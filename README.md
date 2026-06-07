@@ -1,6 +1,20 @@
-# NetLeaf v2.0.0
+# NetLeaf v2.1.0
+
+![NetLeaf Logo](Logo.svg)
 
 高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器。
+
+## 新增功能 (v2.1.0)
+
+- ✅ **简化启动**: `nl_web_create(port)` 创建即启动，无需单独调用 `nl_web_start`
+- ✅ **按端口停止**: `nl_web_stop_by_port(port)` 支持通过端口号停止服务器
+- ✅ **自动清理**: `nl_web_set_auto_cleanup(1)` 程序退出时自动释放所有服务器资源
+- ✅ **变量硬编码**: 服务器端变量替换，用户F12无法看到原始变量名
+- ✅ **自定义编码**: 支持设置响应编码（UTF-8等）
+- ✅ **完整日志系统**: 支持DEBUG/INFO/WARN/ERROR级别
+- ✅ **自动交叉编译检测**: Linux脚本自动检测可用工具链
+- ✅ **Debug模式**: 一键启用调试日志
+- ✅ **异步并发优化**: 完整的异步IO支持，优化性能消耗
 
 ## 快速开始
 
@@ -32,6 +46,16 @@ chmod +x build.sh
 ./build.sh x86
 ./build.sh arm
 ./build.sh arm64
+```
+
+### 全架构构建
+
+```bash
+# Linux - 自动检测可用交叉编译工具链
+./build_all_linux.sh
+
+# Windows
+build_all_windows.bat
 ```
 
 ## 输出位置
@@ -82,7 +106,42 @@ int main() {
 }
 ```
 
-### 3. 使用预设组件
+### 3. 变量硬编码（新增）
+
+**变量在服务器端替换，用户F12看不到原始变量名：**
+
+```c
+#include "netleaf.h"
+
+int main() {
+    nl_web_server_t* server = nl_web_create(8080);
+    
+    // 设置编码
+    nl_web_set_encoding(server, "UTF-8");
+    
+    // 定义变量
+    const char* vars[] = {"username", "user_id"};
+    const char* values[] = {"张三", "12345"};
+    
+    // 添加带变量的页面
+    nl_web_add_html_with_vars(server, "/profile",
+        "<h1>欢迎, {{<var>username</var>}}</h1>"
+        "<p>用户ID: {{<var>user_id</var>}}</p>",
+        vars, values, 2);
+    
+    nl_web_start(server);
+    while (1) Sleep(1000);
+    return 0;
+}
+```
+
+**输出到客户端：**
+```html
+<h1>欢迎, 张三</h1>
+<p>用户ID: 12345</p>
+```
+
+### 4. 使用预设组件
 
 ```c
 // 计数器
@@ -96,7 +155,7 @@ const char* fields[] = {"name", "email", "message"};
 nl_web_add_form(server, "/contact", "Contact Us", fields, 3);
 ```
 
-### 4. TCP服务器
+### 5. TCP服务器
 
 ```c
 #include "netleaf.h"
@@ -117,6 +176,103 @@ int main() {
     return 0;
 }
 ```
+
+## 更新日志
+
+### v2.1.0
+
+**新增功能:**
+- `nl_web_create(port)` - 创建即启动Web服务器
+- `nl_web_stop_by_port(port)` - 按端口号停止服务器
+- `nl_web_set_auto_cleanup(enable)` - 程序退出时自动清理所有服务器
+- `nl_web_set_encoding()` - 设置响应编码
+- `nl_web_add_html_with_vars()` - 带变量的HTML页面
+- `nl_web_add_vue_with_vars()` - 带变量的Vue页面
+- `nl_debug_enable()` - 启用调试模式
+- `nl_log_debug()`, `nl_log_info()`, `nl_log_warn()`, `nl_log_error()` - 日志函数
+- 自动检测交叉编译工具链
+- 异步并发优化，完整的异步IO支持
+
+**Bug修复:**
+- 修复服务器端口冲突问题（重复创建相同端口返回现有实例）
+- 修复内存泄漏风险（通过`atexit`注册自动清理）
+- 修复多线程安全问题（全局服务器列表添加互斥锁保护）
+
+**安全更新:**
+- 完善的空指针检查
+- 缓冲区溢出防护
+- 字符串格式化安全
+
+### v2.0.0
+- 初始版本发布
+- 支持HTTP/1.1, HTTP/2, HTTP/3
+- WebSocket支持
+
+## Wiki - 最佳实践
+
+### 推荐配置
+
+#### 1. 启用自动清理（强烈推荐）
+
+为了防止程序退出时内存泄漏，建议在程序初始化时启用自动清理功能：
+
+```c
+#include "netleaf.h"
+
+int main() {
+    // 启用程序退出时自动清理所有服务器资源
+    nl_web_set_auto_cleanup(1);
+    
+    // 创建服务器（创建即启动）
+    nl_web_server_t* server = nl_web_create(8080);
+    
+    // ... 添加路由和业务逻辑 ...
+    
+    while (1) {
+        // 主循环
+    }
+    
+    // 程序退出时会自动调用 nl_web_destroy 清理所有服务器
+    return 0;
+}
+```
+
+**为什么推荐启用：**
+- ✅ 防止内存泄漏
+- ✅ 自动释放所有服务器资源（socket、线程、内存）
+- ✅ 确保程序优雅退出
+- ✅ 特别适合守护进程或服务类应用
+
+**默认行为：**
+- 默认关闭（`nl_web_set_auto_cleanup(0)`）
+- 如需手动管理，使用 `nl_web_destroy(server)` 或 `nl_web_stop_by_port(port)`
+
+#### 2. 多服务器管理
+
+```c
+// 创建多个服务器
+nl_web_server_t* server1 = nl_web_create(8080);
+nl_web_server_t* server2 = nl_web_create(8081);
+
+// 按端口停止指定服务器
+nl_web_stop_by_port(8080);
+
+// 程序退出时自动清理所有剩余服务器
+```
+
+#### 3. 编译选项
+
+**Debug模式（开发阶段）：**
+```c
+nl_debug_enable();  // 启用详细日志输出
+```
+
+**Release模式（生产环境）：**
+```c
+// 默认关闭调试日志，仅输出错误信息
+```
+
+#### 4. 内联HTML/Vue支持
 
 ### 5. 文件服务
 

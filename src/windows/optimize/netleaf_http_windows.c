@@ -814,7 +814,7 @@ static int h2_process_frame(struct nl_http2_connection* conn, const uint8_t* dat
             while (offset < header.length) {
                 char name[MAX_HEADER_NAME];
                 char value[MAX_HEADER_VALUE];
-                size_t consumed;
+                size_t consumed = 0;
                 
                 if (hpack_decode_header(&conn->hpack, payload + offset, header.length - offset, name, value, &consumed) == 0) {
                     if (strcmp(name, ":method") == 0) {

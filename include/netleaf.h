@@ -19,9 +19,9 @@
 extern "C" {
 #endif
 
-#define NETLEAF_VERSION "2.0.0"
+#define NETLEAF_VERSION "2.1.0"
 #define NETLEAF_VERSION_MAJOR 2
-#define NETLEAF_VERSION_MINOR 0
+#define NETLEAF_VERSION_MINOR 1
 #define NETLEAF_VERSION_PATCH 0
 
 typedef enum {
@@ -56,6 +56,17 @@ typedef enum {
     NL_LOG_WARN,
     NL_LOG_ERROR
 } nl_log_level_t;
+
+// Debug mode API
+NL_API void nl_debug_enable(int enable);
+NL_API int nl_debug_is_enabled(void);
+
+// Logging API
+NL_API void nl_log(nl_log_level_t level, const char* format, ...);
+NL_API void nl_log_debug(const char* format, ...);
+NL_API void nl_log_info(const char* format, ...);
+NL_API void nl_log_warn(const char* format, ...);
+NL_API void nl_log_error(const char* format, ...);
 
 typedef enum {
     NL_OPT_TCP_NODELAY = 1,
@@ -188,15 +199,30 @@ NL_API int nl_serve(int port, nl_http_handler_t default_handler, void* user_data
 typedef struct nl_web_server nl_web_server_t;
 
 // Create a web server with inline HTML/Vue support
+// Now automatically starts the server
 NL_API nl_web_server_t* nl_web_create(int port);
 NL_API void nl_web_destroy(nl_web_server_t* server);
 NL_API int nl_web_start(nl_web_server_t* server);
 NL_API void nl_web_stop(nl_web_server_t* server);
 
+// Stop server by port (new simplified API)
+NL_API void nl_web_stop_by_port(int port);
+
+// Set auto-cleanup on program exit (default: disabled)
+NL_API void nl_web_set_auto_cleanup(int enable);
+
+// Set encoding for web responses
+NL_API void nl_web_set_encoding(nl_web_server_t* server, const char* encoding);
+
 // Add inline HTML/Vue response
 NL_API void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html);
 NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
 NL_API void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
+
+// Add inline HTML/Vue with variable substitution
+// Variables are in format: {{<var>variable_name</var>}}
+NL_API void nl_web_add_html_with_vars(nl_web_server_t* server, const char* path, const char* html, const char** vars, const char** values, int count);
+NL_API void nl_web_add_vue_with_vars(nl_web_server_t* server, const char* path, const char* vue_code, const char** vars, const char** values, int count);
 
 // Modern responsive helper: auto-generate modern UI
 NL_API void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* title);

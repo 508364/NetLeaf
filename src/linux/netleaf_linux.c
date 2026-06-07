@@ -71,6 +71,7 @@ struct nl_event_loop {
 static nl_log_level_t current_log_level = NL_LOG_INFO;
 static nl_log_callback log_callback = NULL;
 static void* log_user_data = NULL;
+static int debug_mode = 0;
 
 static void linux_log(nl_log_level_t level, const char* fmt, ...) {
     if (level < current_log_level) return;
@@ -91,6 +92,81 @@ static void linux_log(nl_log_level_t level, const char* fmt, ...) {
         strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm);
         fprintf(stderr, "[%s] [%s] %s\n", time_str, prefix[level], msg);
     }
+}
+
+// Debug mode API implementation
+void nl_debug_enable(int enable) {
+    debug_mode = enable;
+    if (enable) {
+        current_log_level = NL_LOG_DEBUG;
+        linux_log(NL_LOG_INFO, "Debug mode enabled");
+    } else {
+        linux_log(NL_LOG_INFO, "Debug mode disabled");
+    }
+}
+
+int nl_debug_is_enabled(void) {
+    return debug_mode;
+}
+
+void nl_log(nl_log_level_t level, const char* format, ...) {
+    if (level < current_log_level) return;
+    
+    va_list args;
+    va_start(args, format);
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg), format, args);
+    va_end(args);
+    
+    linux_log(level, "%s", msg);
+}
+
+void nl_log_debug(const char* format, ...) {
+    if (NL_LOG_DEBUG < current_log_level) return;
+    
+    va_list args;
+    va_start(args, format);
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg), format, args);
+    va_end(args);
+    
+    linux_log(NL_LOG_DEBUG, "%s", msg);
+}
+
+void nl_log_info(const char* format, ...) {
+    if (NL_LOG_INFO < current_log_level) return;
+    
+    va_list args;
+    va_start(args, format);
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg), format, args);
+    va_end(args);
+    
+    linux_log(NL_LOG_INFO, "%s", msg);
+}
+
+void nl_log_warn(const char* format, ...) {
+    if (NL_LOG_WARN < current_log_level) return;
+    
+    va_list args;
+    va_start(args, format);
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg), format, args);
+    va_end(args);
+    
+    linux_log(NL_LOG_WARN, "%s", msg);
+}
+
+void nl_log_error(const char* format, ...) {
+    if (NL_LOG_ERROR < current_log_level) return;
+    
+    va_list args;
+    va_start(args, format);
+    char msg[1024];
+    vsnprintf(msg, sizeof(msg), format, args);
+    va_end(args);
+    
+    linux_log(NL_LOG_ERROR, "%s", msg);
 }
 
 static int set_nonblocking(int fd) {
@@ -1466,9 +1542,13 @@ struct nl_web_server {
     volatile int running;
     nl_web_route_t* routes;
     pthread_mutex_t mutex;
+    char encoding[32];
+    struct nl_web_server* next;
 };
 
-static struct nl_web_server* g_web_server = NULL;
+static struct nl_web_server* g_web_servers = NULL;
+static pthread_mutex_t g_web_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_auto_cleanup_enabled = 0;
 
 // Modern responsive CSS base
 static const char* nl_responsive_css = 
@@ -1548,18 +1628,55 @@ static void* web_server_thread(void* arg) {
 }
 
 nl_web_server_t* nl_web_create(int port) {
+    // Check if server already exists on this port
+    pthread_mutex_lock(&g_web_servers_mutex);
+    struct nl_web_server* existing = g_web_servers;
+    while (existing) {
+        if (existing->port == port) {
+            pthread_mutex_unlock(&g_web_servers_mutex);
+            return existing;
+        }
+        existing = existing->next;
+    }
+    
     nl_web_server_t* server = (nl_web_server_t*)calloc(1, sizeof(nl_web_server_t));
-    if (!server) return NULL;
+    if (!server) {
+        pthread_mutex_unlock(&g_web_servers_mutex);
+        return NULL;
+    }
     
     server->port = port;
     server->routes = NULL;
     pthread_mutex_init(&server->mutex, NULL);
+    strncpy(server->encoding, "UTF-8", sizeof(server->encoding) - 1);
+    server->next = g_web_servers;
+    g_web_servers = server;
+    pthread_mutex_unlock(&g_web_servers_mutex);
+    
+    // Auto-start the server
+    int result = nl_web_start(server);
+    if (result != 0) {
+        nl_web_destroy(server);
+        return NULL;
+    }
     
     return server;
 }
 
 void nl_web_destroy(nl_web_server_t* server) {
     if (!server) return;
+    
+    // Remove from global list
+    pthread_mutex_lock(&g_web_servers_mutex);
+    struct nl_web_server** pp = &g_web_servers;
+    while (*pp) {
+        if (*pp == server) {
+            *pp = server->next;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_web_servers_mutex);
     
     if (server->running) {
         nl_web_stop(server);
@@ -1607,7 +1724,6 @@ int nl_web_start(nl_web_server_t* server) {
     server->running = 1;
     pthread_create(&server->thread, NULL, web_server_thread, server);
     
-    g_web_server = server;
     printf("Web server started on port %d\n", server->port);
     return 0;
 }
@@ -1678,8 +1794,167 @@ void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_c
     add_web_route(server, path, full_html, "text/html");
 }
 
+void nl_web_set_encoding(nl_web_server_t* server, const char* encoding) {
+    if (!server || !encoding) return;
+    strncpy(server->encoding, encoding, sizeof(server->encoding) - 1);
+}
+
+static char* substitute_variables(const char* template, const char** vars, const char** values, int count) {
+    if (!template || !vars || !values || count <= 0) {
+        char* result = (char*)malloc(strlen(template) + 1);
+        if (result) strcpy(result, template);
+        return result;
+    }
+    
+    size_t result_size = strlen(template) * 2;
+    char* result = (char*)malloc(result_size);
+    if (!result) return NULL;
+    
+    char* ptr = result;
+    const char* src = template;
+    *ptr = '\0';
+    
+    while (*src) {
+        if (strncmp(src, "{{<var>", 7) == 0) {
+            const char* var_start = src + 7;
+            const char* var_end = strstr(var_start, "</var>}}");
+            if (var_end) {
+                size_t var_len = var_end - var_start;
+                char var_name[256];
+                strncpy(var_name, var_start, var_len);
+                var_name[var_len] = '\0';
+                
+                const char* replacement = NULL;
+                for (int i = 0; i < count; i++) {
+                    if (strcmp(vars[i], var_name) == 0) {
+                        replacement = values[i];
+                        break;
+                    }
+                }
+                
+                if (replacement) {
+                    size_t rep_len = strlen(replacement);
+                    size_t current_len = strlen(result);
+                    if (current_len + rep_len + 1 > result_size) {
+                        result_size *= 2;
+                        char* new_result = (char*)realloc(result, result_size);
+                        if (!new_result) {
+                            free(result);
+                            return NULL;
+                        }
+                        result = new_result;
+                        ptr = result + current_len;
+                    }
+                    strcpy(ptr, replacement);
+                    ptr += rep_len;
+                }
+                
+                src = var_end + 8;
+                continue;
+            }
+        }
+        
+        *ptr++ = *src++;
+        *ptr = '\0';
+    }
+    
+    return result;
+}
+
+void nl_web_add_html_with_vars(nl_web_server_t* server, const char* path, const char* html, const char** vars, const char** values, int count) {
+    if (!server || !path || !html) return;
+    
+    char* substituted = substitute_variables(html, vars, values, count);
+    if (substituted) {
+        add_web_route(server, path, substituted, "text/html");
+        free(substituted);
+    }
+}
+
+void nl_web_add_vue_with_vars(nl_web_server_t* server, const char* path, const char* vue_code, const char** vars, const char** values, int count) {
+    if (!server || !path || !vue_code) return;
+    
+    char* substituted = substitute_variables(vue_code, vars, values, count);
+    if (substituted) {
+        char full_html[32768];
+        snprintf(full_html, sizeof(full_html),
+            "<!DOCTYPE html>\n"
+            "<html><head><title>NetLeaf Vue</title>\n"
+            "%s"
+            "%s"
+            "</head><body>\n"
+            "<div id=\"app\">\n"
+            "%s\n"
+            "</div>\n"
+            "<script>\n"
+            "const { createApp, ref, reactive } = Vue;\n"
+            "createApp({\n"
+            "  setup() {\n"
+            "    return { }\n"
+            "  }\n"
+            "}).mount('#app');\n"
+            "</script>\n"
+            "</body></html>",
+            nl_responsive_css, nl_vue_cdn, substituted);
+        add_web_route(server, path, full_html, "text/html");
+        free(substituted);
+    }
+}
+
 void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json) {
     add_web_route(server, path, json, "application/json");
+}
+
+void nl_web_stop_by_port(int port) {
+    pthread_mutex_lock(&g_web_servers_mutex);
+    struct nl_web_server* server = g_web_servers;
+    while (server) {
+        if (server->port == port) {
+            pthread_mutex_unlock(&g_web_servers_mutex);
+            nl_web_destroy(server);
+            return;
+        }
+        server = server->next;
+    }
+    pthread_mutex_unlock(&g_web_servers_mutex);
+}
+
+static void cleanup_all_web_servers(void) {
+    pthread_mutex_lock(&g_web_servers_mutex);
+    while (g_web_servers) {
+        struct nl_web_server* server = g_web_servers;
+        g_web_servers = server->next;
+        
+        pthread_mutex_unlock(&g_web_servers_mutex);
+        
+        if (server->running) {
+            nl_web_stop(server);
+        }
+        
+        pthread_mutex_lock(&server->mutex);
+        nl_web_route_t* route = server->routes;
+        while (route) {
+            nl_web_route_t* next = route->next;
+            if (route->content) free(route->content);
+            free(route);
+            route = next;
+        }
+        pthread_mutex_unlock(&server->mutex);
+        
+        pthread_mutex_destroy(&server->mutex);
+        free(server);
+        
+        pthread_mutex_lock(&g_web_servers_mutex);
+    }
+    pthread_mutex_unlock(&g_web_servers_mutex);
+}
+
+void nl_web_set_auto_cleanup(int enable) {
+    if (enable && !g_auto_cleanup_enabled) {
+        g_auto_cleanup_enabled = 1;
+        atexit(cleanup_all_web_servers);
+    }
+    g_auto_cleanup_enabled = enable;
 }
 
 void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* title) {
