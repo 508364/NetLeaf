@@ -311,7 +311,8 @@ static int parse_request(nl_http_request_t* req, const char* data, size_t len) {
     }
     
     req->method = parse_method(method);
-    strncpy(req->path, path, MAX_PATH - 1);
+    memcpy(req->path, path, strlen(path) < MAX_PATH ? strlen(path) + 1 : MAX_PATH - 1);
+    req->path[MAX_PATH - 1] = '\0';
     
     if (strstr(version, "2.0") != NULL) {
         req->version = NL_HTTP_VERSION_2;

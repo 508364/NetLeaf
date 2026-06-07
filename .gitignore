@@ -10,6 +10,9 @@ lib/
 *.o
 *.obj
 
+# Documentation
+wiki/
+
 # Libraries
 *.dll
 *.lib
@@ -99,3 +102,4 @@ site/
 *.swo
 *~
 *.bak
+/releases
