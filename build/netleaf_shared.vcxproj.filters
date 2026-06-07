@@ -1,184 +1,23 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\nl_core.c">
+    <ClCompile Include="F:\GitHub\NetLeaf\src\windows\netleaf_windows.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\nl_platform.c">
+    <ClCompile Include="F:\GitHub\NetLeaf\src\windows\optimize\netleaf_http_windows.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\nl_optimize.c">
+    <ClCompile Include="F:\GitHub\NetLeaf\src\windows\optimize\netleaf_optimize_windows.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\common\nl_error.c">
+    <ClCompile Include="F:\GitHub\NetLeaf\src\windows\optimize\netleaf_websocket_windows.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\common\nl_log.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\common\nl_memory.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\common\nl_string.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\common\nl_time.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\common\nl_utils.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\network\nl_http.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\network\nl_http_version.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\network\nl_tcp.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\network\nl_udp.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\network\nl_ws.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\crypto\sha1.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\crypto\base64.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\crypto\nl_ssl.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\data\nl_config.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\data\nl_config_file.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\data\nl_json.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\data\nl_mempool.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\data\nl_fastpool.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\io\nl_file.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\io\nl_compress.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\features\nl_forward.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\features\nl_middleware.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="F:\GitHub\NetLeaf\src\platform\netleaf_loader.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\netleaf.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\netleaf_config.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\netleaf_common.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\netleaf_optimize.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\common\netleaf_error.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\common\netleaf_log.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\common\netleaf_memory.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\common\netleaf_string.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\common\netleaf_time.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\common\netleaf_utils.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\crypto\sha1.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\crypto\base64.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\crypto\netleaf_ssl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\data\netleaf_config.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\data\netleaf_config_file.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\data\netleaf_fastpool.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\data\netleaf_json.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\data\netleaf_mempool.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\features\netleaf_forward.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\features\netleaf_middleware.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\io\netleaf_compress.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\io\netleaf_file.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\network\netleaf_http_version.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\network\netleaf_netopt.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\network\netleaf_tcp.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\network\netleaf_udp.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\network\netleaf_ws.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\platform\netleaf_platform.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="F:\GitHub\NetLeaf\include\platform\netleaf_loader.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="F:\GitHub\NetLeaf\CMakeLists.txt" />
   </ItemGroup>
   <ItemGroup>
-    <Filter Include="Header Files">
-      <UniqueIdentifier>{7DFAF8C2-C87B-34D4-82D9-3ACD76E3D899}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Source Files">
       <UniqueIdentifier>{B7E28647-3AEA-316E-BA3C-6832750BFC04}</UniqueIdentifier>
     </Filter>

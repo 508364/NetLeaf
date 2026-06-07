@@ -1,52 +1,101 @@
-# Prerequisites
-*.d
-
-# Object files
+# Build outputs
+build/
+build_x64/
+build_x86/
+build_arm64/
+build_wsl/
+build_arm/
+bin/
+lib/
 *.o
-*.ko
 *.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
 
 # Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
 *.dll
+*.lib
 *.so
 *.so.*
+*.a
 *.dylib
 
 # Executables
 *.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+*.cmake
+!CMakeLists.txt
+*.ninja
+*.ninja.d
+.vscode/
+cmake_install.cmake
+
+# Visual Studio
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.vs/
+*.suo
+*.recipe
+*.tlog/
+*.lastbuildstate
+
+# Eclipse
+.project
+.cproject
+.settings/
+
+# CLion
+.idea/
+*.iml
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Debug symbols
 *.pdb
+*.dSYM/
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# Logs
+*.log
+
+# Test files
+*.test
+*.tmp
+*.temp
+
+# Node.js (frontend examples)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
+package-lock.json
+yarn.lock
+dist/
+.cache/
+
+# TypeScript
+*.tsbuildinfo
+
+# Documentation generated files
+docs/_build/
+site/
+
+# Temporary files
+*.swp
+*.swo
+*~
+*.bak

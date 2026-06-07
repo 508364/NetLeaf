@@ -1,0 +1,279 @@
+#ifndef NETLEAF_H
+#define NETLEAF_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+// DLL export/import macros
+#ifdef _WIN32
+    #ifdef NL_EXPORTS
+        #define NL_API __declspec(dllexport)
+    #else
+        #define NL_API __declspec(dllimport)
+    #endif
+#else
+    #define NL_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define NETLEAF_VERSION "2.0.0"
+#define NETLEAF_VERSION_MAJOR 2
+#define NETLEAF_VERSION_MINOR 0
+#define NETLEAF_VERSION_PATCH 0
+
+typedef enum {
+    NL_OK = 0,
+    NL_ERROR = -1,
+    NL_EINVAL = -2,
+    NL_ENOMEM = -3,
+    NL_ETIMEOUT = -4,
+    NL_ECONNECT = -5,
+    NL_EAGAIN = -6,
+    NL_ECLOSED = -7,
+    NL_ENOTSUPPORTED = -8,
+    NL_EPARSE = -9,
+    NL_ESYNTAX = -10,
+    NL_EFILE = -11,
+    NL_EKEY_NOT_FOUND = -11,
+    NL_EKEY_TYPE = -12,
+    NL_EBUFFER = -13,
+    NL_EOF = -14
+} nl_status_t;
+
+typedef enum {
+    NL_PROTO_TCP,
+    NL_PROTO_UDP,
+    NL_PROTO_HTTP,
+    NL_PROTO_WEBSOCKET
+} nl_protocol_t;
+
+typedef enum {
+    NL_LOG_DEBUG,
+    NL_LOG_INFO,
+    NL_LOG_WARN,
+    NL_LOG_ERROR
+} nl_log_level_t;
+
+typedef enum {
+    NL_OPT_TCP_NODELAY = 1,
+    NL_OPT_TCP_KEEPALIVE = 2,
+    NL_OPT_TCP_KEEPIDLE = 3,
+    NL_OPT_TCP_KEEPINTVL = 4,
+    NL_OPT_TCP_KEEPCNT = 5,
+    NL_OPT_SO_SNDBUF = 6,
+    NL_OPT_SO_RCVBUF = 7,
+    NL_OPT_SO_REUSEADDR = 8,
+    NL_OPT_SO_REUSEPORT = 9,
+    NL_OPT_SO_LINGER = 10,
+    NL_OPT_SO_BROADCAST = 11
+} nl_socket_option_t;
+
+typedef struct nl_server nl_server_t;
+typedef struct nl_client nl_client_t;
+typedef struct nl_config nl_config_t;
+typedef struct nl_buffer nl_buffer_t;
+typedef struct nl_event_loop nl_event_loop_t;
+
+typedef void (*nl_request_handler)(nl_buffer_t* req, nl_buffer_t* resp, void* user_data);
+typedef void (*nl_log_callback)(nl_log_level_t level, const char* msg, void* user_data);
+typedef void (*nl_udp_message_handler)(const char* data, size_t len, 
+                                        const char* from_addr, int from_port, void* user_data);
+
+NL_API nl_server_t* nl_server_create(nl_protocol_t protocol, int port);
+NL_API void nl_server_destroy(nl_server_t* server);
+NL_API int nl_server_start(nl_server_t* server);
+NL_API void nl_server_stop(nl_server_t* server);
+NL_API void nl_server_set_handler(nl_server_t* server, nl_request_handler handler, void* user_data);
+NL_API void nl_server_set_udp_handler(nl_server_t* server, nl_udp_message_handler handler, void* user_data);
+NL_API int nl_server_set_option(nl_server_t* server, nl_socket_option_t option, int value);
+NL_API int nl_server_get_option(nl_server_t* server, nl_socket_option_t option, int* value);
+
+NL_API nl_client_t* nl_client_create(nl_protocol_t protocol);
+NL_API void nl_client_destroy(nl_client_t* client);
+NL_API int nl_client_connect(nl_client_t* client, const char* host, int port);
+NL_API void nl_client_disconnect(nl_client_t* client);
+NL_API int nl_client_send(nl_client_t* client, const void* data, size_t len);
+NL_API int nl_client_recv(nl_client_t* client, void* buf, size_t len);
+NL_API int nl_client_send_to(nl_client_t* client, const char* host, int port, const void* data, size_t len);
+NL_API int nl_client_recv_from(nl_client_t* client, void* buf, size_t len, char* from_addr, size_t addr_len, int* from_port);
+NL_API int nl_client_set_option(nl_client_t* client, nl_socket_option_t option, int value);
+NL_API int nl_client_get_option(nl_client_t* client, nl_socket_option_t option, int* value);
+NL_API int nl_client_get_fd(nl_client_t* client);
+NL_API int nl_server_get_fd(nl_server_t* server);
+
+NL_API nl_config_t* nl_config_create(void);
+NL_API void nl_config_destroy(nl_config_t* config);
+NL_API int nl_config_load(nl_config_t* config, const char* path);
+NL_API int nl_config_save(nl_config_t* config, const char* path);
+NL_API const char* nl_config_get(nl_config_t* config, const char* key);
+NL_API void nl_config_set(nl_config_t* config, const char* key, const char* value);
+
+NL_API nl_buffer_t* nl_buffer_create(size_t capacity);
+NL_API void nl_buffer_destroy(nl_buffer_t* buffer);
+NL_API void nl_buffer_clear(nl_buffer_t* buffer);
+NL_API size_t nl_buffer_write(nl_buffer_t* buffer, const void* data, size_t len);
+NL_API size_t nl_buffer_read(nl_buffer_t* buffer, void* data, size_t len);
+NL_API size_t nl_buffer_size(nl_buffer_t* buffer);
+
+NL_API void nl_log_set_level(nl_log_level_t level);
+NL_API void nl_log_set_callback(nl_log_callback callback, void* user_data);
+
+NL_API const char* nl_version_string(void);
+NL_API int nl_version_major(void);
+NL_API int nl_version_minor(void);
+NL_API int nl_version_patch(void);
+
+// =========================================
+// Advanced Server API - File Server
+// =========================================
+
+typedef struct nl_file_server nl_file_server_t;
+
+typedef enum {
+    NL_METHOD_GET,
+    NL_METHOD_POST,
+    NL_METHOD_PUT,
+    NL_METHOD_DELETE,
+    NL_METHOD_PATCH,
+    NL_METHOD_HEAD,
+    NL_METHOD_OPTIONS
+} nl_http_method_t;
+
+typedef void (*nl_http_handler_t)(
+    const char* path,
+    nl_http_method_t method,
+    const char* body,
+    size_t body_size,
+    char** response,
+    size_t* response_size,
+    void* user_data
+);
+
+// Create a file server for serving static files
+NL_API nl_file_server_t* nl_file_server_create(const char* directory, int port);
+NL_API void nl_file_server_destroy(nl_file_server_t* server);
+NL_API int nl_file_server_start(nl_file_server_t* server);
+NL_API void nl_file_server_stop(nl_file_server_t* server);
+NL_API void nl_file_server_set_index(nl_file_server_t* server, const char* index_file);
+NL_API void nl_file_server_set_easter_egg(nl_file_server_t* server, int enable);
+
+// Simple one-liner to start serving files
+NL_API int nl_serve_files(const char* directory, int port);
+
+// =========================================
+// Advanced Server API - Route Configuration
+// =========================================
+
+typedef struct nl_route nl_route_t;
+typedef struct nl_router nl_router_t;
+
+NL_API nl_router_t* nl_router_create(void);
+NL_API void nl_router_destroy(nl_router_t* router);
+NL_API void nl_router_add_route(nl_router_t* router, const char* path, nl_http_method_t method, nl_http_handler_t handler, void* user_data);
+NL_API void nl_router_set_static_dir(nl_router_t* router, const char* directory);
+
+// Start a server with router
+NL_API int nl_router_serve(nl_router_t* router, int port);
+
+// Quick start function
+NL_API int nl_serve(int port, nl_http_handler_t default_handler, void* user_data);
+
+// =========================================
+// Inline HTML/Vue Modern Web Server API
+// =========================================
+
+typedef struct nl_web_server nl_web_server_t;
+
+// Create a web server with inline HTML/Vue support
+NL_API nl_web_server_t* nl_web_create(int port);
+NL_API void nl_web_destroy(nl_web_server_t* server);
+NL_API int nl_web_start(nl_web_server_t* server);
+NL_API void nl_web_stop(nl_web_server_t* server);
+
+// Add inline HTML/Vue response
+NL_API void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html);
+NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
+NL_API void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
+
+// Modern responsive helper: auto-generate modern UI
+NL_API void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* title);
+NL_API void nl_web_add_dashboard(nl_web_server_t* server, const char* path, const char* title);
+NL_API void nl_web_add_form(nl_web_server_t* server, const char* path, const char* title, const char** fields, int field_count);
+NL_API void nl_web_add_todo(nl_web_server_t* server, const char* path, const char* title);
+NL_API void nl_web_add_chat(nl_web_server_t* server, const char* path, const char* title);
+NL_API void nl_web_add_gallery(nl_web_server_t* server, const char* path, const char* title, const char** image_urls, int count);
+
+// Simple one-liner: serve inline HTML
+NL_API int nl_serve_html(int port, const char* html);
+NL_API int nl_serve_vue(int port, const char* vue_code);
+NL_API int nl_serve_dashboard(int port, const char* title);
+NL_API int nl_serve_todo(int port, const char* title);
+NL_API int nl_serve_chat(int port, const char* title);
+
+// =========================================
+// JSON Parser API
+// =========================================
+
+typedef enum {
+    NL_JSON_NULL = 0,
+    NL_JSON_BOOL = 1,
+    NL_JSON_INT = 2,
+    NL_JSON_DOUBLE = 3,
+    NL_JSON_STRING = 4,
+    NL_JSON_ARRAY = 5,
+    NL_JSON_OBJECT = 6
+} nl_json_type_t;
+
+NL_API void* nl_json_parse(const char* json_str, nl_status_t* error_code, int* error_line, int* error_col);
+NL_API void* nl_json_parse_file(const char* file_path, nl_status_t* error_code);
+NL_API void nl_json_destroy(void* json);
+NL_API int nl_json_get_type(void* json);
+NL_API int nl_json_get_bool(void* json);
+NL_API int64_t nl_json_get_int(void* json);
+NL_API double nl_json_get_double(void* json);
+NL_API const char* nl_json_get_string(void* json);
+NL_API size_t nl_json_array_size(void* json);
+NL_API void* nl_json_array_get(void* json, size_t index);
+NL_API void* nl_json_object_get(void* json, const char* key);
+NL_API int nl_json_has_key(void* json, const char* key);
+NL_API char* nl_json_stringify(void* json, int pretty);
+NL_API int nl_json_save_file(void* json, const char* file_path, int pretty);
+NL_API const char* nl_json_error_message(nl_status_t error_code);
+
+// =========================================
+// TOML Parser API
+// =========================================
+
+typedef enum {
+    NL_TOML_STRING = 1,
+    NL_TOML_INT = 2,
+    NL_TOML_FLOAT = 3,
+    NL_TOML_BOOL = 4,
+    NL_TOML_ARRAY = 5,
+    NL_TOML_TABLE = 6
+} nl_toml_type_t;
+
+NL_API void* nl_toml_parse(const char* toml_str, nl_status_t* error_code, int* error_line, int* error_col);
+NL_API void* nl_toml_parse_file(const char* file_path, nl_status_t* error_code);
+NL_API void nl_toml_destroy(void* toml);
+NL_API int nl_toml_get_type(void* toml);
+NL_API const char* nl_toml_get_string(void* toml);
+NL_API int64_t nl_toml_get_int(void* toml);
+NL_API double nl_toml_get_float(void* toml);
+NL_API int nl_toml_get_bool(void* toml);
+NL_API size_t nl_toml_array_size(void* toml);
+NL_API void* nl_toml_array_get(void* toml, size_t index);
+NL_API void* nl_toml_table_get(void* toml, const char* key);
+NL_API int nl_toml_has_key(void* toml, const char* key);
+NL_API char* nl_toml_stringify(void* toml);
+NL_API int nl_toml_save_file(void* toml, const char* file_path);
+NL_API const char* nl_toml_error_message(nl_status_t error_code);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
