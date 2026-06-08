@@ -90,8 +90,17 @@ echo ""
 for ARCH in "${SUCCESSFUL_ARCHES[@]}"; do
     BUILD_DIR="build_${ARCH}"
     echo "  打包 Linux $ARCH..."
+
+    SO_FILE="${BUILD_DIR}/lib/libnetleaf.so.${VERSION}"
+    
+    if [[ ! -f "$SO_FILE" ]]; then
+        echo "  [警告] 未找到 $SO_FILE，跳过打包"
+        continue
+    fi
+
     tar -czvf "releases/NetLeaf-${VERSION}-linux-${ARCH}.tar.gz" \
-        "$BUILD_DIR/lib/libnetleaf.so" \
+        --transform "s|libnetleaf\.so\.${VERSION}|libnetleaf.so|" \
+        "$SO_FILE" \
         "$BUILD_DIR/lib/libnetleaf.a" \
         "$BUILD_DIR/bin/example_all_features" \
         "include/netleaf.h" \
