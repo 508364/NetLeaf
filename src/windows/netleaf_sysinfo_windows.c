@@ -19,6 +19,8 @@
     static void load_sys_info(void) {
         if (sys_info_loaded) return;
 
+#pragma warning(push)
+#pragma warning(disable: 4996)
         OSVERSIONINFOEX osvi;
         ZeroMemory(&osvi, sizeof(OSVERSIONINFOEX));
         osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
@@ -40,6 +42,7 @@
         } else {
             snprintf(os_name, sizeof(os_name), "Windows");
         }
+#pragma warning(pop)
 
         SYSTEM_INFO si;
         GetNativeSystemInfo(&si);

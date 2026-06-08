@@ -4,7 +4,7 @@
 高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器
 
 **仓库地址:**
-- GitHub: [https://github.com/x508364/NetLeaf](https://github.com/x508364/NetLeaf)
+- GitHub: [https://github.com/508364/NetLeaf](https://github.com/508364/NetLeaf)
 - Gitee: [https://gitee.com/x508364/NetLeaf](https://gitee.com/x508364/NetLeaf)
 
 ## 新增功能 (v2.1.5)
@@ -496,6 +496,25 @@ nl_router_add_route(router, "/api/hello", NL_METHOD_GET, my_handler, NULL);
 nl_router_set_static_dir(router, "./public");
 nl_router_serve(router, 8080);
 ```
+
+## 构建脚本
+
+### Windows
+
+```cmd
+build_all.bat
+```
+
+自动构建 x64、x86、ARM64 架构并打包为ZIP格式。
+
+### Linux/WSL
+
+```bash
+chmod +x build_all.sh
+./build_all.sh
+```
+
+自动检测已安装的交叉编译工具链并构建所有可用架构。
 
 ## 链接你的项目
 
