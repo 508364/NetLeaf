@@ -1,14 +1,16 @@
 @echo off
+chcp 65001
 REM NetLeaf Multi-Architecture Build Script
 REM This script builds NetLeaf for Windows x86, x64, and ARM64
 
 echo ========================================
-echo   NetLeaf v1.9.5 Build Script
+echo   NetLeaf v2.1.5 Build Script
 echo ========================================
 echo.
 
 REM Create output directories
 if not exist "build" mkdir build
+if not exist "releases" mkdir releases
 
 REM Check if VS environment is available
 where cl >nul 2>nul
@@ -41,6 +43,8 @@ if %errorlevel% neq 0 (
 )
 cd ..\..
 echo x64 build completed!
+powershell.exe -Command "Compress-Archive -Path build\x64\lib\Release\netleaf.lib, build\x64\bin\Release\netleaf.dll, include\netleaf.h -DestinationPath releases\NetLeaf-2.1.5-windows-x64.zip -Force"
+echo x64 package created!
 echo.
 
 REM Build for x86 (Win32)
@@ -64,6 +68,8 @@ if %errorlevel% neq 0 (
 )
 cd ..\..
 echo x86 build completed!
+powershell.exe -Command "Compress-Archive -Path build\x86\lib\Release\netleaf.lib, build\x86\bin\Release\netleaf.dll, include\netleaf.h -DestinationPath releases\NetLeaf-2.1.5-windows-x86.zip -Force"
+echo x86 package created!
 echo.
 
 REM Build for ARM64
@@ -87,20 +93,16 @@ if %errorlevel% neq 0 (
 )
 cd ..\..
 echo ARM64 build completed!
+powershell.exe -Command "Compress-Archive -Path build\arm64\lib\Release\netleaf.lib, build\arm64\bin\Release\netleaf.dll, include\netleaf.h -DestinationPath releases\NetLeaf-2.1.5-windows-arm64.zip -Force"
+echo ARM64 package created!
 echo.
 
 echo ========================================
 echo   All builds completed successfully!
 echo ========================================
 echo.
-echo Output directories:
-echo   x64: build\x64\bin\Windows\x64\Release
-echo   x86: build\x86\bin\Windows\x86\Release
-echo   ARM64: build\arm64\bin\Windows\arm64\Release
+echo Packages location: releases\
+echo   - NetLeaf-2.1.5-windows-x64.zip
+echo   - NetLeaf-2.1.5-windows-x86.zip
+echo   - NetLeaf-2.1.5-windows-arm64.zip
 echo.
-echo Libraries can be found in:
-echo   build\x64\lib\Windows\x64\Release
-echo   build\x86\lib\Windows\x86\Release
-echo   build\arm64\lib\Windows\arm64\Release
-echo.
-pause

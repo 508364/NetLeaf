@@ -19,10 +19,10 @@
 extern "C" {
 #endif
 
-#define NETLEAF_VERSION "2.1.0"
+#define NETLEAF_VERSION "2.1.5"
 #define NETLEAF_VERSION_MAJOR 2
 #define NETLEAF_VERSION_MINOR 1
-#define NETLEAF_VERSION_PATCH 0
+#define NETLEAF_VERSION_PATCH 5
 
 typedef enum {
     NL_OK = 0,
@@ -214,6 +214,34 @@ NL_API void nl_web_set_auto_cleanup(int enable);
 // Set encoding for web responses
 NL_API void nl_web_set_encoding(nl_web_server_t* server, const char* encoding);
 
+// Supported encoding constants
+#define NL_ENCODING_UTF8 "UTF-8"
+#define NL_ENCODING_GBK "GBK"
+#define NL_ENCODING_GB2312 "GB2312"
+#define NL_ENCODING_GB18030 "GB18030"
+#define NL_ENCODING_ISO8859_1 "ISO-8859-1"
+#define NL_ENCODING_US_ASCII "US-ASCII"
+#define NL_ENCODING_UTF16 "UTF-16"
+#define NL_ENCODING_BIG5 "Big5"
+
+// Validate encoding string
+NL_API int nl_web_validate_encoding(const char* encoding);
+
+// Error and warning API
+typedef enum {
+    NL_WARN_NONE = 0,
+    NL_WARN_PORT_IN_USE = 1,
+    NL_WARN_INVALID_ENCODING = 2,
+    NL_WARN_MEMORY_LIMIT = 3,
+    NL_WARN_CONNECTION_LIMIT = 4,
+    NL_WARN_INVALID_CONFIG = 5,
+    NL_WARN_BUFFER_OVERFLOW = 6
+} nl_warning_t;
+
+NL_API const char* nl_warning_message(nl_warning_t warning);
+NL_API void nl_web_enable_warnings(int enable);
+NL_API int nl_web_get_last_warning(nl_warning_t* warning);
+
 // Add inline HTML/Vue response
 NL_API void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html);
 NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
@@ -297,6 +325,69 @@ NL_API int nl_toml_has_key(void* toml, const char* key);
 NL_API char* nl_toml_stringify(void* toml);
 NL_API int nl_toml_save_file(void* toml, const char* file_path);
 NL_API const char* nl_toml_error_message(nl_status_t error_code);
+
+// =========================================
+// System Information API (Lazy Loading)
+// =========================================
+
+// RAM unit configuration
+typedef enum {
+    NL_RAM_UNIT_DECIMAL = 1000,  // Linux default: 1 KB = 1000 bytes
+    NL_RAM_UNIT_BINARY = 1024    // Windows default: 1 KB = 1024 bytes
+} nl_ram_unit_t;
+
+// Set RAM unit (affects nl_sys_info_get_total_ram)
+NL_API void nl_sys_info_set_ram_unit(nl_ram_unit_t unit);
+NL_API nl_ram_unit_t nl_sys_info_get_ram_unit(void);
+
+// Get system information (lazily loaded)
+NL_API const char* nl_sys_info_get_os_name(void);
+NL_API const char* nl_sys_info_get_architecture(void);
+NL_API const char* nl_sys_info_get_cpu_model(void);
+NL_API int64_t nl_sys_info_get_total_ram(void);  // Returns bytes based on configured unit
+NL_API const char* nl_sys_info_get_runtime_version(void);
+
+// Release cached system info (for lazy reload)
+NL_API void nl_sys_info_clear_cache(void);
+
+// Check if system info has been loaded
+NL_API int nl_sys_info_is_loaded(void);
+
+// =========================================
+// Lazy Loading Configuration API
+// =========================================
+
+typedef enum {
+    NL_LAZY_MODULE_HTTP = 1,
+    NL_LAZY_MODULE_WEBSOCKET = 2,
+    NL_LAZY_MODULE_TCP = 4,
+    NL_LAZY_MODULE_UDP = 8,
+    NL_LAZY_MODULE_TOML = 16,
+    NL_LAZY_MODULE_JSON = 32,
+    NL_LAZY_MODULE_SYSINFO = 64,
+    NL_LAZY_MODULE_ALL = 0xFF
+} nl_lazy_module_t;
+
+typedef enum {
+    NL_LAZY_STATUS_UNLOADED = 0,
+    NL_LAZY_STATUS_LOADING = 1,
+    NL_LAZY_STATUS_LOADED = 2,
+    NL_LAZY_STATUS_STOPPING = 3,
+    NL_LAZY_STATUS_STOPPED = 4
+} nl_lazy_status_t;
+
+NL_API void nl_lazy_enable(int enable);
+NL_API void nl_lazy_enable_module(nl_lazy_module_t module);
+NL_API void nl_lazy_disable_module(nl_lazy_module_t module);
+NL_API int nl_lazy_is_enabled(nl_lazy_module_t module);
+NL_API void nl_lazy_clear_all_cache(void);
+NL_API void nl_lazy_preload_module(nl_lazy_module_t module);
+
+NL_API void nl_lazy_stop_module(nl_lazy_module_t module);
+NL_API nl_lazy_status_t nl_lazy_get_module_status(nl_lazy_module_t module);
+NL_API int nl_lazy_is_module_loaded(nl_lazy_module_t module);
+NL_API int nl_lazy_set_thread_count(int count);
+NL_API int nl_lazy_get_thread_count(void);
 
 #ifdef __cplusplus
 }
