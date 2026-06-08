@@ -5,8 +5,10 @@ set -e
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
 
+VERSION="2.1.6"
+
 echo "================================================"
-echo "  NetLeaf v2.1.5 - Linux 一键构建"
+echo "  NetLeaf v${VERSION} - Linux 一键构建"
 echo "================================================"
 echo ""
 
@@ -70,7 +72,7 @@ for ARCH in "${AVAILABLE_ARCHES[@]}"; do
     export CC=${ARCH_COMPILERS[$ARCH]:-gcc}
     export CXX=${ARCH_COMPILERS[$ARCH]:-g++}
     
-    if cmake .. -DCMAKE_BUILD_TYPE=Release; then
+    if cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=ON; then
         if cmake --build .; then
             echo "[OK] Linux $ARCH 构建成功"
             BUILD_SUCCESS=$((BUILD_SUCCESS + 1))
@@ -88,10 +90,12 @@ echo ""
 for ARCH in "${SUCCESSFUL_ARCHES[@]}"; do
     BUILD_DIR="build_${ARCH}"
     echo "  打包 Linux $ARCH..."
-    tar -czvf "releases/NetLeaf-2.1.5-linux-${ARCH}.tar.gz" \
+    tar -czvf "releases/NetLeaf-${VERSION}-linux-${ARCH}.tar.gz" \
         "$BUILD_DIR/lib/libnetleaf.so" \
         "$BUILD_DIR/lib/libnetleaf.a" \
-        "include/netleaf.h"
+        "$BUILD_DIR/bin/example_all_features" \
+        "include/netleaf.h" \
+        "examples/example_all_features.c"
 done
 
 echo ""
@@ -99,4 +103,9 @@ echo "================================================"
 echo "  构建完成"
 echo "================================================"
 echo "成功构建: $BUILD_SUCCESS / $TOTAL_BUILDS"
+echo ""
+echo "Packages location: releases/"
+for ARCH in "${SUCCESSFUL_ARCHES[@]}"; do
+    echo "  - NetLeaf-${VERSION}-linux-${ARCH}.tar.gz"
+done
 echo ""

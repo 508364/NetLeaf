@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(NetLeaf VERSION 2.1.5 LANGUAGES C)
+project(NetLeaf VERSION 2.1.6 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -115,17 +115,33 @@ if(BUILD_STATIC_LIBS)
     endif()
 endif()
 
+if(BUILD_EXAMPLES)
+    message(STATUS "Building examples...")
+    
+    set(EXAMPLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+    
+    add_executable(example_all_features ${EXAMPLES_DIR}/example_all_features.c)
+    target_link_libraries(example_all_features netleaf_static ${LINK_LIBS})
+    target_compile_definitions(example_all_features PRIVATE DEBUG_LOGGING)
+    
+    message(STATUS "Examples will be built to: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
+
 # 构建摘要
 message(STATUS "")
 message(STATUS "========================================")
-message(STATUS "  NetLeaf v${PROJECT_VERSION} - Library Only")
+message(STATUS "  NetLeaf v${PROJECT_VERSION}")
 message(STATUS "========================================")
 message(STATUS "Platform: ${PLATFORM_NAME}")
 if(NOT WIDE_LIB)
     message(STATUS "Architecture: ${ARCH_NAME}")
 endif()
 message(STATUS "Mode: ${WIDE_LIB} (Wide-Usable)")
+message(STATUS "Build examples: ${BUILD_EXAMPLES}")
 message(STATUS "")
 message(STATUS "Output directories:")
 message(STATUS "  Libraries: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+if(BUILD_EXAMPLES)
+    message(STATUS "  Examples: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
 message(STATUS "")

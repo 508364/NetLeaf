@@ -19,10 +19,10 @@
 extern "C" {
 #endif
 
-#define NETLEAF_VERSION "2.1.5"
+#define NETLEAF_VERSION "2.1.6"
 #define NETLEAF_VERSION_MAJOR 2
 #define NETLEAF_VERSION_MINOR 1
-#define NETLEAF_VERSION_PATCH 5
+#define NETLEAF_VERSION_PATCH 6
 
 typedef enum {
     NL_OK = 0,
@@ -226,6 +226,102 @@ NL_API void nl_web_set_encoding(nl_web_server_t* server, const char* encoding);
 
 // Validate encoding string
 NL_API int nl_web_validate_encoding(const char* encoding);
+
+// =========================================
+// Dynamic Encoding Adaptation API (v2.1.6)
+// =========================================
+// Auto-detect and convert encoding based on client request
+// "见人说人话，见鬼说鬼话" - automatic encoding negotiation and conversion
+
+// Enable/disable automatic encoding negotiation
+// When enabled, the library will:
+// 1. Parse Accept-Charset header from client
+// 2. Automatically convert responses to the client's preferred encoding
+// 3. Handle bidirectional conversion between internal UTF-8 and external encodings
+NL_API void nl_web_enable_auto_encoding(nl_web_server_t* server, int enable);
+
+// Check if auto-encoding is enabled
+NL_API int nl_web_is_auto_encoding_enabled(nl_web_server_t* server);
+
+// Set fallback encoding when client doesn't specify
+NL_API void nl_web_set_fallback_encoding(nl_web_server_t* server, const char* encoding);
+
+// Get the negotiated encoding for a request
+// Returns the encoding that will be used for the response
+NL_API const char* nl_web_get_negotiated_encoding(nl_web_server_t* server);
+
+// Global encoding conversion functions
+// Convert string from source_encoding to target_encoding
+// Returns allocated buffer, must be freed by caller
+// Smart optimization: Only converts non-ASCII characters to reduce performance overhead
+NL_API char* nl_encoding_convert(const char* input, size_t input_len, 
+                                 const char* source_encoding, const char* target_encoding);
+
+// Detect encoding of a string
+// Returns the most likely encoding or NULL if undetectable
+NL_API const char* nl_encoding_detect(const char* input, size_t input_len);
+
+// Get system default encoding
+NL_API const char* nl_encoding_get_system_default(void);
+
+// =========================================
+// Multi-Scenario Encoding Conversion API
+// =========================================
+// All functions support lazy loading and automatic cleanup
+// Only processes non-ASCII characters to minimize performance impact
+
+// Console output with automatic encoding conversion
+// Automatically converts to console's native encoding
+NL_API void nl_encoding_console_output(const char* text, const char* encoding);
+
+// HTML response encoding conversion
+// Input is assumed to be UTF-8, converts to target_encoding
+NL_API char* nl_encoding_html_convert(const char* html, size_t html_len, const char* target_encoding);
+
+// JSON response encoding conversion
+// Input is assumed to be UTF-8, converts to target_encoding
+NL_API char* nl_encoding_json_convert(const char* json, size_t json_len, const char* target_encoding);
+
+// TOML response encoding conversion
+// Input is assumed to be UTF-8, converts to target_encoding
+NL_API char* nl_encoding_toml_convert(const char* toml, size_t toml_len, const char* target_encoding);
+
+// Vue code encoding conversion
+// Input is assumed to be UTF-8, converts to target_encoding
+NL_API char* nl_encoding_vue_convert(const char* vue_code, size_t vue_len, const char* target_encoding);
+
+// Inline page code encoding conversion
+// Input is assumed to be UTF-8, converts to target_encoding
+NL_API char* nl_encoding_inline_convert(const char* code, size_t code_len, const char* target_encoding);
+
+// Log output encoding conversion
+// Input is assumed to be UTF-8, converts to target_encoding
+NL_API char* nl_encoding_log_convert(const char* log, size_t log_len, const char* target_encoding);
+
+// =========================================
+// Chinese Simplified/Traditional Conversion API
+// =========================================
+
+// Check if text contains simplified Chinese characters
+NL_API int nl_encoding_is_simplified_chinese(const char* input, size_t input_len);
+
+// Check if text contains traditional Chinese characters
+NL_API int nl_encoding_is_traditional_chinese(const char* input, size_t input_len);
+
+// Convert between simplified and traditional Chinese
+// to_traditional: 1 = simplified -> traditional, 0 = traditional -> simplified
+// Input must be UTF-8, output is UTF-8
+NL_API char* nl_encoding_chinese_convert(const char* input, size_t input_len, int to_traditional);
+
+// =========================================
+// Encoding Module Management API (Lazy Loading)
+// =========================================
+
+// Check if encoding module is loaded
+NL_API int nl_encoding_is_module_loaded(void);
+
+// Unload encoding module (automatic cleanup, reduces memory usage)
+NL_API void nl_encoding_unload_module(void);
 
 // Error and warning API
 typedef enum {

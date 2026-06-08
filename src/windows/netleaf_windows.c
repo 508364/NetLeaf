@@ -1496,6 +1496,8 @@ struct nl_web_server {
     nl_web_route_t* routes;
     CRITICAL_SECTION mutex;
     char encoding[32];
+    int auto_encoding_enabled;
+    char fallback_encoding[32];
     struct nl_web_server* next;
 };
 
@@ -1796,8 +1798,156 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
     LeaveCriticalSection(&server->mutex);
 }
 
+static int charset_module_loaded = 0;
+
+static void charset_module_init(void) {
+    if (!charset_module_loaded) {
+        charset_module_loaded = 1;
+    }
+}
+
+static void charset_module_cleanup(void) {
+    if (charset_module_loaded) {
+        charset_module_loaded = 0;
+    }
+}
+
+static int strcasecmp_n(const char* str1, const char* str2, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c1 = str1[i];
+        char c2 = str2[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return c1 - c2;
+        if (c1 == '\0') return 0;
+    }
+    return 0;
+}
+
+static const char* find_charset_case_insensitive(const char* html) {
+    const char* p = html;
+    while ((p = strstr(p, "charset")) != NULL) {
+        if (p > html && *(p - 1) != '<') {
+            p += 7;
+            continue;
+        }
+        
+        const char* eq = strchr(p, '=');
+        if (eq) {
+            return eq;
+        }
+        p += 7;
+    }
+    return NULL;
+}
+
+static const char* find_tag_case_insensitive(const char* html, const char* tag) {
+    const char* p = html;
+    size_t tag_len = strlen(tag);
+    
+    while ((p = strstr(p, "<")) != NULL) {
+        p++;
+        if (strcasecmp_n(p, tag, tag_len) == 0) {
+            char next = p[tag_len];
+            if (next == '>' || next == ' ' || next == '\t' || next == '\n' || next == '\r') {
+                return p - 1;
+            }
+        }
+        p++;
+    }
+    return NULL;
+}
+
+static char* add_charset_if_missing(nl_web_server_t* server, const char* html) {
+    charset_module_init();
+    
+    if (!server || !html) {
+        charset_module_cleanup();
+        char* empty = (char*)malloc(1);
+        if (empty) *empty = '\0';
+        return empty;
+    }
+    
+    const char* encoding = server->encoding;
+    if (strlen(encoding) == 0) {
+        charset_module_cleanup();
+        char* copy = (char*)malloc(strlen(html) + 1);
+        if (copy) strcpy(copy, html);
+        return copy;
+    }
+    
+    if (find_charset_case_insensitive(html)) {
+        charset_module_cleanup();
+        char* copy = (char*)malloc(strlen(html) + 1);
+        if (copy) strcpy(copy, html);
+        return copy;
+    }
+    
+    const char* insert_pos = NULL;
+    size_t insert_offset = 0;
+    
+    const char* head_start = find_tag_case_insensitive(html, "head");
+    if (head_start) {
+        insert_offset = head_start - html + strlen("<head");
+        while (html[insert_offset] != '>' && html[insert_offset] != '\0') {
+            insert_offset++;
+        }
+        if (html[insert_offset] == '>') {
+            insert_offset++;
+        }
+        insert_pos = html + insert_offset;
+    } else {
+        const char* html_start = find_tag_case_insensitive(html, "html");
+        if (html_start) {
+            insert_offset = html_start - html + strlen("<html");
+            while (html[insert_offset] != '>' && html[insert_offset] != '\0') {
+                insert_offset++;
+            }
+            if (html[insert_offset] == '>') {
+                insert_offset++;
+            }
+            insert_pos = html + insert_offset;
+        }
+    }
+    
+    if (!insert_pos) {
+        insert_pos = html;
+        insert_offset = 0;
+    }
+    
+    size_t html_len = strlen(html);
+    size_t charset_tag_len = strlen("<meta charset=\"\">") + strlen(encoding);
+    size_t new_len = html_len + charset_tag_len + 1;
+    
+    if (new_len > 1048576) {
+        charset_module_cleanup();
+        char* copy = (char*)malloc(html_len + 1);
+        if (copy) strcpy(copy, html);
+        return copy;
+    }
+    
+    char* result = (char*)malloc(new_len);
+    if (!result) {
+        charset_module_cleanup();
+        char* copy = (char*)malloc(html_len + 1);
+        if (copy) strcpy(copy, html);
+        return copy;
+    }
+    
+    memcpy(result, html, insert_offset);
+    snprintf(result + insert_offset, new_len - insert_offset, 
+             "<meta charset=\"%s\">%s", encoding, html + insert_offset);
+    
+    charset_module_cleanup();
+    return result;
+}
+
 void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html) {
-    add_web_route(server, path, html, "text/html");
+    char* processed = add_charset_if_missing(server, html);
+    if (processed) {
+        add_web_route(server, path, processed, "text/html");
+        free(processed);
+    }
 }
 
 void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code) {
@@ -1827,6 +1977,29 @@ void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_c
 void nl_web_set_encoding(nl_web_server_t* server, const char* encoding) {
     if (!server || !encoding) return;
     strncpy(server->encoding, encoding, sizeof(server->encoding) - 1);
+}
+
+NL_API void nl_web_enable_auto_encoding(nl_web_server_t* server, int enable) {
+    if (!server) return;
+    server->auto_encoding_enabled = enable;
+}
+
+NL_API int nl_web_is_auto_encoding_enabled(nl_web_server_t* server) {
+    if (!server) return 0;
+    return server->auto_encoding_enabled;
+}
+
+NL_API void nl_web_set_fallback_encoding(nl_web_server_t* server, const char* encoding) {
+    if (!server || !encoding) return;
+    strncpy(server->fallback_encoding, encoding, sizeof(server->fallback_encoding) - 1);
+}
+
+NL_API const char* nl_web_get_negotiated_encoding(nl_web_server_t* server) {
+    if (!server) return NULL;
+    if (server->auto_encoding_enabled && strlen(server->fallback_encoding) > 0) {
+        return server->fallback_encoding;
+    }
+    return server->encoding;
 }
 
 static char* substitute_variables(const char* template, const char** vars, const char** values, int count) {
@@ -1939,7 +2112,7 @@ void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* t
     char html[32768];
     snprintf(html, sizeof(html),
         "<!DOCTYPE html>\n"
-        "<html><head><title>%s</title>\n"
+        "<html><head><meta charset=\"UTF-8\"><title>%s</title>\n"
         "%s"
         "%s"
         "</head><body>\n"
@@ -1971,7 +2144,7 @@ void nl_web_add_dashboard(nl_web_server_t* server, const char* path, const char*
     char html[65536];
     snprintf(html, sizeof(html),
         "<!DOCTYPE html>\n"
-        "<html><head><title>%s</title>\n"
+        "<html><head><meta charset=\"UTF-8\"><title>%s</title>\n"
         "%s"
         "%s"
         "</head><body>\n"
@@ -2007,7 +2180,7 @@ void nl_web_add_dashboard(nl_web_server_t* server, const char* path, const char*
         "  </div>\n"
         "</div>\n"
         "<script>\n"
-        "const { createApp, reactive, onMounted } = Vue;\n"
+        "const { createApp, ref, reactive, onMounted } = Vue;\n"
         "createApp({\n"
         "  setup() {\n"
         "    const title = ref('%s');\n"
@@ -2061,7 +2234,7 @@ void nl_web_add_form(nl_web_server_t* server, const char* path, const char* titl
     
     snprintf(html, sizeof(html),
         "<!DOCTYPE html>\n"
-        "<html><head><title>%s</title>\n"
+        "<html><head><meta charset=\"UTF-8\"><title>%s</title>\n"
         "%s"
         "%s"
         "</head><body>\n"
@@ -2127,6 +2300,7 @@ void nl_web_add_todo(nl_web_server_t* server, const char* path, const char* titl
         "<!DOCTYPE html>\n"
         "<html>\n"
         "<head>\n"
+        "  <meta charset=\"UTF-8\">\n"
         "  <title>%s</title>\n"
         "%s"
         "%s"
@@ -2202,6 +2376,7 @@ void nl_web_add_chat(nl_web_server_t* server, const char* path, const char* titl
         "<!DOCTYPE html>\n"
         "<html>\n"
         "<head>\n"
+        "  <meta charset=\"UTF-8\">\n"
         "  <title>%s</title>\n"
         "%s"
         "%s"

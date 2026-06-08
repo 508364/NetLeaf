@@ -1,10 +1,11 @@
-# NetLeaf v2.0.0 - 快速开始指南
+# NetLeaf v2.1.6 - 快速开始指南
 
 ## 目录
 
 1. [编译和安装](#1-编译和安装)
 2. [5分钟快速上手指南](#2-5分钟快速上手)
 3. [API速查表](#3-api速查表)
+4. [编码动态适配](#4-编码动态适配)
 
 ---
 
@@ -216,6 +217,56 @@ gcc your_app.c -I NetLeaf/include -L NetLeaf/build/lib -lnetleaf -lpthread -o yo
 |------|------|
 | `example_basic_web.c` | 基础Web服务器示例 |
 | `example_tcp_server.c` | TCP回显服务器 |
+
+---
+
+---
+
+## 4. 编码动态适配（v2.1.6新增）
+
+自动编码协商功能，实现"见人说人话，见鬼说鬼话"的智能转码。
+
+### 启用自动编码
+
+```c
+#include "netleaf.h"
+
+int main() {
+    nl_web_server_t* server = nl_web_create(8080);
+    
+    // 启用自动编码协商
+    nl_web_enable_auto_encoding(server, 1);
+    
+    // 设置回退编码
+    nl_web_set_fallback_encoding(server, "UTF-8");
+    
+    // 添加页面（内部始终使用UTF-8）
+    nl_web_add_html(server, "/", "<h1>你好，世界！</h1>");
+    
+    while (1) Sleep(1000);
+    return 0;
+}
+```
+
+### 编码转换API
+
+| 函数 | 说明 |
+|------|------|
+| `nl_web_enable_auto_encoding(server, enable)` | 启用/禁用自动编码协商 |
+| `nl_encoding_convert(input, len, src, dst)` | 编码转换（双向转换） |
+| `nl_encoding_detect(input, len)` | 自动检测字符串编码 |
+| `nl_encoding_get_system_default()` | 获取系统默认编码 |
+
+### 支持的编码
+
+- UTF-8、GBK、GB2312、GB18030、Big5、ISO-8859-1、US-ASCII、UTF-16
+
+### 特性
+
+- ✅ 自动解析客户端Accept-Charset请求头
+- ✅ 运行时自动转码响应内容
+- ✅ 仅对非ASCII字符进行转码优化
+- ✅ 懒加载机制，使用后自动下线
 
 ---
 

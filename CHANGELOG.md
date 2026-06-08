@@ -1,5 +1,46 @@
 # NetLeaf 版本历史
 
+## v2.1.6
+
+**新增功能 - 编码动态适配:**
+- `nl_web_enable_auto_encoding(server, enable)` - 启用/禁用自动编码协商
+- `nl_web_is_auto_encoding_enabled(server)` - 检查是否启用自动编码
+- `nl_web_set_fallback_encoding(server, encoding)` - 设置回退编码
+- `nl_web_get_negotiated_encoding(server)` - 获取协商后的编码
+- `nl_encoding_convert(input, len, src_enc, dst_enc)` - 编码转换函数
+- `nl_encoding_detect(input, len)` - 自动检测字符串编码
+- `nl_encoding_get_system_default()` - 获取系统默认编码
+
+**编码支持:**
+- UTF-8
+- GBK
+- GB2312
+- GB18030
+- Big5
+- ISO-8859-1
+- US-ASCII
+- UTF-16
+
+**全场景支持:**
+- ✅ 控制台输出
+- ✅ Web响应
+- ✅ HTML页面
+- ✅ Vue组件
+- ✅ JSON响应
+- ✅ TOML响应
+
+**特性:**
+- 自动解析客户端Accept-Charset请求头
+- 运行时自动转码响应内容
+- 双向编码转换（任意编码之间互相转换）
+- 跨平台支持（Windows/Linux）
+- 懒加载机制：功能拉起使用后自动下线，减少内存占用
+- 智能优化：仅对非ASCII字符进行转码，减少性能开销
+
+**编译器编码修复:**
+- 默认使用UTF-8编码编译
+- 解决中文乱码问题
+
 ## v2.1.5
 
 **新增功能:**

@@ -1,4 +1,4 @@
-# NetLeaf v2.1.5
+# NetLeaf v2.1.6
 
 High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.
 
@@ -14,6 +14,7 @@ High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HT
 - ✅ **Lazy Loading**: All components support lazy loading
 - ✅ **System Info**: OS/Architecture/CPU/RAM/Runtime information
 - ✅ **Multi-threading**: Configurable thread pool (1-256 threads)
+- ✅ **Dynamic Encoding**: Auto encoding negotiation and transcoding (UTF-8, GBK, Big5, etc.)
 
 ## Quick Start
 
@@ -98,6 +99,23 @@ void nl_lazy_stop_module(int module);
 void nl_lazy_set_thread_count(int count); // 1-256 threads
 ```
 
+### Dynamic Encoding API
+
+```c
+// Enable auto encoding negotiation
+void nl_web_enable_auto_encoding(nl_web_server_t* server, int enable);
+
+// Convert encoding between formats
+char* nl_encoding_convert(const char* input, size_t len, 
+                          const char* src_enc, const char* dst_enc);
+
+// Detect string encoding
+const char* nl_encoding_detect(const char* input, size_t len);
+
+// Get system default encoding
+const char* nl_encoding_get_system_default(void);
+```
+
 ## Gitee Repository
 
 ```
@@ -114,4 +132,4 @@ MIT License
 
 ## Version
 
-2.1.5
+2.1.6

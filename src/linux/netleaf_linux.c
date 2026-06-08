@@ -1544,6 +1544,8 @@ struct nl_web_server {
     pthread_mutex_t mutex;
     char encoding[32];
     struct nl_web_server* next;
+    int auto_encoding_enabled;
+    char fallback_encoding[32];
 };
 
 static struct nl_web_server* g_web_servers = NULL;
@@ -3136,3 +3138,26 @@ int nl_toml_save_file(void* toml, const char* file_path) {
     return NL_OK;
 }
 const char* nl_toml_error_message(nl_status_t error_code) { return nl_json_error_message(error_code); }
+
+NL_API void nl_web_enable_auto_encoding(nl_web_server_t* server, int enable) {
+    if (!server) return;
+    server->auto_encoding_enabled = enable;
+}
+
+NL_API int nl_web_is_auto_encoding_enabled(nl_web_server_t* server) {
+    if (!server) return 0;
+    return server->auto_encoding_enabled;
+}
+
+NL_API void nl_web_set_fallback_encoding(nl_web_server_t* server, const char* encoding) {
+    if (!server || !encoding) return;
+    strncpy(server->fallback_encoding, encoding, sizeof(server->fallback_encoding) - 1);
+}
+
+NL_API const char* nl_web_get_negotiated_encoding(nl_web_server_t* server) {
+    if (!server) return NULL;
+    if (server->auto_encoding_enabled && strlen(server->fallback_encoding) > 0) {
+        return server->fallback_encoding;
+    }
+    return server->encoding;
+}

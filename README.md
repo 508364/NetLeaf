@@ -1,27 +1,11 @@
-<img src="Logo.svg" width="80" height="80" align="left"> 
+<img src="Logo.svg" width="40" height="40" align="left"> 
 
-### **NetLeaf v2.1.5**
+### **NetLeaf v2.1.6**
 高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器
 
 **仓库地址:**
 - GitHub: [https://github.com/508364/NetLeaf](https://github.com/508364/NetLeaf)
 - Gitee: [https://gitee.com/x508364/NetLeaf](https://gitee.com/x508364/NetLeaf)
-
-## 新增功能 (v2.1.5)
-
-- ✅ **系统信息组件**: 获取运行系统名称/架构/CPU/RAM总量/运行库版本（懒加载）
-- ✅ **RAM进制配置**: 支持1000进制（Linux默认）和1024进制（Windows默认）
-- ✅ **安全增强**: 只能停止由本库启动的端口，防止误操作
-- ✅ **全局懒加载**: 所有组件支持懒加载，仅在使用时加载，减轻启动性能消耗
-- ✅ **简化启动**: `nl_web_create(port)` 创建即启动，无需单独调用 `nl_web_start`
-- ✅ **按端口停止**: `nl_web_stop_by_port(port)` 支持通过端口号停止服务器
-- ✅ **自动清理**: `nl_web_set_auto_cleanup(1)` 程序退出时自动释放所有服务器资源
-- ✅ **变量硬编码**: 服务器端变量替换，用户F12无法看到原始变量名
-- ✅ **自定义编码**: 支持设置响应编码（UTF-8等）
-- ✅ **完整日志系统**: 支持DEBUG/INFO/WARN/ERROR级别
-- ✅ **自动交叉编译检测**: Linux脚本自动检测可用工具链
-- ✅ **Debug模式**: 一键启用调试日志
-- ✅ **异步并发优化**: 完整的异步IO支持，优化性能消耗
 
 ## 快速开始
 
@@ -186,26 +170,18 @@ int main() {
 
 ## 更新日志
 
-### v2.1.5
+## 新增功能 (v2.1.6)
 
-**新增功能:**
-- `nl_sys_info_get_os_name()` - 获取操作系统名称
-- `nl_sys_info_get_architecture()` - 获取系统架构
-- `nl_sys_info_get_cpu_model()` - 获取CPU型号
-- `nl_sys_info_get_total_ram()` - 获取总内存（字节）
-- `nl_sys_info_get_runtime_version()` - 获取运行库版本
-- `nl_sys_info_set_ram_unit(unit)` - 设置RAM进制（1000/1024）
-- `nl_sys_info_clear_cache()` - 清除缓存（用于重新加载）
-- **懒加载机制**: 系统信息仅在首次调用时加载
-- **安全增强**: `nl_web_stop_by_port()` 只能停止本库启动的端口
+- ✅ **编码动态适配**: 自动解析客户端Accept-Charset请求头，自动转码响应内容（见人说人话，见鬼说鬼话）
+- ✅ **全场景支持**: 控制台输出、Web响应、HTML、Vue、JSON响应、TOML响应全面支持
+- ✅ **双向编码转换**: 支持UTF-8/GBK/GB2312/GB18030/Big5等编码之间的双向转换
+- ✅ **编码自动检测**: 自动检测字符串编码格式
+- ✅ **系统编码获取**: 获取系统默认编码
+- ✅ **自动编码协商**: 服务端自动与客户端协商最优编码
+- ✅ **懒加载机制**: 功能拉起使用后自动下线，减少内存占用
+- ✅ **智能优化**: 仅对非ASCII字符进行转码，减少性能开销
+- ✅ **编译器编码修复**: 默认使用UTF-8编码编译，解决中文乱码问题
 
-**RAM进制配置:**
-- Linux 默认: 1000进制（符合SI标准）
-- Windows 默认: 1024进制（传统二进制）
-- 可通过 `nl_sys_info_set_ram_unit(NL_RAM_UNIT_DECIMAL)` 或 `nl_sys_info_set_ram_unit(NL_RAM_UNIT_BINARY)` 切换
-
-**安全更新:**
-- 只能停止由本库启动的端口，防止误操作其他进程的端口
 
 **查看完整版本历史:** [CHANGELOG.md](CHANGELOG.md)
 
