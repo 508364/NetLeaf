@@ -1,7 +1,12 @@
 <img src="Logo.svg" width="40" height="40" align="left"> 
 
-### **NetLeaf v2.1.6**
+### **NetLeaf v2.2.0**
 高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器
+
+**平台支持:**
+- ✅ Windows (IOCP) - 完全支持
+- ✅ Linux (epoll) - 完全支持
+- 🔶 macOS (kqueue) - **初步支持** (v2.2.0新增)
 
 **仓库地址:**
 - GitHub: [https://github.com/508364/NetLeaf](https://github.com/508364/NetLeaf)
@@ -170,17 +175,13 @@ int main() {
 
 ## 更新日志
 
-## 新增功能 (v2.1.6)
+## 新增功能 (v2.2.0)
 
-- ✅ **编码动态适配**: 自动解析客户端Accept-Charset请求头，自动转码响应内容（见人说人话，见鬼说鬼话）
-- ✅ **全场景支持**: 控制台输出、Web响应、HTML、Vue、JSON响应、TOML响应全面支持
-- ✅ **双向编码转换**: 支持UTF-8/GBK/GB2312/GB18030/Big5等编码之间的双向转换
-- ✅ **编码自动检测**: 自动检测字符串编码格式
-- ✅ **系统编码获取**: 获取系统默认编码
-- ✅ **自动编码协商**: 服务端自动与客户端协商最优编码
-- ✅ **懒加载机制**: 功能拉起使用后自动下线，减少内存占用
-- ✅ **智能优化**: 仅对非ASCII字符进行转码，减少性能开销
-- ✅ **编译器编码修复**: 默认使用UTF-8编码编译，解决中文乱码问题
+- ✅ **macOS平台支持**: 初步支持macOS (kqueue事件机制)
+- ✅ **Auto-complete机制**: 自动补全charset标签和自动引入Vue库（独立可拆卸模块）
+- ✅ **Auto-route机制**: 404时自动查找相近端点并提示（独立可拆卸模块）
+- ✅ **自定义错误页面**: 支持设置自定义错误页面模板，强制预留变量区域
+- ✅ **错误页面联动**: 错误页面可与autoroute联动，显示路由建议
 
 
 **查看完整版本历史:** [CHANGELOG.md](CHANGELOG.md)
@@ -513,7 +514,7 @@ gcc myapp.c -I include -L build/lib -lnetleaf -lpthread -o myapp
 ✅ **内联HTML/Vue** - 直接在代码中嵌入响应式界面  
 ✅ **预设组件** - 计数器、面板、表单等开箱即用  
 ✅ **现代CSS** - 美观的渐变和动画效果  
-✅ **跨平台** - Windows (IOCP) + Linux (epoll)  
+✅ **跨平台** - Windows (IOCP) + Linux (epoll) + macOS (kqueue) 🔶  
 ✅ **宽可用库** - 简洁统一的输出结构  
 ✅ **无外部依赖** - 仅使用系统API  
 ✅ **多架构支持** - x86, x64, ARM, ARM64
@@ -546,3 +547,175 @@ int nl_serve_dashboard(int port, const char* title);
 ```
 
 更多API请查看 `include/netleaf.h`。
+
+## 附加模块
+
+以下模块是从主库分离出来的独立库，与主库共用版本号(v2.2.0)，构建时一起构建。
+
+### 1. Auto-complete 模块 (netleaf_autocomplete)
+
+**功能：** 自动补全内联HTML/Vue代码中缺失的编码声明，以及自动引入Vue库。
+
+**特性：**
+- **Charset自动补全**: 根据程序设置的统一编码格式自动添加 `<meta charset>` 和 `<meta name="viewport">` 标签
+- **Vue自动引用**: 检测Vue代码但没有Vue引用时，自动从CDN引入Vue库
+- **独立功能控制**: charset和Vue功能可以单独启用/禁用
+- **灵活启用方式**: 支持 `1/0`、`true/false`、`on/off`、`yes/no`（大小写不敏感）
+
+**平台支持：**
+- ✅ Windows - 使用系统API
+- ✅ Linux - 使用系统API
+- ✅ macOS - 使用系统API
+
+**使用示例：**
+```c
+#include "netleaf_autocomplete.h"
+
+int main() {
+    // 初始化模块
+    nl_autocomplete_init();
+    
+    // 设置统一编码格式
+    nl_autocomplete_set_encoding("UTF-8");
+    
+    // 启用模块（支持字符串）
+    nl_autocomplete_enable_ex("true");  // 或 "on", "yes", "1"
+    
+    // 单独控制功能
+    nl_autocomplete_enable_feature(NL_AUTOCOMPLETE_FEATURE_CHARSET);  // 启用charset
+    nl_autocomplete_disable_feature(NL_AUTOCOMPLETE_FEATURE_VUE);     // 禁用Vue
+    
+    // 处理HTML
+    const char* html = "<html><body>Hello</body></html>";
+    char* result = nl_autocomplete_process_html(html, strlen(html), NULL);
+    
+    // result: <html><head><meta charset="UTF-8">...</head><body>Hello</body></html>
+    
+    free(result);
+    return 0;
+}
+```
+
+**构建选项：** `BUILD_AUTOCOMPLETE=ON` (默认)
+
+---
+
+### 2. Auto-route 模块 (netleaf_autoroute)
+
+**功能：** 404时自动查找相近端点并在错误页面提示。
+
+**特性：**
+- **智能路由匹配**: 使用Levenshtein距离算法计算路径相似度
+- **多策略评分**: 考虑路径段匹配、前缀共有、段数相同等因素
+- **通配符支持**: 支持 `*` 和 `**` 通配符模式
+- **灵活启用方式**: 支持 `1/0`、`true/false`、`on/off`、`yes/no`
+
+**平台支持：**
+- ✅ Windows - 完全支持
+- ✅ Linux - 完全支持
+- ✅ macOS - 完全支持
+
+**使用示例：**
+```c
+#include "netleaf_autoroute.h"
+
+int main() {
+    // 初始化模块
+    nl_autoroute_init();
+    
+    // 启用模块
+    nl_autoroute_enable_ex("true");
+    
+    // 获取全局路由匹配器
+    nl_route_matcher_t* matcher = nl_autoroute_get_global_matcher();
+    
+    // 添加已知路由
+    nl_route_matcher_add_route(matcher, "/api/users");
+    nl_route_matcher_add_route(matcher, "/api/products");
+    nl_route_matcher_add_route(matcher, "/dashboard");
+    
+    // 查找相似路由
+    char* suggestion = nl_route_matcher_find_similar(matcher, "/api/user", 0.4);
+    // suggestion: "/api/users" (相似度0.75)
+    
+    free(suggestion);
+    return 0;
+}
+```
+
+**构建选项：** `BUILD_AUTOROUTE=ON` (默认)
+
+---
+
+### 3. ErrorPage 模块 (netleaf_errorpage)
+
+**功能：** 支持自定义错误页面模板，强制预留变量区域，可与Auto-route联动。
+
+**特性：**
+- **模板系统**: 支持自定义HTML模板
+- **变量替换**: 必须预留 `{{ERROR_CODE}}`、`{{ERROR_MESSAGE}}`、`{{REQUESTED_PATH}}` 等变量
+- **条件块**: 支持 `{{#if SUGGESTION}}...{{/if}}` 条件块
+- **独立运行**: 模块未加载时错误页面功能不生效
+
+**重要声明：**
+- 该模块独立且standalone
+- 其他模块不能使用此模块的功能
+- 如果该模块未编译/加载，错误页面功能将不可用
+
+**平台支持：**
+- ✅ Windows - 完全支持
+- ✅ Linux - 完全支持
+- ✅ macOS - 完全支持
+
+**使用示例：**
+```c
+#include "netleaf_errorpage.h"
+
+int main() {
+    // 初始化模块
+    nl_errorpage_init();
+    
+    // 启用模块
+    nl_errorpage_enable_ex("true");
+    
+    // 设置自定义模板（必须包含所有必需变量）
+    const char* template = 
+        "<html><head><title>{{ERROR_CODE}} {{ERROR_MESSAGE}}</title></head>"
+        "<body><h1>{{ERROR_CODE}} {{ERROR_MESSAGE}}</h1>"
+        "<p>Path: {{REQUESTED_PATH}}</p>"
+        "{{#if SUGGESTION}}<p>Did you mean: <a href=\"{{SUGGESTION}}\">{{SUGGESTION}}</a></p>{{/if}}"
+        "<footer>Server: {{SERVER_VERSION}} at {{TIMESTAMP}}</footer></body></html>";
+    
+    nl_errorpage_set_template(404, template);
+    
+    // 生成错误响应
+    nl_errorpage_vars_t vars = {
+        .status_code = 404,
+        .error_message = "Not Found",
+        .requested_path = "/badpath",
+        .suggestion = "/correctpath",
+        .server_version = "MyApp v1.0"
+    };
+    
+    char* response = nl_errorpage_make_response(404, &vars);
+    
+    free(response);
+    return 0;
+}
+```
+
+**必需变量：**
+| 变量 | 说明 |
+|------|------|
+| `{{ERROR_CODE}}` | HTTP状态码 |
+| `{{ERROR_MESSAGE}}` | 状态码描述 |
+| `{{REQUESTED_PATH}}` | 请求路径 |
+| `{{SERVER_VERSION}}` | 服务器版本 |
+| `{{TIMESTAMP}}` | 错误时间戳 |
+
+**可选变量：**
+| 变量 | 说明 |
+|------|------|
+| `{{SUGGESTION}}` | Auto-route提供的路由建议 |
+
+**构建选项：** `BUILD_ERRORPAGE=ON` (默认)

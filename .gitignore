@@ -23,6 +23,7 @@ wiki/
 
 # Executables
 *.exe
+下一步.txt
 
 # CMake
 CMakeCache.txt

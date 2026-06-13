@@ -19,10 +19,10 @@
 extern "C" {
 #endif
 
-#define NETLEAF_VERSION "2.1.6"
+#define NETLEAF_VERSION "2.2.0"
 #define NETLEAF_VERSION_MAJOR 2
-#define NETLEAF_VERSION_MINOR 1
-#define NETLEAF_VERSION_PATCH 6
+#define NETLEAF_VERSION_MINOR 2
+#define NETLEAF_VERSION_PATCH 0
 
 typedef enum {
     NL_OK = 0,
@@ -226,6 +226,56 @@ NL_API void nl_web_set_encoding(nl_web_server_t* server, const char* encoding);
 
 // Validate encoding string
 NL_API int nl_web_validate_encoding(const char* encoding);
+
+// =========================================
+// Error Page API (v2.2.0)
+// =========================================
+// Support custom error pages with variable substitution
+// Error pages can be linked with autoroute for route suggestions
+
+typedef enum {
+    NL_ERROR_PAGE_OK = 0,
+    NL_ERROR_PAGE_NOT_FOUND = 1,
+    NL_ERROR_PAGE_INVALID_TEMPLATE = 2,
+    NL_ERROR_PAGE_VAR_NOT_FOUND = 3,
+    NL_ERROR_PAGE_RENDER_FAILED = 4
+} nl_error_page_status_t;
+
+// Error page variables structure (mandatory fields for substitution)
+typedef struct {
+    int status_code;              // HTTP status code (404, 500, etc.)
+    const char* error_message;    // Error description
+    const char* requested_path;   // Requested URL path
+    const char* suggestion;       // Suggested route (from autoroute)
+    const char* timestamp;        // Server timestamp
+    const char* server_version;   // Server version string
+} nl_error_page_vars_t;
+
+// Set custom error page template for a status code
+// Template file must contain mandatory placeholders:
+//   {{ERROR_CODE}}, {{ERROR_MESSAGE}}, {{REQUESTED_PATH}}, {{SUGGESTION}}
+NL_API int nl_web_server_set_error_page(nl_web_server_t* server,
+                                        int status_code,
+                                        const char* template_path);
+
+// Enable/disable autoroute suggestions on error pages
+NL_API int nl_web_server_enable_error_suggestions(nl_web_server_t* server,
+                                                   int enable);
+
+// Check if error suggestions are enabled
+NL_API int nl_web_server_is_error_suggestions_enabled(nl_web_server_t* server);
+
+// Render error page with given variables
+// Returns allocated string, must be freed by caller
+NL_API char* nl_render_error_page(const char* template_content,
+                                   nl_error_page_vars_t* vars);
+
+// Quick error page response generation
+// Builds a default error page with the given status and message
+NL_API char* nl_make_error_response(int status_code,
+                                     const char* error_message,
+                                     const char* requested_path,
+                                     const char* suggestion);
 
 // =========================================
 // Dynamic Encoding Adaptation API (v2.1.6)

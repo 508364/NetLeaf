@@ -9,6 +9,7 @@
  *   添加编译宏 DEBUG_LOGGING
  */
 
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(NetLeaf VERSION 2.1.6 LANGUAGES C)
+project(NetLeaf VERSION 2.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -10,6 +10,9 @@ option(WIDE_LIB "Build as wide-usable library (simple output structure)" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(BUILD_STATIC_LIBS "Build static libraries" ON)
 option(BUILD_EXAMPLES "Build example programs" OFF)
+option(BUILD_AUTOCOMPLETE "Build autocomplete module (auto charset/Vue completion)" ON)
+option(BUILD_AUTOROUTE "Build autoroute module (auto route suggestions)" ON)
+option(BUILD_ERRORPAGE "Build errorpage module (better error pages with templates)" ON)
 
 # 平台检测
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -20,6 +23,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set(PLATFORM_NAME "Windows")
     set(PLATFORM_SOURCE "windows")
     message(STATUS "Platform: Windows (IOCP)")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(PLATFORM_NAME "macOS")
+    set(PLATFORM_SOURCE "macos")
+    message(STATUS "Platform: macOS (kqueue)")
 else()
     message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}")
 endif()
@@ -83,18 +90,37 @@ elseif(PLATFORM_NAME STREQUAL "Windows")
         add_compile_options(/utf-8)
     endif()
     set(LINK_LIBS ws2_32 mswsock advapi32)
+elseif(PLATFORM_NAME STREQUAL "macOS")
+    set(SHARED_LIB_EXT ".dylib")
+    set(STATIC_LIB_EXT ".a")
+    find_package(Threads REQUIRED)
+    find_library(ICONV_LIB iconv)
+    set(LINK_LIBS ${CMAKE_THREAD_LIBS_INIT} m ${ICONV_LIB})
+    add_definitions(-DNL_PLATFORM_MACOS)
+    # macOS specific
+    if(BUILD_SHARED_LIBS)
+        add_definitions(-DNL_EXPORTS)
+    endif()
 endif()
 
 # 编译器优化
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3 -Wno-stringop-truncation -Wno-stringop-overflow -Wno-format-truncation")
+elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3 -Wno-string-conversion")
 elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W3 /O2")
 endif()
 
 # 共享库
 add_library(netleaf_shared SHARED ${PLATFORM_SOURCES} ${PLATFORM_OPT_SOURCES})
-target_link_libraries(netleaf_shared ${LINK_LIBS})
+target_link_libraries(netleaf_shared PUBLIC ${LINK_LIBS})
+if(PLATFORM_NAME STREQUAL "macOS")
+    set_target_properties(netleaf_shared PROPERTIES
+        INSTALL_RPATH "@loader_path"
+        BUILD_WITH_INSTALL_RPATH TRUE
+    )
+endif()
 set_target_properties(netleaf_shared PROPERTIES
     OUTPUT_NAME "netleaf"
     VERSION ${PROJECT_VERSION}
@@ -128,6 +154,24 @@ if(BUILD_EXAMPLES)
     message(STATUS "Examples will be built to: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 endif()
 
+# 可选模块 - Auto-complete
+if(BUILD_AUTOCOMPLETE)
+    message(STATUS "Building autocomplete module...")
+    add_subdirectory(src/autocomplete)
+endif()
+
+# 可选模块 - Auto-route
+if(BUILD_AUTOROUTE)
+    message(STATUS "Building autoroute module...")
+    add_subdirectory(src/autoroute)
+endif()
+
+# 可选模块 - Better Error Page
+if(BUILD_ERRORPAGE)
+    message(STATUS "Building errorpage module...")
+    add_subdirectory(src/errorpage)
+endif()
+
 # 构建摘要
 message(STATUS "")
 message(STATUS "========================================")
@@ -139,6 +183,9 @@ if(NOT WIDE_LIB)
 endif()
 message(STATUS "Mode: ${WIDE_LIB} (Wide-Usable)")
 message(STATUS "Build examples: ${BUILD_EXAMPLES}")
+message(STATUS "Build autocomplete: ${BUILD_AUTOCOMPLETE}")
+message(STATUS "Build autoroute: ${BUILD_AUTOROUTE}")
+message(STATUS "Build errorpage: ${BUILD_ERRORPAGE}")
 message(STATUS "")
 message(STATUS "Output directories:")
 message(STATUS "  Libraries: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")

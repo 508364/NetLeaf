@@ -1,5 +1,67 @@
 # NetLeaf 版本历史
 
+## v2.2.0
+
+**平台支持:**
+- ✅ Windows (IOCP) - 完全支持
+- ✅ Linux (epoll) - 完全支持
+- 🔶 macOS (kqueue) - **初步支持**
+
+**新增功能 - macOS平台:**
+- `src/macos/` 目录下的完整实现
+- kqueue替代epoll作为事件机制
+- iconv编码转换（与Linux兼容）
+- pthread懒加载机制
+- sysctl系统信息获取
+
+**附加模块 (从主库分离，与主库共用版本号):**
+
+### Auto-complete (netleaf_autocomplete)
+- **功能**: 自动补全charset标签和自动引入Vue库
+- **文件**: `src/autocomplete/`
+  - `netleaf_autocomplete.c` - 核心模块
+  - `netleaf_charset.c` - Charset自动补全
+  - `netleaf_vue_import.c` - Vue自动引入
+- **特性**:
+  - Charset自动补全：根据统一编码格式添加 `<meta charset>` 和 `<meta name="viewport">`
+  - Vue自动引用：检测Vue代码但无引用时自动从CDN引入
+  - 灵活启用方式：支持 `true/false`, `on/off`, `yes/no`, `1/0`
+  - 单独控制：charset和Vue功能可独立启用/禁用
+- **平台**: Windows/Linux/macOS 全部支持
+
+### Auto-route (netleaf_autoroute)
+- **功能**: 404时自动查找相近端点并在错误页面提示
+- **文件**: `src/autoroute/`
+  - `netleaf_autoroute.c` - 核心模块
+  - `netleaf_route_matcher.c` - 路由匹配算法
+- **特性**:
+  - Levenshtein距离算法计算路径相似度
+  - 多策略评分：路径段匹配、前缀共有、段数相同
+  - 通配符支持：`*` 和 `**`
+- **平台**: Windows/Linux/macOS 全部支持
+
+### ErrorPage (netleaf_errorpage)
+- **功能**: 支持自定义错误页面模板，强制预留变量区域
+- **文件**: `src/errorpage/`
+  - `netleaf_errorpage.c` - 完整实现
+- **特性**:
+  - 独立standalone模块，其他模块不可使用其功能
+  - 模板必须预留变量：`{{ERROR_CODE}}`, `{{ERROR_MESSAGE}}`, `{{REQUESTED_PATH}}`, `{{SERVER_VERSION}}`, `{{TIMESTAMP}}`
+  - 支持 `{{#if SUGGESTION}}` 条件块
+  - 可与Auto-route联动显示路由建议
+- **平台**: Windows/Linux/macOS 全部支持
+
+**主库API更新:**
+- `nl_web_server_set_error_page()` - 设置自定义错误页面模板
+- `nl_web_server_enable_error_suggestions()` - 启用路由建议
+- `nl_render_error_page()` - 渲染错误页面
+- `nl_make_error_response()` - 生成HTTP错误响应
+
+**构建系统更新:**
+- CMake选项: `BUILD_AUTOCOMPLETE=ON`, `BUILD_AUTOROUTE=ON`, `BUILD_ERRORPAGE=ON`
+- 所有附加模块默认一起构建，共用主库版本号
+- macOS交叉编译toolchain: `cmake/osxcross.cmake`
+
 ## v2.1.6
 
 **新增功能 - 编码动态适配:**

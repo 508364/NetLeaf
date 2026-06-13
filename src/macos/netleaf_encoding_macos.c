@@ -1,5 +1,5 @@
-#ifdef _WIN32
-#error "This file should only be compiled on Linux"
+#if defined(_WIN32)
+#error "This file should only be compiled on Linux/macOS"
 #endif
 
 #include <stdio.h>
@@ -8,7 +8,7 @@
 #include <iconv.h>
 #include <langinfo.h>
 
-#include "netleaf.h"
+#include "../../include/netleaf.h"
 
 // 编码模块懒加载状态
 static int g_encoding_module_loaded = 0;

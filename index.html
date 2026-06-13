@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetLeaf Wiki</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            display: flex;
+            min-height: 100vh;
+            background: #f6f8fa;
+        }
+        
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: #24292e;
+            color: #fff;
+            padding: 20px;
+            flex-shrink: 0;
+            overflow-y: auto;
+            position: fixed;
+            left: 0;
+            top: 0;
+            bottom: 0;
+        }
+        
+        .sidebar h1 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #30363d;
+        }
+        
+        .sidebar h2 {
+            font-size: 12px;
+            font-weight: 600;
+            color: #8b949e;
+            text-transform: uppercase;
+            margin: 16px 0 8px 0;
+            letter-spacing: 0.5px;
+        }
+        
+        .sidebar ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .sidebar li {
+            margin: 4px 0;
+        }
+        
+        .sidebar a {
+            color: #c9d1d9;
+            text-decoration: none;
+            padding: 4px 8px;
+            display: block;
+            border-radius: 4px;
+            font-size: 14px;
+            transition: background-color 0.15s, color 0.15s;
+        }
+        
+        .sidebar a:hover {
+            background: #30363d;
+            color: #fff;
+        }
+        
+        .sidebar a.active {
+            background: #0366d6;
+            color: #fff;
+        }
+        
+        .sidebar .divider {
+            height: 1px;
+            background: #30363d;
+            margin: 16px 0;
+        }
+        
+        .sidebar .footer {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid #30363d;
+            font-size: 12px;
+            color: #8b949e;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            margin-left: 280px;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 100vh;
+        }
+        
+        .content-header {
+            background: #fff;
+            border-bottom: 1px solid #d0d7de;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        
+        .content-header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            color: #24292e;
+        }
+        
+        .content-header .version {
+            font-size: 14px;
+            color: #6a737d;
+        }
+        
+        .content-body {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+        }
+        
+        .markdown-content {
+            max-width: 900px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 24px;
+        }
+        
+        /* Markdown Styles */
+        .markdown-content h1 {
+            font-size: 2em;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #d0d7de;
+        }
+        
+        .markdown-content h2 {
+            font-size: 1.5em;
+            margin: 24px 0 16px 0;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #d0d7de;
+        }
+        
+        .markdown-content h3 {
+            font-size: 1.25em;
+            margin: 20px 0 12px 0;
+        }
+        
+        .markdown-content h4 {
+            font-size: 1em;
+            margin: 16px 0 10px 0;
+        }
+        
+        .markdown-content p {
+            line-height: 1.6;
+            margin: 12px 0;
+            color: #24292e;
+        }
+        
+        .markdown-content ul, .markdown-content ol {
+            padding-left: 24px;
+            margin: 12px 0;
+        }
+        
+        .markdown-content li {
+            line-height: 1.6;
+            margin: 4px 0;
+        }
+        
+        .markdown-content code {
+            background: #f6f8fa;
+            padding: 0.2em 0.4em;
+            font-size: 85%;
+            border-radius: 6px;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+        
+        .markdown-content pre {
+            background: #f6f8fa;
+            padding: 16px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 12px 0;
+            border: 1px solid #e1e4e8;
+        }
+        
+        .markdown-content pre code {
+            padding: 0;
+            font-size: 14px;
+            line-height: 1.5;
+            background: none;
+        }
+        
+        .markdown-content a {
+            color: #0366d6;
+            text-decoration: none;
+        }
+        
+        .markdown-content a:hover {
+            text-decoration: underline;
+        }
+        
+        .markdown-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+            font-size: 14px;
+        }
+        
+        .markdown-content th, .markdown-content td {
+            border: 1px solid #d0d7de;
+            padding: 6px 13px;
+            text-align: left;
+        }
+        
+        .markdown-content th {
+            background: #f6f8fa;
+            font-weight: 600;
+        }
+        
+        .markdown-content tr:nth-child(2n) {
+            background: #f6f8fa;
+        }
+        
+        .markdown-content blockquote {
+            border-left: 4px solid #d0d7de;
+            padding: 0 16px;
+            margin: 16px 0;
+            color: #586069;
+            background: #f6f8fa;
+            border-radius: 0 6px 6px 0;
+        }
+        
+        .markdown-content hr {
+            border: none;
+            border-top: 1px solid #d0d7de;
+            margin: 24px 0;
+        }
+        
+        .markdown-content img {
+            max-width: 100%;
+            border-radius: 6px;
+        }
+        
+        .markdown-content strong {
+            font-weight: 600;
+        }
+        
+        .markdown-content em {
+            font-style: italic;
+        }
+        
+        .markdown-content del {
+            text-decoration: line-through;
+        }
+        
+        .markdown-content .task-list-item {
+            list-style: none;
+        }
+        
+        .markdown-content input[type="checkbox"] {
+            margin-right: 8px;
+        }
+        
+        /* Loading */
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 200px;
+            color: #8b949e;
+        }
+        
+        /* Mobile */
+        @media (max-width: 768px) {
+            body {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                width: 100%;
+                padding: 16px;
+                max-height: 200px;
+                position: relative;
+            }
+            
+            .main-content {
+                margin-left: 0;
+            }
+            
+            .content-header {
+                padding: 12px 16px;
+            }
+            
+            .content-body {
+                padding: 16px;
+            }
+            
+            .markdown-content {
+                padding: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar" id="sidebar">
+        <h1>NetLeaf Wiki</h1>
+        <div id="sidebar-content"></div>
+        <div class="divider"></div>
+        <div class="footer" id="footer-content"></div>
+    </div>
+    
+    <div class="main-content">
+        <div class="content-header">
+            <h1 id="page-title">Loading...</h1>
+            <span class="version" id="page-version"></span>
+        </div>
+        <div class="content-body">
+            <div class="markdown-content" id="content">
+                <div class="loading">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Simple fallback Markdown parser if marked.js is not available
+        function simpleMarkdownToHtml(markdown) {
+            if (!markdown) return '<p>No content available.</p>';
+            
+            let html = markdown;
+            const codeBlocks = [];
+            let blockIndex = 0;
+            
+            // Extract code blocks first (preserve them)
+            html = html.replace(/```(\w+)?\n([\s\S]*?)```/g, function(match, lang, code) {
+                const placeholder = `__CODE_BLOCK_${blockIndex}__`;
+                codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+                blockIndex++;
+                return placeholder;
+            });
+            html = html.replace(/``(\w+)?\n([\s\S]*?)``/g, function(match, lang, code) {
+                const placeholder = `__CODE_BLOCK_${blockIndex}__`;
+                codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+                blockIndex++;
+                return placeholder;
+            });
+            
+            // Headers
+            html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
+            html = html.replace(/^## (.*$)/gim, '<h2>$1</h2>');
+            html = html.replace(/^# (.*$)/gim, '<h1>$1</h1>');
+            
+            // Tables - handle multi-line tables
+            html = parseTables(html);
+            
+            // Inline code
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            
+            // Bold, italic, strikethrough
+            html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
+            html = html.replace(/~~(.*?)~~/g, '<del>$1</del>');
+            
+            // Links
+            html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+            
+            // Unordered lists
+            html = html.replace(/^(\s*)- (.+)$/gim, '<li>$2</li>');
+            html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
+            
+            // Ordered lists
+            html = html.replace(/^(\s*)\d+\. (.+)$/gim, '<li>$2</li>');
+            html = html.replace(/(<li>[\s\S]*?<\/li>)(?!<\/ul>)/g, '<ol>$1</ol>');
+            
+            // Blockquotes
+            html = html.replace(/^> (.+)$/gim, '<blockquote><p>$1</p></blockquote>');
+            
+            // Horizontal rules
+            html = html.replace(/^---$/gim, '<hr>');
+            
+            // Paragraphs (only for non-HTML lines)
+            html = html.replace(/^(?!<)([^<>\n]+)$/gm, '<p>$1</p>');
+            
+            // Remove empty paragraphs
+            html = html.replace(/<p><\/p>\n*/g, '');
+            
+            // Restore code blocks
+            for (let i = 0; i < codeBlocks.length; i++) {
+                html = html.replace(`__CODE_BLOCK_${i}__`, codeBlocks[i]);
+            }
+            
+            return html;
+        }
+        
+        // Table parsing helper
+        function parseTables(text) {
+            const tableRegex = /^\|(.+)\|\s*\n\|[-|+]+\|\s*\n((?:\|.+\|\s*\n?)+)/gm;
+            return text.replace(tableRegex, function(match, header, body) {
+                let headerRow = '<tr>' + header.split('|').filter(c => c.trim()).map(h => `<th>${h.trim()}</th>`).join('') + '</tr>';
+                let bodyRows = body.trim().split('\n').map(row => {
+                    return '<tr>' + row.split('|').filter(c => c.trim()).map(cell => `<td>${cell.trim()}</td>`).join('') + '</tr>';
+                }).join('');
+                return `<table>${headerRow}${bodyRows}</table>`;
+            });
+        }
+        
+        // Use marked.js if available, otherwise use fallback
+        function renderMarkdown(markdown) {
+            // Check if marked is available and is a function
+            if (typeof marked === 'function') {
+                return marked(markdown);
+            }
+            // ES Module export case (marked.default might be the function)
+            if (typeof marked === 'object' && typeof marked.default === 'function') {
+                return marked.default(markdown);
+            }
+            // Fallback to simple parser
+            return simpleMarkdownToHtml(markdown);
+        }
+        
+        // Parse sidebar markdown
+        function parseSidebar(markdown) {
+            const lines = markdown.split('\n');
+            let html = '';
+            
+            for (let line of lines) {
+                // Section headers (## Header)
+                if (line.startsWith('## ')) {
+                    html += `<h2>${line.substring(3)}</h2><ul>`;
+                }
+                // Links (- [text](link))
+                else if (line.startsWith('- [')) {
+                    const match = line.match(/-\s*\[([^\]]+)\]\(([^)]+)\)/);
+                    if (match) {
+                        const text = match[1];
+                        let link = match[2];
+                        
+                        // External links (http://, https://) - open in new window
+                        if (link.startsWith('http://') || link.startsWith('https://')) {
+                            html += `<li><a href="${link}" target="_blank" rel="noopener">${text}</a></li>`;
+                        } else {
+                            // Internal links - ensure .md extension
+                            if (!link.endsWith('.md')) {
+                                link += '.md';
+                            }
+                            html += `<li><a href="#" data-page="${link}">${text}</a></li>`;
+                        }
+                    }
+                }
+                // Divider (---)
+                else if (line.trim() === '---') {
+                    html += '</ul><div class="divider"></div>';
+                }
+                // Bold text (**text**) - for footer info
+                else if (line.startsWith('**')) {
+                    html += line.replace(/\*\*/g, '');
+                }
+            }
+            
+            return html;
+        }
+        
+        // Load page content
+        async function loadPage(pageName) {
+            const sidebarLinks = document.querySelectorAll('.sidebar a');
+            sidebarLinks.forEach(link => link.classList.remove('active'));
+            
+            const activeLink = document.querySelector(`.sidebar a[data-page="${pageName}"]`);
+            if (activeLink) {
+                activeLink.classList.add('active');
+            }
+            
+            document.getElementById('content').innerHTML = '<div class="loading">Loading...</div>';
+            
+            try {
+                const basePath = getBasePath();
+                const filePath = `${basePath}wiki/${pageName}`;
+                const response = await fetch(filePath);
+                if (!response.ok) {
+                    document.getElementById('content').innerHTML = '<p>Page not found.</p>';
+                    document.getElementById('page-title').textContent = 'Not Found';
+                    return;
+                }
+                
+                const markdown = await response.text();
+                const html = renderMarkdown(markdown);
+                
+                document.getElementById('content').innerHTML = html;
+                
+                // Extract title from first heading
+                const titleMatch = markdown.match(/^# (.+)$/m);
+                document.getElementById('page-title').textContent = titleMatch ? titleMatch[1] : pageName.replace('.md', '');
+                
+            } catch (error) {
+                document.getElementById('content').innerHTML = `<p>Error loading page: ${error.message}</p>`;
+            }
+        }
+        
+        // Get base path relative to current HTML file
+        function getBasePath() {
+            const pathname = window.location.pathname;
+            const lastSlashIndex = pathname.lastIndexOf('/');
+            if (lastSlashIndex === -1) {
+                return './';
+            }
+            return pathname.substring(0, lastSlashIndex + 1);
+        }
+        
+        // Initialize
+        async function init() {
+            const basePath = getBasePath();
+            
+            // Load sidebar
+            try {
+                const sidebarResponse = await fetch(`${basePath}wiki/_Sidebar.md`);
+                const sidebarMarkdown = await sidebarResponse.text();
+                document.getElementById('sidebar-content').innerHTML = parseSidebar(sidebarMarkdown);
+            } catch (error) {
+                document.getElementById('sidebar-content').innerHTML = '<ul><li><a href="#" data-page="Home.md">Home</a></li></ul>';
+            }
+            
+            // Load footer
+            try {
+                const footerResponse = await fetch(`${basePath}wiki/_Footer.md`);
+                const footerMarkdown = await footerResponse.text();
+                const footerHtml = renderMarkdown(footerMarkdown);
+                document.getElementById('footer-content').innerHTML = footerHtml;
+            } catch (error) {
+                document.getElementById('footer-content').innerHTML = '<p>NetLeaf Wiki</p>';
+            }
+            
+            // Load default page
+            const urlParams = new URLSearchParams(window.location.search);
+            let page = urlParams.get('page') || 'Home';
+            if (!page.endsWith('.md')) {
+                page += '.md';
+            }
+            loadPage(page);
+            
+            // Add click handlers
+            document.addEventListener('click', function(e) {
+                const target = e.target.closest('.sidebar a');
+                if (target && target.hasAttribute('data-page')) {
+                    e.preventDefault();
+                    const pageName = target.getAttribute('data-page');
+                    window.history.pushState({ page: pageName }, '', `?page=${pageName}`);
+                    loadPage(pageName);
+                }
+            });
+            
+            // Handle back/forward
+            window.addEventListener('popstate', function(e) {
+                if (e.state && e.state.page) {
+                    loadPage(e.state.page);
+                }
+            });
+        }
+        
+        // Run on DOM ready
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

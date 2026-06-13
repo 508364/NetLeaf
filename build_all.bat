@@ -3,7 +3,7 @@ chcp 65001 >nul 2>&1
 REM NetLeaf Multi-Architecture Build Script
 REM This script builds NetLeaf for Windows x86, x64, and ARM64
 
-set VERSION=2.1.6
+set VERSION=2.2.0
 
 echo ========================================
 echo   NetLeaf v%VERSION% Build Script
@@ -45,7 +45,7 @@ echo x64 build completed!
 
 REM Create x64 package with example
 echo Creating x64 package...
-powershell.exe -Command "Compress-Archive -Path 'build\x64\lib\Release\netleaf.lib','build\x64\bin\Release\netleaf.dll','build\x64\bin\Release\netleaf.lib','build\x64\bin\Release\example_all_features.exe','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
+powershell.exe -Command "Compress-Archive -Path 'build\x64\lib\Release\netleaf.lib','build\x64\bin\Release\netleaf.dll','build\x64\bin\Release\example_all_features.exe','build\x64\lib\Release\netleaf_autocomplete.lib','build\x64\bin\Release\netleaf_autocomplete.dll','build\x64\lib\Release\netleaf_autoroute.lib','build\x64\bin\Release\netleaf_autoroute.dll','build\x64\lib\Release\netleaf_errorpage.lib','build\x64\bin\Release\netleaf_errorpage.dll','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
 echo x64 package created!
 echo.
 
@@ -71,7 +71,7 @@ echo x86 build completed!
 
 REM Create x86 package with example
 echo Creating x86 package...
-powershell.exe -Command "Compress-Archive -Path 'build\x86\lib\Release\netleaf.lib','build\x86\bin\Release\netleaf.dll','build\x86\bin\Release\netleaf.lib','build\x86\bin\Release\example_all_features.exe','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
+powershell.exe -Command "Compress-Archive -Path 'build\x86\lib\Release\netleaf.lib','build\x86\bin\Release\netleaf.dll','build\x86\bin\Release\example_all_features.exe','build\x86\lib\Release\netleaf_autocomplete.lib','build\x86\bin\Release\netleaf_autocomplete.dll','build\x86\lib\Release\netleaf_autoroute.lib','build\x86\bin\Release\netleaf_autoroute.dll','build\x86\lib\Release\netleaf_errorpage.lib','build\x86\bin\Release\netleaf_errorpage.dll','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
 echo x86 package created!
 echo.
 
@@ -97,7 +97,7 @@ echo ARM64 build completed!
 
 REM Create ARM64 package with example
 echo Creating ARM64 package...
-powershell.exe -Command "Compress-Archive -Path 'build\arm64\lib\Release\netleaf.lib','build\arm64\bin\Release\netleaf.dll','build\arm64\bin\Release\netleaf.lib','build\arm64\bin\Release\example_all_features.exe','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
+powershell.exe -Command "Compress-Archive -Path 'build\arm64\lib\Release\netleaf.lib','build\arm64\bin\Release\netleaf.dll','build\arm64\bin\Release\example_all_features.exe','build\arm64\lib\Release\netleaf_autocomplete.lib','build\arm64\bin\Release\netleaf_autocomplete.dll','build\arm64\lib\Release\netleaf_autoroute.lib','build\arm64\bin\Release\netleaf_autoroute.dll','build\arm64\lib\Release\netleaf_errorpage.lib','build\arm64\bin\Release\netleaf_errorpage.dll','include\netleaf.h','examples\example_all_features.c' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
 echo ARM64 package created!
 echo.
 

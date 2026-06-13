@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include "../include/netleaf.h"
 
@@ -1499,6 +1500,8 @@ struct nl_web_server {
     int auto_encoding_enabled;
     char fallback_encoding[32];
     struct nl_web_server* next;
+    int error_suggestions_enabled;
+    char error_page_templates[8][256];
 };
 
 static struct nl_web_server* g_web_servers = NULL;
@@ -2000,6 +2003,116 @@ NL_API const char* nl_web_get_negotiated_encoding(nl_web_server_t* server) {
         return server->fallback_encoding;
     }
     return server->encoding;
+}
+
+// =========================================
+// Error Page API (v2.2.0)
+// =========================================
+
+NL_API int nl_web_server_set_error_page(nl_web_server_t* server, int status_code, const char* template_path) {
+    if (!server || !template_path) return NL_ERROR_PAGE_NOT_FOUND;
+    if (status_code < 100 || status_code > 999) return NL_ERROR_PAGE_NOT_FOUND;
+    
+    int idx = 0;
+    if (status_code == 400) idx = 0;
+    else if (status_code == 401) idx = 1;
+    else if (status_code == 403) idx = 2;
+    else if (status_code == 404) idx = 3;
+    else if (status_code == 500) idx = 4;
+    else if (status_code == 502) idx = 5;
+    else if (status_code == 503) idx = 6;
+    else idx = 7;
+    
+    strncpy(server->error_page_templates[idx], template_path, sizeof(server->error_page_templates[idx]) - 1);
+    server->error_page_templates[idx][sizeof(server->error_page_templates[idx]) - 1] = '\0';
+    
+    return NL_ERROR_PAGE_OK;
+}
+
+NL_API int nl_web_server_enable_error_suggestions(nl_web_server_t* server, int enable) {
+    if (!server) return 0;
+    server->error_suggestions_enabled = enable ? 1 : 0;
+    return 1;
+}
+
+NL_API int nl_web_server_is_error_suggestions_enabled(nl_web_server_t* server) {
+    if (!server) return 0;
+    return server->error_suggestions_enabled;
+}
+
+static const char* get_error_code_string(int status_code) {
+    switch (status_code) {
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
+        default: return "Unknown Error";
+    }
+}
+
+NL_API char* nl_render_error_page(const char* template_content, nl_error_page_vars_t* vars) {
+    if (!vars) return NULL;
+    
+    /* Reserved interface for future template-based error pages */
+    (void)template_content;
+    
+    char* result = malloc(4096);
+    if (!result) return NULL;
+    
+    snprintf(result, 4096, 
+        "<html><head><title>%d - %s</title></head>"
+        "<body><h1>%d %s</h1>"
+        "<p>Requested path: %s</p>"
+        "%s"
+        "<p>Server version: %s</p></body></html>",
+        vars->status_code, vars->error_message ? vars->error_message : get_error_code_string(vars->status_code),
+        vars->status_code, vars->error_message ? vars->error_message : get_error_code_string(vars->status_code),
+        vars->requested_path ? vars->requested_path : "/",
+        vars->suggestion ? vars->suggestion : "",
+        vars->server_version ? vars->server_version : "NetLeaf v2.2.0");
+    
+    return result;
+}
+
+NL_API char* nl_make_error_response(int status_code, const char* error_message, const char* requested_path, const char* suggestion) {
+    nl_error_page_vars_t vars;
+    memset(&vars, 0, sizeof(vars));
+    vars.status_code = status_code;
+    vars.error_message = error_message ? error_message : get_error_code_string(status_code);
+    vars.requested_path = requested_path;
+    vars.suggestion = suggestion;
+    vars.server_version = "NetLeaf v2.2.0";
+    
+    time_t now = time(NULL);
+    static char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    vars.timestamp = time_str;
+    
+    char* body = nl_render_error_page(NULL, &vars);
+    if (!body) return NULL;
+    
+    size_t body_len = strlen(body);
+    char* response = malloc(body_len + 256);
+    if (!response) { free(body); return NULL; }
+    
+    snprintf(response, body_len + 256,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n%s",
+        status_code, get_error_code_string(status_code),
+        body_len, body);
+    
+    free(body);
+    return response;
 }
 
 static char* substitute_variables(const char* template, const char** vars, const char** values, int count) {
