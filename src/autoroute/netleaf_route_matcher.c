@@ -19,12 +19,20 @@ static void split_path(const char* path, char segments[][128], int* count) {
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
     
-    char* token = strtok(tmp, "/");
-    while (token && *count < 32) {
-        strncpy(segments[*count], token, 127);
+    // Manual strtok implementation for portability
+    char* start = tmp;
+    char* pos;
+    while ((pos = strchr(start, '/')) != NULL && *count < 32) {
+        *pos = '\0';
+        strncpy(segments[*count], start, 127);
         segments[*count][127] = '\0';
         (*count)++;
-        token = strtok(NULL, "/");
+        start = pos + 1;
+    }
+    if (*count < 32 && start[0] != '\0') {
+        strncpy(segments[*count], start, 127);
+        segments[*count][127] = '\0';
+        (*count)++;
     }
 }
 

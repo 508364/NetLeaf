@@ -946,6 +946,12 @@ static char* read_file(const char* filepath, size_t* out_size) {
     long size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     
+    if (size < 0) {
+        fclose(fp);
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
+    
     char* content = (char*)malloc((size_t)size + 1);
     if (!content) {
         fclose(fp);
@@ -1634,7 +1640,12 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
         strncpy(route->path, path, sizeof(route->path) - 1);
         route->content_size = strlen(content);
         route->content = (char*)malloc(route->content_size + 1);
-        if (route->content) strcpy(route->content, content);
+        if (!route->content) {
+            free(route);
+            pthread_mutex_unlock(&server->mutex);
+            return;
+        }
+        strcpy(route->content, content);
         strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
         route->next = server->routes;
         server->routes = route;

@@ -939,6 +939,12 @@ static char* read_file(const char* filepath, size_t* out_size) {
     long size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     
+    if (size < 0) {
+        fclose(fp);
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
+    
     char* content = (char*)malloc((size_t)size + 1);
     if (!content) {
         fclose(fp);
@@ -1507,6 +1513,8 @@ static void default_server_handler(const char* path, nl_http_method_t method,
         *response = (char*)malloc(*response_size + 1);
         if (*response) {
             strcpy(*response, default_resp);
+        } else {
+            *response_size = 0;
         }
     }
 }
