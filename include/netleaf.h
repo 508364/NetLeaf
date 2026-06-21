@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "netleaf_module.h"
 
 // DLL export/import macros
 #ifdef _WIN32
@@ -19,10 +20,49 @@
 extern "C" {
 #endif
 
-#define NETLEAF_VERSION "2.2.0"
+#define NETLEAF_VERSION "2.2.1"
 #define NETLEAF_VERSION_MAJOR 2
 #define NETLEAF_VERSION_MINOR 2
-#define NETLEAF_VERSION_PATCH 0
+#define NETLEAF_VERSION_PATCH 1
+
+// =========================================
+// Module Management API
+// =========================================
+
+// Initialize all available modules
+NL_API int nl_modules_init(void);
+
+// Shutdown all modules
+NL_API void nl_modules_shutdown(void);
+
+// Get module info by type
+NL_API nl_module_info_t* nl_get_module(nl_module_type_t type);
+
+// Get module info by name
+NL_API nl_module_info_t* nl_get_module_by_name(const char* name);
+
+// Get all available modules
+NL_API int nl_get_modules(nl_module_info_t** modules, int max_count);
+
+// Get module count
+NL_API int nl_get_module_count(void);
+
+// Check if module is available
+NL_API int nl_module_available(nl_module_type_t type);
+
+// Print module status (for debugging)
+NL_API void nl_print_modules(void);
+
+// =========================================
+// Core Library Module Info
+// =========================================
+
+// Get core library module info
+NL_API nl_module_info_t* nl_core_get_module_info(void);
+
+// =========================================
+// Status Codes
+// =========================================
 
 typedef enum {
     NL_OK = 0,

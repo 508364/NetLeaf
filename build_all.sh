@@ -3,7 +3,7 @@
 # This script builds NetLeaf for multiple Linux architectures
 # It automatically detects available cross-compilers and builds packages
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -185,6 +185,21 @@ package_arch() {
     fi
     if [ -e "../../include/netleaf.h" ]; then
         cp -r ../../include/netleaf.h "${PKG_TMP}/"
+    fi
+    if [ -e "../../include/netleaf_autocomplete.h" ]; then
+        cp -r ../../include/netleaf_autocomplete.h "${PKG_TMP}/"
+    fi
+    if [ -e "../../include/netleaf_autoroute.h" ]; then
+        cp -r ../../include/netleaf_autoroute.h "${PKG_TMP}/"
+    fi
+    if [ -e "../../include/netleaf_errorpage.h" ]; then
+        cp -r ../../include/netleaf_errorpage.h "${PKG_TMP}/"
+    fi
+    if [ -e "../../include/netleaf_ipc.h" ]; then
+        cp -r ../../include/netleaf_ipc.h "${PKG_TMP}/"
+    fi
+    if [ -e "../../include/netleaf_linkagg.h" ]; then
+        cp -r ../../include/netleaf_linkagg.h "${PKG_TMP}/"
     fi
     if [ -e "../../examples/example_all_features.c" ]; then
         cp -r ../../examples/example_all_features.c "${PKG_TMP}/"

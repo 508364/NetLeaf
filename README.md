@@ -1,12 +1,12 @@
 <img src="Logo.svg" width="40" height="40" align="left"> 
 
-### **NetLeaf v2.2.0**
+### **NetLeaf v2.2.1**
 高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器
 
 **平台支持:**
 - ✅ Windows (IOCP) - 完全支持
 - ✅ Linux (epoll) - 完全支持
-- 🔶 macOS (kqueue) - **初步支持** (v2.2.0新增)
+- ✅ macOS (kqueue) - 完全支持
 
 **仓库地址:**
 - GitHub: [https://github.com/508364/NetLeaf](https://github.com/508364/NetLeaf)
@@ -174,6 +174,16 @@ int main() {
 ```
 
 ## 更新日志
+
+## 新增功能 (v2.2.1)
+
+- ✅ **IPC通讯服务**: 进程间通讯服务，支持Windows Named Pipe和Linux Unix Domain Socket（独立模块）
+- ✅ **同端口链路聚合**: 单端口监听，支持Round Robin/Random/Least Connections/Weighted Round Robin负载均衡（独立模块）
+- ✅ **多语言错误消息**: 统一的中英文错误消息翻译库 (netleaf_lang)
+- ✅ **统一模块接口**: 所有独立模块通过`nl_module_info_t`结构统一管理
+- ✅ **ASan支持**: 支持AddressSanitizer内存检测
+- ✅ **多项Bug修复**: 修复边缘触发epoll、socket双重关闭、内存泄漏等问题
+- ✅ **性能优化**: LTO链接优化、qsort替代bubble sort、移除忙等待
 
 ## 新增功能 (v2.2.0)
 
@@ -719,3 +729,86 @@ int main() {
 | `{{SUGGESTION}}` | Auto-route提供的路由建议 |
 
 **构建选项：** `BUILD_ERRORPAGE=ON` (默认)
+
+### 4. IPC 模块 (netleaf_ipc)
+
+**功能：** 进程间通讯服务，支持 Windows Named Pipe 和 Linux Unix Domain Socket。
+
+**特性：**
+- 服务端监听和客户端连接
+- 跨进程数据传输
+- 线程安全设计
+- 数据回调、连接/断开回调
+
+**平台支持：**
+- ✅ Windows - Named Pipe
+- ✅ Linux - Unix Domain Socket
+- ❌ macOS - 不支持
+
+**路径格式：**
+- Windows: `\\.\pipe\<name>`
+- Linux: 文件系统路径（如 `/tmp/ipc_socket`）
+
+**构建选项：** `BUILD_IPC=ON` (默认)
+
+### 5. LinkAgg 模块 (netleaf_linkagg)
+
+**功能：** 同端口链路聚合，单端口监听转发到多个后端。
+
+**特性：**
+- 负载均衡策略: Round Robin, Random, Least Connections, Weighted Round Robin
+- 支持 HTTP 和 IPC 后端
+- 同端口路由聚合
+- 后端数量限制: 512个（索引 0-511）
+- 端口 ID 格式: `xxx.xxx`
+
+**平台支持：**
+- ✅ Windows - 需要 IPC 模块支持
+- ✅ Linux - 需要 IPC 模块支持
+- ❌ macOS - 不支持（依赖 IPC 模块）
+
+**状态：** Beta 版本
+
+**构建选项：** `BUILD_LINKAGG=ON` (默认)
+
+### 6. Lang 模块 (netleaf_lang)
+
+**功能：** 多语言错误消息翻译库。
+
+**特性：**
+- 无限语言支持（en_us, zh_cn, ja_jp, ko_kr 等）
+- 语言代码格式强制 `xx_xx`（忽略大小写）
+- 分开注册语言和错误消息
+- 自定义语言代码和错误码注册
+- 多文件支持（一个库多个语言文件）
+- 多库共享文件（需显示声明）
+- 错误码重复检测
+- 异步加载支持
+
+**平台支持：**
+- ✅ Windows - 完全支持
+- ✅ Linux - 完全支持
+- ✅ macOS - 完全支持
+
+**使用示例：**
+```c
+#include "netleaf_lang.h"
+
+int main() {
+    // 设置语言
+    nl_lang_set("zh_cn");  // 或 "en_us", "ja_jp" 等
+    
+    // 获取错误消息
+    const char* msg = nl_lang_get_error(NL_LIB_LINKAGG, -9);
+    printf("错误: %s\n", msg);
+    // 输出: "不接入，ID被占用"
+    
+    // 分开注册语言
+    nl_lang_register_language(NL_LIB_LINKAGG, "ja_jp");
+    nl_lang_set_error(NL_LIB_LINKAGG, -9, "ja_jp", "IDが使用中");
+    
+    return 0;
+}
+```
+
+**构建选项：** `BUILD_LANG=ON` (默认)

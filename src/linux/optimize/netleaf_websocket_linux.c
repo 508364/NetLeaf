@@ -22,6 +22,11 @@ typedef struct ws_client {
     struct ws_client* next;
 } ws_client_t;
 
+typedef struct ws_thread_arg {
+    nl_websocket_server_t* server;
+    int client_fd;
+} ws_thread_arg_t;
+
 struct nl_websocket_server {
     int fd;
     int port;
@@ -116,8 +121,13 @@ static void base64_encode(const char* input, size_t len, char* output) {
 static void generate_sec_websocket_key(char* key) __attribute__((unused));
 static void generate_sec_websocket_key(char* key) {
     static const char* alphanum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static int seeded = 0;
     
-    srand((unsigned int)time(NULL));
+    if (!seeded) {
+        srand((unsigned int)time(NULL));
+        seeded = 1;
+    }
+    
     for (int i = 0; i < 16; i++) {
         key[i] = alphanum[rand() % 62];
     }
@@ -229,16 +239,18 @@ static void build_ws_frame(const char* data, size_t len, nl_ws_opcode_t opcode, 
 }
 
 static void* client_thread(void* arg) {
-    int client_fd = *(int*)arg;
-    free(arg);
+    ws_thread_arg_t* targ = (ws_thread_arg_t*)arg;
+    nl_websocket_server_t* server = targ->server;
+    int client_fd = targ->client_fd;
+    free(targ);
     
     if (websocket_handshake(client_fd) != 0) {
         close(client_fd);
+        if (server->on_close) {
+            server->on_close(server->user_data);
+        }
         return NULL;
     }
-    
-    ws_client_t* client = (ws_client_t*)arg;
-    nl_websocket_server_t* server = (nl_websocket_server_t*)client;
     
     char buffer[BUFFER_SIZE];
     
@@ -267,6 +279,9 @@ static void* client_thread(void* arg) {
     }
     
     close(client_fd);
+    if (server->on_close) {
+        server->on_close(server->user_data);
+    }
     return NULL;
 }
 
@@ -280,11 +295,12 @@ static void* server_thread(void* arg) {
         int client_fd = accept(server->fd, (struct sockaddr*)&client_addr, &client_len);
         
         if (client_fd >= 0) {
-            int* fd_ptr = malloc(sizeof(int));
-            *fd_ptr = client_fd;
+            ws_thread_arg_t* targ = malloc(sizeof(ws_thread_arg_t));
+            targ->server = server;
+            targ->client_fd = client_fd;
             
             pthread_t thread;
-            pthread_create(&thread, NULL, client_thread, fd_ptr);
+            pthread_create(&thread, NULL, client_thread, targ);
             pthread_detach(thread);
             
             if (server->on_connect) {
@@ -364,13 +380,13 @@ void nl_ws_server_set_on_connect(nl_websocket_server_t* server, nl_ws_connect_ha
 void nl_ws_server_set_on_message(nl_websocket_server_t* server, nl_ws_message_handler handler, void* user_data) {
     if (!server) return;
     server->on_message = handler;
-    (void)user_data; // User data stored elsewhere
+    server->user_data = user_data;
 }
 
 void nl_ws_server_set_on_close(nl_websocket_server_t* server, nl_ws_close_handler handler, void* user_data) {
     if (!server) return;
     server->on_close = handler;
-    (void)user_data; // User data stored elsewhere
+    server->user_data = user_data;
 }
 
 int nl_ws_server_broadcast(nl_websocket_server_t* server, const char* data, size_t len, nl_ws_opcode_t opcode) {

@@ -4,7 +4,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-#include "../../include/netleaf.h"
+#include "netleaf.h"
 
 static int g_lazy_enabled = 1;
 static unsigned char g_loaded_modules = 0;

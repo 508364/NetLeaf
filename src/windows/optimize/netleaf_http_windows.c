@@ -1,9 +1,11 @@
+#define _CRT_RAND_S  // Enable rand_s() on Windows
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <bcrypt.h>
 
 #include "netleaf_http.h"
 
@@ -1265,8 +1267,21 @@ static void quic_generate_conn_id(nl_quic_conn_id_t* conn_id, uint8_t len) {
     if (len > QUIC_MAX_CONN_ID_LEN) len = QUIC_MAX_CONN_ID_LEN;
     conn_id->len = len;
     
-    for (uint8_t i = 0; i < len; i++) {
-        conn_id->data[i] = (uint8_t)rand();
+    /* Use cryptographically secure random number generator */
+    NTSTATUS status = BCryptGenRandom(
+        NULL,                           /* Use system preferred RNG */
+        conn_id->data,                  /* Output buffer */
+        len,                            /* Number of bytes to generate */
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG /* Use system preferred RNG flag */
+    );
+    
+    /* Fallback to rand_s() if BCryptGenRandom fails (should not happen) */
+    if (status != 0) {
+        for (uint8_t i = 0; i < len; i++) {
+            unsigned int random_val;
+            rand_s(&random_val);
+            conn_id->data[i] = (uint8_t)(random_val & 0xFF);
+        }
     }
 }
 

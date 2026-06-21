@@ -1,17 +1,17 @@
 <img src="Logo.svg" width="40" height="40" align="left"> 
 
-# NetLeaf v2.2.0
+# NetLeaf v2.2.1
 
 High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.
 
 **Platform Support:**
 - ✅ Windows (IOCP) - Full support
 - ✅ Linux (epoll) - Full support
-- 🔶 macOS (kqueue) - **Initial support** (NEW in v2.2.0)
+- ✅ macOS (kqueue) - Full support
 
 ## Features
 
-- ✅ **Cross-platform**: Windows / Linux / macOS 🔶
+- ✅ **Cross-platform**: Windows / Linux / macOS
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
 - ✅ **Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, TCP, UDP
 - ✅ **Web Server**: Built-in HTML/Vue.js support with server-side variable replacement
@@ -20,9 +20,13 @@ High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HT
 - ✅ **System Info**: OS/Architecture/CPU/RAM/Runtime information
 - ✅ **Multi-threading**: Configurable thread pool (1-256 threads)
 - ✅ **Dynamic Encoding**: Auto encoding negotiation and transcoding (UTF-8, GBK, Big5, etc.)
-- 🔶 **Auto-complete**: Automatic charset/Vue import (v2.2.0)
-- 🔶 **Auto-route**: Route suggestions for 404 pages (v2.2.0)
-- 🔶 **Custom Error Pages**: Template-based error pages with variables (v2.2.0)
+- ✅ **Auto-complete**: Automatic charset/Vue import
+- ✅ **Auto-route**: Route suggestions for 404 pages
+- ✅ **Custom Error Pages**: Template-based error pages with variables
+- ✅ **IPC Communication**: Inter-process communication (Windows Named Pipe, Linux Unix Domain Socket)
+- ✅ **Link Aggregation**: Same-port load balancing with multiple backends
+- ✅ **Unified Module Interface**: Centralized module management via nl_module_info_t
+- ✅ **ASan Support**: AddressSanitizer memory detection
 
 ## Quick Start
 
@@ -140,11 +144,11 @@ MIT License
 
 ## Version
 
-2.2.0
+2.2.1
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v2.2.0) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v2.2.1) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 
@@ -259,3 +263,138 @@ int main() {
 | `{{TIMESTAMP}}` | Error timestamp |
 
 **Build Option:** `BUILD_ERRORPAGE=ON` (default)
+
+---
+
+### 4. IPC Module (netleaf_ipc)
+
+**Features:**
+- **Inter-process Communication**: Windows Named Pipe and Linux Unix Domain Socket support
+- **Server/Client Architecture**: Supports server-side listening and client connections
+- **Cross-process Data Transfer**: Efficient data exchange between processes
+- **Thread-safe Design**: Built with thread safety in mind
+
+**Platform Support:**
+- ✅ Windows (Named Pipe)
+- ✅ Linux (Unix Domain Socket)
+- ❌ macOS (Not supported)
+
+**Usage:**
+```c
+#include "netleaf_ipc.h"
+
+int main() {
+    // Check platform support
+    if (!nl_ipc_is_available()) {
+        return 1;
+    }
+    
+    nl_ipc_init();
+    
+#ifdef _WIN32
+    const char* path = "\\\\.\\pipe\\my_pipe";
+#else
+    const char* path = "/tmp/my_socket";
+#endif
+    
+    nl_ipc_server_t* server = nl_ipc_server_create(path);
+    nl_ipc_server_start(server);
+    
+    // Keep running...
+    while (1) sleep(1);
+    
+    nl_ipc_server_destroy(server);
+    nl_ipc_shutdown();
+    return 0;
+}
+```
+
+**Build Option:** `BUILD_IPC=ON` (default)
+
+---
+
+### 5. LinkAgg Module (netleaf_linkagg)
+
+**⚠️ Beta Version**
+
+**Features:**
+- **Same-port Load Balancing**: Single port listening with multiple backend forwarding
+- **Load Balancing Strategies**: Round Robin, Random, Least Connections, Weighted Round Robin
+- **Backend Support**: HTTP and IPC backends
+- **Dependency**: Requires IPC module
+
+**Platform Support:**
+- ✅ Windows (Requires IPC)
+- ✅ Linux (Requires IPC)
+- ❌ macOS (Not supported - depends on IPC)
+
+**Usage:**
+```c
+#include "netleaf_linkagg.h"
+
+int main() {
+    if (!nl_linkagg_is_available()) {
+        return 1;
+    }
+    
+    nl_linkagg_init();
+    
+    nl_linkagg_t* la = nl_linkagg_create(8080);
+    nl_linkagg_set_strategy(la, NL_LINKAGG_STRATEGY_ROUND_ROBIN);
+    
+    nl_linkagg_add_http_backend(la, "127.0.0.1", 8081, 1);
+    nl_linkagg_add_http_backend(la, "127.0.0.1", 8082, 1);
+    
+    nl_linkagg_start(la);
+    
+    while (1) sleep(1);
+    
+    nl_linkagg_destroy(la);
+    nl_linkagg_shutdown();
+    return 0;
+}
+```
+
+**Build Option:** `BUILD_LINKAGG=ON` (default)
+
+---
+
+### 6. Lang Module (netleaf_lang)
+
+**Features:**
+- **Multi-language Support**: Unlimited languages (en_us, zh_cn, ja_jp, ko_kr, etc.)
+- **Language Code Format**: Enforced `xx_xx` format (case-insensitive)
+- **Separate Registration**: Register languages and error messages separately
+- **Custom Error Codes**: Support for registering custom error codes
+- **Multi-file Support**: Load multiple language files per library
+- **Shared Files**: Multiple libraries can share translation files
+- **Duplicate Detection**: Prevent duplicate error code registration
+- **Async Loading**: Support for asynchronous loading
+
+**Platform Support:**
+- ✅ Windows
+- ✅ Linux
+- ✅ macOS
+
+**Usage:**
+```c
+#include "netleaf_lang.h"
+
+int main() {
+    // Set language
+    nl_lang_set("zh_cn");
+    
+    // Get error message
+    const char* msg = nl_lang_get_error(NL_LIB_LINKAGG, -9);
+    // Output: "不接入，ID被占用"
+    
+    // Switch to English
+    nl_lang_set("en_us");
+    msg = nl_lang_get_error(NL_LIB_LINKAGG, -9);
+    // Output: "ID already in use, not connected"
+    
+    return 0;
+}
+```
+
+**Build Option:** `BUILD_LANG=ON` (default)

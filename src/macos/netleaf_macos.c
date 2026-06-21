@@ -88,9 +88,10 @@ static void macos_log(nl_log_level_t level, const char* fmt, ...) {
     } else {
         const char* prefix[] = {"DEBUG", "INFO", "WARN", "ERROR"};
         time_t now = time(NULL);
-        struct tm* tm = localtime(&now);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
         char time_str[32];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
         fprintf(stderr, "[%s] [%s] %s\n", time_str, prefix[level], msg);
     }
 }
@@ -1045,8 +1046,9 @@ static int send_418_response(int client) {
 
 static int is_april_fools_day(void) {
     time_t now = time(NULL);
-    struct tm* tm = localtime(&now);
-    return (tm->tm_mon == 3 && tm->tm_mday == 1);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    return (tm_buf.tm_mon == 3 && tm_buf.tm_mday == 1);
 }
 
 static void* file_server_thread(void* arg) {
@@ -2515,8 +2517,10 @@ char* nl_make_error_response(int status_code, const char* error_message, const c
     vars.server_version = "NetLeaf v2.2.0";
     
     time_t now = time(NULL);
-    static char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    struct tm tm_buf;
+    char time_str[64];
+    localtime_r(&now, &tm_buf);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
     vars.timestamp = time_str;
     
     char* body = nl_render_error_page(NULL, &vars);

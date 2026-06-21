@@ -11,7 +11,7 @@
 #include <mach/mach.h>
 #include <mach/mach_host.h>
 
-#include "../../include/netleaf.h"
+#include "netleaf.h"
 
 static int sys_info_loaded = 0;
 static nl_ram_unit_t ram_unit = NL_RAM_UNIT_DECIMAL;

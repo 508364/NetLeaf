@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <sys/epoll.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -87,9 +88,10 @@ static void linux_log(nl_log_level_t level, const char* fmt, ...) {
     } else {
         const char* prefix[] = {"DEBUG", "INFO", "WARN", "ERROR"};
         time_t now = time(NULL);
-        struct tm* tm = localtime(&now);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
         char time_str[32];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm);
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
         fprintf(stderr, "[%s] [%s] %s\n", time_str, prefix[level], msg);
     }
 }
@@ -276,16 +278,37 @@ static void* server_thread(void* arg) {
                     nl_buffer_t* resp = nl_buffer_create(BUFFER_SIZE);
                     
                     char buf[BUFFER_SIZE];
-                    ssize_t n = read(fd, buf, BUFFER_SIZE);
-                    if (n > 0) {
-                        nl_buffer_write(req, buf, (size_t)n);
+                    // Edge-triggered: must read until EAGAIN
+                    int done = 0;
+                    while (!done) {
+                        ssize_t n = read(fd, buf, BUFFER_SIZE);
+                        if (n > 0) {
+                            nl_buffer_write(req, buf, (size_t)n);
+                        } else if (n == 0) {
+                            // Connection closed by peer
+                            close(fd);
+                            epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                            done = 1;
+                        } else if (n < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                // No more data available - normal for edge-triggered
+                                done = 1;
+                            } else {
+                                // Error
+                                close(fd);
+                                epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                                done = 1;
+                            }
+                        }
+                    }
+                    
+                    // Process request if we got data
+                    if (nl_buffer_size(req) > 0) {
                         server->handler(req, resp, server->user_data);
                         
                         if (nl_buffer_size(resp) > 0) {
-                            write(fd, resp->data, nl_buffer_size(resp));
+                            (void)write(fd, resp->data, nl_buffer_size(resp));
                         }
-                    } else if (n == 0) {
-                        close(fd);
                     }
                     
                     nl_buffer_destroy(req);
@@ -390,7 +413,10 @@ int nl_server_start(nl_server_t* server) {
 void nl_server_stop(nl_server_t* server) {
     if (!server) return;
     server->running = 0;
-    if (server->fd != -1) close(server->fd);
+    if (server->fd != -1) {
+        close(server->fd);
+        server->fd = -1;
+    }
     if (server->thread_id) {
         pthread_join(server->thread_id, NULL);
     }
@@ -534,7 +560,10 @@ int nl_client_connect(nl_client_t* client, const char* host, int port) {
 
 void nl_client_disconnect(nl_client_t* client) {
     if (!client) return;
-    if (client->fd != -1) close(client->fd);
+    if (client->fd != -1) {
+        close(client->fd);
+        client->fd = -1;
+    }
     client->connected = 0;
 }
 
@@ -1060,8 +1089,9 @@ static int send_418_response(int client) {
 
 static int is_april_fools_day(void) {
     time_t now = time(NULL);
-    struct tm* tm = localtime(&now);
-    return (tm->tm_mon == 3 && tm->tm_mday == 1);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    return (tm_buf.tm_mon == 3 && tm_buf.tm_mday == 1);
 }
 
 static void* file_server_thread(void* arg) {
@@ -1074,7 +1104,10 @@ static void* file_server_thread(void* arg) {
         int client = accept(server->sock, (struct sockaddr*)&client_addr, &client_len);
         
         if (client < 0) {
-            usleep(100000);
+            if (errno == EINTR) continue;
+            // Use poll instead of busy-wait usleep
+            struct pollfd pfd = { .fd = server->sock, .events = POLLIN };
+            poll(&pfd, 1, 100);
             continue;
         }
         
@@ -1352,7 +1385,10 @@ static void* router_server_thread(void* arg) {
         int client = accept(rs->sock, (struct sockaddr*)&client_addr, &client_len);
         
         if (client < 0) {
-            usleep(100000);
+            if (errno == EINTR) continue;
+            // Use poll instead of busy-wait usleep
+            struct pollfd pfd = { .fd = rs->sock, .events = POLLIN };
+            poll(&pfd, 1, 100);
             continue;
         }
         
@@ -1833,6 +1869,7 @@ static char* substitute_variables(const char* template, const char** vars, const
             if (var_end) {
                 size_t var_len = var_end - var_start;
                 char var_name[256];
+                if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
                 strncpy(var_name, var_start, var_len);
                 var_name[var_len] = '\0';
                 
@@ -2646,7 +2683,7 @@ void* nl_json_parse_file(const char* file_path, nl_status_t* error_code) {
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
     char* buf = (char*)malloc(sz + 1);
     if (!buf) { fclose(fp); if (error_code) *error_code = NL_ENOMEM; return NULL; }
-    fread(buf, 1, sz, fp); buf[sz] = '\0'; fclose(fp);
+    (void)fread(buf, 1, sz, fp); buf[sz] = '\0'; fclose(fp);
     int el = 0, ec = 0;
     void* json = nl_json_parse(buf, error_code, &el, &ec);
     free(buf);
@@ -3080,7 +3117,7 @@ void* nl_toml_parse_file(const char* file_path, nl_status_t* error_code) {
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
     char* buf = (char*)malloc(sz + 1);
     if (!buf) { fclose(fp); if (error_code) *error_code = NL_ENOMEM; return NULL; }
-    fread(buf, 1, sz, fp); buf[sz] = '\0'; fclose(fp);
+    (void)fread(buf, 1, sz, fp); buf[sz] = '\0'; fclose(fp);
     int el = 0, ec = 0;
     void* toml = nl_toml_parse(buf, error_code, &el, &ec);
     free(buf);
@@ -3258,8 +3295,10 @@ NL_API char* nl_make_error_response(int status_code, const char* error_message, 
     vars.server_version = "NetLeaf v2.2.0";
     
     time_t now = time(NULL);
-    static char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    struct tm tm_buf;
+    char time_str[64];
+    localtime_r(&now, &tm_buf);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
     vars.timestamp = time_str;
     
     char* body = nl_render_error_page(NULL, &vars);

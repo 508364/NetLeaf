@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/random.h>
 
 #include "netleaf_http.h"
 #include "netleaf_optimize.h"
@@ -903,7 +904,7 @@ static int h2_process_frame(struct nl_http2_connection* conn, const uint8_t* dat
                 uint8_t frame[17];
                 h2_frame_header_write(frame, &ack_header);
                 memcpy(frame + 9, payload, 8);
-                write(conn->fd, frame, 17);
+                (void)write(conn->fd, frame, 17);  // Ignore return value for PING ACK
             }
             break;
             
@@ -1017,7 +1018,10 @@ static void* http1_client_thread(void* arg) {
         generate_response_http1(&resp, &response_data, &response_len);
         
         if (response_data) {
-            write(client_fd, response_data, response_len);
+            ssize_t written = write(client_fd, response_data, response_len);
+            if (written < 0) {
+                // Connection error, ignore
+            }
             free(response_data);
         }
         
@@ -1284,9 +1288,27 @@ static void quic_generate_conn_id(nl_quic_conn_id_t* conn_id, uint8_t len) {
     if (len > QUIC_MAX_CONN_ID_LEN) len = QUIC_MAX_CONN_ID_LEN;
     conn_id->len = len;
     
-    // Generate random connection ID
-    for (uint8_t i = 0; i < len; i++) {
-        conn_id->data[i] = (uint8_t)rand();
+    /* Use cryptographically secure random number generator */
+    ssize_t bytes_read = getrandom(conn_id->data, len, 0);
+    
+    /* Fallback to /dev/urandom if getrandom fails */
+    if (bytes_read < 0 || (size_t)bytes_read < len) {
+        FILE* fp = fopen("/dev/urandom", "rb");
+        if (fp) {
+            size_t read = fread(conn_id->data, 1, len, fp);
+            fclose(fp);
+            if (read < len) {
+                /* Last fallback: use rand() (not ideal but better than nothing) */
+                for (uint8_t i = (uint8_t)read; i < len; i++) {
+                    conn_id->data[i] = (uint8_t)(rand() & 0xFF);
+                }
+            }
+        } else {
+            /* Fallback to rand() if /dev/urandom is not available */
+            for (uint8_t i = 0; i < len; i++) {
+                conn_id->data[i] = (uint8_t)(rand() & 0xFF);
+            }
+        }
     }
 }
 

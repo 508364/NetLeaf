@@ -33,6 +33,59 @@ struct nl_websocket_server {
     void* user_data;
 };
 
+static void simple_sha1(const char* input, size_t len, unsigned char* output) {
+    uint32_t h0 = 0x67452301;
+    uint32_t h1 = 0xEFCDAB89;
+    uint32_t h2 = 0x98BADCFE;
+    uint32_t h3 = 0x10325476;
+    uint32_t h4 = 0xC3D2E1F0;
+
+    size_t original_len = len;
+    size_t padded_len = ((len + 8) / 64 + 1) * 64;
+    unsigned char* padded = calloc(padded_len, 1);
+    if (!padded) return;
+
+    memcpy(padded, input, len);
+    padded[len] = 0x80;
+    *(uint64_t*)(padded + padded_len - 8) = original_len * 8;
+
+    for (size_t i = 0; i < padded_len; i += 64) {
+        uint32_t w[80];
+        for (int j = 0; j < 16; j++) {
+            w[j] = (padded[i + j * 4] << 24) | (padded[i + j * 4 + 1] << 16) |
+                   (padded[i + j * 4 + 2] << 8) | padded[i + j * 4 + 3];
+        }
+        for (int j = 16; j < 80; j++) {
+            w[j] = ((w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16]) << 1) | ((w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16]) >> 31);
+        }
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+
+        for (int j = 0; j < 80; j++) {
+            uint32_t f, k;
+            if (j < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+            else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+
+            uint32_t temp = ((a << 5) | (a >> 27)) + f + e + k + w[j];
+            e = d; d = c; c = ((b << 30) | (b >> 2)); b = a; a = temp;
+        }
+
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    }
+
+    free(padded);
+
+    for (int i = 0; i < 4; i++) {
+        output[i] = (h0 >> (24 - i * 8)) & 0xFF;
+        output[i + 4] = (h1 >> (24 - i * 8)) & 0xFF;
+        output[i + 8] = (h2 >> (24 - i * 8)) & 0xFF;
+        output[i + 12] = (h3 >> (24 - i * 8)) & 0xFF;
+        output[i + 16] = (h4 >> (24 - i * 8)) & 0xFF;
+    }
+}
+
 static void base64_encode(const char* input, size_t len, char* output) {
     static const char* base64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     
@@ -84,16 +137,10 @@ static int websocket_handshake(SOCKET client_fd) {
     snprintf(combined, sizeof(combined), "%s%s", key, magic);
     
     unsigned char hash[20];
-    for (int i = 0; i < 20; i++) hash[i] = 0;
-    
-    FILE* f = _popen("echo nope", "r");
-    if (f) {
-        snprintf(combined, sizeof(combined), "echo -n \"%s%s\" | sha1sum", key, magic);
-        _pclose(f);
-    }
+    simple_sha1(combined, strlen(combined), hash);
     
     char accept_key[64];
-    base64_encode(combined, strlen(combined), accept_key);
+    base64_encode((const char*)hash, 20, accept_key);
     
     char response[512];
     snprintf(response, sizeof(response),
@@ -167,12 +214,22 @@ static void build_ws_frame(const char* data, size_t len, nl_ws_opcode_t opcode, 
     }
 }
 
+typedef struct ws_thread_arg {
+    nl_websocket_server_t* server;
+    SOCKET client_fd;
+} ws_thread_arg_t;
+
 static DWORD WINAPI client_thread(LPVOID arg) {
-    SOCKET client_fd = *(SOCKET*)arg;
-    free(arg);
+    ws_thread_arg_t* targ = (ws_thread_arg_t*)arg;
+    nl_websocket_server_t* server = targ->server;
+    SOCKET client_fd = targ->client_fd;
+    free(targ);
     
     if (websocket_handshake(client_fd) != 0) {
         closesocket(client_fd);
+        if (server->on_close) {
+            server->on_close(server->user_data);
+        }
         return 0;
     }
     
@@ -196,11 +253,16 @@ static DWORD WINAPI client_thread(LPVOID arg) {
                 size_t pong_len;
                 build_ws_frame("", 0, NL_WS_PONG, pong_frame, &pong_len);
                 send(client_fd, pong_frame, (int)pong_len, 0);
+            } else if (server->on_message && (opcode == NL_WS_TEXT || opcode == NL_WS_BINARY)) {
+                server->on_message(data, data_len, opcode, server->user_data);
             }
         }
     }
     
     closesocket(client_fd);
+    if (server->on_close) {
+        server->on_close(server->user_data);
+    }
     return 0;
 }
 
@@ -214,10 +276,11 @@ static DWORD WINAPI server_thread(LPVOID arg) {
         SOCKET client_fd = accept(server->fd, (struct sockaddr*)&client_addr, &client_len);
         
         if (client_fd != INVALID_SOCKET) {
-            SOCKET* fd_ptr = malloc(sizeof(SOCKET));
-            *fd_ptr = client_fd;
+            ws_thread_arg_t* targ = malloc(sizeof(ws_thread_arg_t));
+            targ->server = server;
+            targ->client_fd = client_fd;
             
-            HANDLE thread = CreateThread(NULL, 0, client_thread, fd_ptr, 0, NULL);
+            HANDLE thread = CreateThread(NULL, 0, client_thread, targ, 0, NULL);
             CloseHandle(thread);
             
             if (server->on_connect) {
@@ -301,11 +364,13 @@ void nl_ws_server_set_on_connect(nl_websocket_server_t* server, nl_ws_connect_ha
 void nl_ws_server_set_on_message(nl_websocket_server_t* server, nl_ws_message_handler handler, void* user_data) {
     if (!server) return;
     server->on_message = handler;
+    server->user_data = user_data;
 }
 
 void nl_ws_server_set_on_close(nl_websocket_server_t* server, nl_ws_close_handler handler, void* user_data) {
     if (!server) return;
     server->on_close = handler;
+    server->user_data = user_data;
 }
 
 int nl_ws_server_broadcast(nl_websocket_server_t* server, const char* data, size_t len, nl_ws_opcode_t opcode) {

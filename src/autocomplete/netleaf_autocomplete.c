@@ -1,4 +1,5 @@
 #include "netleaf_autocomplete.h"
+#include "netleaf_module.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -18,6 +19,32 @@ static int g_autocomplete_available = 0;
 static int g_autocomplete_enabled = 0;
 static int g_feature_mask = NL_AUTOCOMPLETE_FEATURE_ALL;
 static char g_default_encoding[32] = "UTF-8";
+
+// =========================================
+// Module Info
+// =========================================
+
+static nl_module_info_t g_autocomplete_module_info = {
+    .type = NL_MODULE_AUTOCOMPLETE,
+    .name = "autocomplete",
+    .version = NL_AUTOCOMPLETE_VERSION,
+    .capabilities = NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_ALL,
+    .status = NL_MODULE_STATUS_UNINITIALIZED,
+    .platform_windows = 1,
+    .platform_linux = 1,
+    .platform_macos = 1,
+    .init = nl_autocomplete_init,
+    .shutdown = NULL,
+    .is_available = nl_autocomplete_is_available,
+    .get_version = nl_autocomplete_version,
+    .description = "Auto-completion for charset and Vue imports",
+    .author = "NetLeaf Team",
+    .next = NULL
+};
+
+nl_module_info_t* nl_autocomplete_get_module_info(void) {
+    return &g_autocomplete_module_info;
+}
 
 // =========================================
 // Flexible Enable/Disable Helper

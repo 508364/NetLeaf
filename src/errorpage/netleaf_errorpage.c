@@ -1,9 +1,18 @@
+#define _POSIX_C_SOURCE 200809L  // Enable POSIX functions including strdup
 #include "netleaf_errorpage.h"
+#include "netleaf_module.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
+
+// Cross-platform nl_strdup
+#ifdef _WIN32
+    #define nl_strdup _strdup
+#else
+    #define nl_strdup strdup
+#endif
 
 // =========================================
 // Forward declarations
@@ -17,6 +26,32 @@ static char* render_template(const char* template_content, nl_errorpage_vars_t* 
 static int g_errorpage_available = 0;
 static int g_errorpage_enabled = 0;
 static const char* g_templates[16] = { NULL };
+
+// =========================================
+// Module Info
+// =========================================
+
+static nl_module_info_t g_errorpage_module_info = {
+    .type = NL_MODULE_ERRORPAGE,
+    .name = "errorpage",
+    .version = NL_ERRORPAGE_VERSION,
+    .capabilities = NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_ALL,
+    .status = NL_MODULE_STATUS_UNINITIALIZED,
+    .platform_windows = 1,
+    .platform_linux = 1,
+    .platform_macos = 1,
+    .init = nl_errorpage_init,
+    .shutdown = NULL,
+    .is_available = nl_errorpage_is_available,
+    .get_version = nl_errorpage_version,
+    .description = "Template-based error pages",
+    .author = "NetLeaf Team",
+    .next = NULL
+};
+
+nl_module_info_t* nl_errorpage_get_module_info(void) {
+    return &g_errorpage_module_info;
+}
 
 // =========================================
 // Unified Variable Format: {{<var>VAR_NAME</var>}}
@@ -248,8 +283,13 @@ int nl_errorpage_load_template(int status_code, const char* template_path) {
 int nl_errorpage_set_template(int status_code, const char* template_content) {
     int idx = get_template_index(status_code);
     if (idx < 0) return -1;
-    g_templates[idx] = template_content;
-    return 0;
+    // Free old template if exists
+    if (g_templates[idx]) {
+        free((char*)g_templates[idx]);
+    }
+    // Copy the template content
+    g_templates[idx] = template_content ? nl_strdup(template_content) : NULL;
+    return g_templates[idx] ? 0 : -1;
 }
 
 const char* nl_errorpage_get_template(int status_code) {
@@ -303,6 +343,7 @@ static char* substitute_variables(const char* template, const char** vars, const
             if (var_end) {
                 size_t var_len = var_end - var_start;
                 char var_name[256];
+                if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
                 strncpy(var_name, var_start, var_len);
                 var_name[var_len] = '\0';
                 
@@ -449,8 +490,14 @@ char* nl_errorpage_quick_response(int status_code, const char* message, const ch
     vars.server_version = "NetLeaf v2.2.0";
     
     time_t now = time(NULL);
-    static char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    struct tm tm_buf;
+    char time_str[64];
+#ifdef _WIN32
+    localtime_s(&tm_buf, &now);
+#else
+    localtime_r(&now, &tm_buf);
+#endif
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
     vars.timestamp = time_str;
     
     return nl_errorpage_make_response(status_code, &vars);
@@ -466,8 +513,14 @@ char* nl_errorpage_404_with_suggestion(const char* path, const char* suggestion)
     vars.server_version = "NetLeaf v2.2.0";
     
     time_t now = time(NULL);
-    static char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    struct tm tm_buf;
+    char time_str[64];
+#ifdef _WIN32
+    localtime_s(&tm_buf, &now);
+#else
+    localtime_r(&now, &tm_buf);
+#endif
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
     vars.timestamp = time_str;
     
     return nl_errorpage_make_response(404, &vars);

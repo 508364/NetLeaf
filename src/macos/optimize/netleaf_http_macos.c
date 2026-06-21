@@ -1284,10 +1284,8 @@ static void quic_generate_conn_id(nl_quic_conn_id_t* conn_id, uint8_t len) {
     if (len > QUIC_MAX_CONN_ID_LEN) len = QUIC_MAX_CONN_ID_LEN;
     conn_id->len = len;
     
-    // Generate random connection ID
-    for (uint8_t i = 0; i < len; i++) {
-        conn_id->data[i] = (uint8_t)rand();
-    }
+    /* Use cryptographically secure random number generator (arc4random_buf on macOS) */
+    arc4random_buf(conn_id->data, len);
 }
 
 static struct nl_http3_stream* h3_find_or_create_stream(struct nl_http3_connection* conn, uint64_t stream_id) {

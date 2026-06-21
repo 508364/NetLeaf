@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(NetLeaf VERSION 2.2.0 LANGUAGES C)
+project(NetLeaf VERSION 2.2.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -13,6 +13,9 @@ option(BUILD_EXAMPLES "Build example programs" OFF)
 option(BUILD_AUTOCOMPLETE "Build autocomplete module (auto charset/Vue completion)" ON)
 option(BUILD_AUTOROUTE "Build autoroute module (auto route suggestions)" ON)
 option(BUILD_ERRORPAGE "Build errorpage module (better error pages with templates)" ON)
+option(BUILD_IPC "Build IPC communication module (Windows/Linux only)" ON)
+option(BUILD_LINKAGG "Build link aggregation module (Windows/Linux only)" ON)
+option(BUILD_ASAN "Build with AddressSanitizer (Debug only)" OFF)
 
 # 平台检测
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -37,6 +40,24 @@ set(PLATFORM_OPT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/${PLATFORM_SOURCE}/optimiz
 
 file(GLOB PLATFORM_SOURCES "${PLATFORM_DIR}/*.c")
 file(GLOB PLATFORM_OPT_SOURCES "${PLATFORM_OPT_DIR}/*.c")
+
+# 添加模块管理源文件
+list(APPEND PLATFORM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/netleaf_module.c")
+
+# 排除独立模块的平台源文件（它们由各自的 CMakeLists.txt 管理）
+# 注意：Windows 文件名需要转义反斜杠
+if(PLATFORM_NAME STREQUAL "Windows")
+    set(EXCLUDED_FILES "netleaf_ipc_windows.c" "netleaf_linkagg_windows.c")
+elseif(PLATFORM_NAME STREQUAL "Linux")
+    set(EXCLUDED_FILES "netleaf_ipc_linux.c" "netleaf_linkagg_linux.c")
+else()
+    set(EXCLUDED_FILES "")
+endif()
+
+foreach(EXCLUDED_FILE ${EXCLUDED_FILES})
+    list(FILTER PLATFORM_SOURCES EXCLUDE REGEX "${EXCLUDED_FILE}$")
+    list(FILTER PLATFORM_OPT_SOURCES EXCLUDE REGEX "${EXCLUDED_FILE}$")
+endforeach()
 
 # 头文件目录
 include_directories(
@@ -89,7 +110,7 @@ elseif(PLATFORM_NAME STREQUAL "Windows")
     if(MSVC)
         add_compile_options(/utf-8)
     endif()
-    set(LINK_LIBS ws2_32 mswsock advapi32)
+    set(LINK_LIBS ws2_32 mswsock advapi32 bcrypt)
 elseif(PLATFORM_NAME STREQUAL "macOS")
     set(SHARED_LIB_EXT ".dylib")
     set(STATIC_LIB_EXT ".a")
@@ -103,13 +124,55 @@ elseif(PLATFORM_NAME STREQUAL "macOS")
     endif()
 endif()
 
+# ASan support (GCC/Clang only)
+if(BUILD_ASAN)
+    if(MSVC)
+        message(WARNING "AddressSanitizer is not supported with MSVC. Ignoring BUILD_ASAN.")
+    else()
+        message(STATUS "Building with AddressSanitizer enabled")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+    endif()
+endif()
+
 # 编译器优化
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3 -Wno-stringop-truncation -Wno-stringop-overflow -Wno-format-truncation")
-elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3 -Wno-stringop-truncation -Wno-stringop-overflow -Wno-format-truncation -Wno-unused-result")
+    # LTO (Link Time Optimization) - Linux only
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto")
+    endif()
+    # Security hardening flags
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fstack-protector-strong -D_FORTIFY_SOURCE=2")
+    # Linux-specific linker flags (not for macOS)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie -Wl,-z,relro,-z,now")
+    endif()
+elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang" OR CMAKE_C_COMPILER_ID STREQUAL "AppleClang")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3 -Wno-string-conversion")
+    # LTO (Link Time Optimization) - Linux only, macOS osxcross may have issues
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -flto")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto")
+    endif()
+    # Security hardening flags - Linux only
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fstack-protector-strong -D_FORTIFY_SOURCE=2")
+        # Linux-specific linker flags
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie -Wl,-z,relro,-z,now")
+    endif()
 elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W3 /O2")
+    # LTO (Link Time Optimization) for MSVC
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /GL")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /LTCG")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /LTCG")
+    # Security hardening flags for MSVC
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /GS /sdl /DYNAMICBASE")
 endif()
 
 # 共享库
@@ -130,7 +193,10 @@ set_target_properties(netleaf_shared PROPERTIES
 # 静态库
 if(BUILD_STATIC_LIBS)
     add_library(netleaf_static STATIC ${PLATFORM_SOURCES} ${PLATFORM_OPT_SOURCES})
-    target_link_libraries(netleaf_static ${LINK_LIBS})
+    target_link_libraries(netleaf_static 
+        ${LINK_LIBS}
+        netleaf_lang
+    )
     set_target_properties(netleaf_static PROPERTIES
         OUTPUT_NAME "netleaf"
     )
@@ -148,7 +214,13 @@ if(BUILD_EXAMPLES)
     set(EXAMPLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/examples")
     
     add_executable(example_all_features ${EXAMPLES_DIR}/example_all_features.c)
-    target_link_libraries(example_all_features netleaf_static ${LINK_LIBS})
+    target_link_libraries(example_all_features 
+        netleaf_static 
+        netleaf_autocomplete
+        netleaf_autoroute
+        netleaf_errorpage
+        ${LINK_LIBS}
+    )
     target_compile_definitions(example_all_features PRIVATE DEBUG_LOGGING)
     
     message(STATUS "Examples will be built to: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
@@ -166,11 +238,30 @@ if(BUILD_AUTOROUTE)
     add_subdirectory(src/autoroute)
 endif()
 
+# 必需模块 - Language (multi-language error messages)
+message(STATUS "Building lang module...")
+message(STATUS "  - Lang v${PROJECT_VERSION} (multi-language error messages)")
+add_subdirectory(src/lang)
+
 # 可选模块 - Better Error Page
 if(BUILD_ERRORPAGE)
     message(STATUS "Building errorpage module...")
     add_subdirectory(src/errorpage)
 endif()
+
+# 可选模块 - IPC (Windows/Linux only)
+if(BUILD_IPC)
+    message(STATUS "Building ipc module...")
+    add_subdirectory(src/ipc)
+endif()
+
+# 可选模块 - Link Aggregation (Windows/Linux only)
+if(BUILD_LINKAGG)
+    message(STATUS "Building linkagg module...")
+    add_subdirectory(src/linkagg)
+endif()
+
+# 添加测试程序
 
 # 构建摘要
 message(STATUS "")
@@ -182,10 +273,13 @@ if(NOT WIDE_LIB)
     message(STATUS "Architecture: ${ARCH_NAME}")
 endif()
 message(STATUS "Mode: ${WIDE_LIB} (Wide-Usable)")
+message(STATUS "Build lang: ON")
 message(STATUS "Build examples: ${BUILD_EXAMPLES}")
 message(STATUS "Build autocomplete: ${BUILD_AUTOCOMPLETE}")
 message(STATUS "Build autoroute: ${BUILD_AUTOROUTE}")
 message(STATUS "Build errorpage: ${BUILD_ERRORPAGE}")
+message(STATUS "Build ipc: ${BUILD_IPC}")
+message(STATUS "Build linkagg: ${BUILD_LINKAGG}")
 message(STATUS "")
 message(STATUS "Output directories:")
 message(STATUS "  Libraries: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")

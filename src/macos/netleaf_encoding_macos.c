@@ -8,7 +8,7 @@
 #include <iconv.h>
 #include <langinfo.h>
 
-#include "../../include/netleaf.h"
+#include "netleaf.h"
 
 // 编码模块懒加载状态
 static int g_encoding_module_loaded = 0;

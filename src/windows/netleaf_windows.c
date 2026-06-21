@@ -299,7 +299,7 @@ int nl_server_start(nl_server_t* server) {
         }
     }
     
-    server->running = 1;
+    InterlockedExchange(&server->running, 1);
     windows_log(NL_LOG_INFO, "Windows: Server started (IOCP), socket=%lu", (ULONG)server->fd);
     return NL_OK;
 }
@@ -307,7 +307,10 @@ int nl_server_start(nl_server_t* server) {
 void nl_server_stop(nl_server_t* server) {
     if (!server) return;
     InterlockedExchange(&server->running, 0);
-    if (server->fd != INVALID_SOCKET) closesocket(server->fd);
+    if (server->fd != INVALID_SOCKET) {
+        closesocket(server->fd);
+        server->fd = INVALID_SOCKET;
+    }
     windows_log(NL_LOG_INFO, "Windows: Server stopped");
 }
 
@@ -453,7 +456,10 @@ int nl_client_connect(nl_client_t* client, const char* host, int port) {
 
 void nl_client_disconnect(nl_client_t* client) {
     if (!client) return;
-    if (client->fd != INVALID_SOCKET) closesocket(client->fd);
+    if (client->fd != INVALID_SOCKET) {
+        closesocket(client->fd);
+        client->fd = INVALID_SOCKET;
+    }
     client->connected = 0;
 }
 
@@ -1144,10 +1150,10 @@ int nl_file_server_start(nl_file_server_t* server) {
         return NL_ERROR;
     }
     
-    server->running = 1;
+    InterlockedExchange(&server->running, 1);
     server->thread = CreateThread(NULL, 0, file_server_thread, server, 0, NULL);
     if (!server->thread) {
-        server->running = 0;
+        InterlockedExchange(&server->running, 0);
         closesocket(server->sock);
         return NL_ERROR;
     }
@@ -1159,7 +1165,7 @@ int nl_file_server_start(nl_file_server_t* server) {
 void nl_file_server_stop(nl_file_server_t* server) {
     if (!server || !server->running) return;
     
-    server->running = 0;
+    InterlockedExchange(&server->running, 0);
     
     if (server->thread) {
         WaitForSingleObject(server->thread, INFINITE);
@@ -1770,7 +1776,7 @@ void nl_web_set_auto_cleanup(int enable) {
 void nl_web_stop(nl_web_server_t* server) {
     if (!server || !server->running) return;
     
-    server->running = 0;
+    InterlockedExchange(&server->running, 0);
     
     if (server->thread) {
         WaitForSingleObject(server->thread, INFINITE);
@@ -2100,8 +2106,10 @@ NL_API char* nl_make_error_response(int status_code, const char* error_message, 
     vars.server_version = "NetLeaf v2.2.0";
     
     time_t now = time(NULL);
-    static char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    struct tm tm_buf;
+    char time_str[64];
+    localtime_s(&tm_buf, &now);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
     vars.timestamp = time_str;
     
     char* body = nl_render_error_page(NULL, &vars);
@@ -2146,6 +2154,7 @@ static char* substitute_variables(const char* template, const char** vars, const
             if (var_end) {
                 size_t var_len = var_end - var_start;
                 char var_name[256];
+                if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
                 strncpy(var_name, var_start, var_len);
                 var_name[var_len] = '\0';
                 

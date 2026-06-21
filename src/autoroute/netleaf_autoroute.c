@@ -3,6 +3,7 @@
 #endif
 
 #include "netleaf_autoroute.h"
+#include "netleaf_module.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -19,6 +20,32 @@
 static int g_autoroute_available = 0;
 static int g_autoroute_enabled = 0;
 static nl_route_matcher_t* g_global_matcher = NULL;
+
+// =========================================
+// Module Info
+// =========================================
+
+static nl_module_info_t g_autoroute_module_info = {
+    .type = NL_MODULE_AUTOROUTE,
+    .name = "autoroute",
+    .version = NL_AUTOROUTE_VERSION,
+    .capabilities = NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_ALL,
+    .status = NL_MODULE_STATUS_UNINITIALIZED,
+    .platform_windows = 1,
+    .platform_linux = 1,
+    .platform_macos = 1,
+    .init = nl_autoroute_init,
+    .shutdown = NULL,
+    .is_available = nl_autoroute_is_available,
+    .get_version = nl_autoroute_version,
+    .description = "Automatic route suggestions and matching",
+    .author = "NetLeaf Team",
+    .next = NULL
+};
+
+nl_module_info_t* nl_autoroute_get_module_info(void) {
+    return &g_autoroute_module_info;
+}
 
 // =========================================
 // Flexible Enable/Disable Helper
@@ -91,6 +118,19 @@ int nl_autoroute_is_enabled(void) {
 // Levenshtein Distance
 // =========================================
 
+// Maximum string length for Levenshtein calculation (stack allocation)
+#define NL_LEVEN_MAX_LEN 256
+
+// Comparison function for qsort (descending order by score)
+static int nl_route_suggestion_compare(const void* a, const void* b) {
+    const nl_route_suggestion_t* sa = (const nl_route_suggestion_t*)a;
+    const nl_route_suggestion_t* sb = (const nl_route_suggestion_t*)b;
+    // Descending order: higher score first
+    if (sb->score > sa->score) return 1;
+    if (sb->score < sa->score) return -1;
+    return 0;
+}
+
 int nl_levenshtein_distance(const char* s1, const char* s2) {
     if (!s1) s1 = "";
     if (!s2) s2 = "";
@@ -101,12 +141,20 @@ int nl_levenshtein_distance(const char* s1, const char* s2) {
     if (len1 == 0) return (int)len2;
     if (len2 == 0) return (int)len1;
     
-    int* prev = (int*)malloc((len2 + 1) * sizeof(int));
-    int* curr = (int*)malloc((len2 + 1) * sizeof(int));
+    // Use stack allocation for typical path lengths
+    // Fall back to heap for very long strings
+    int use_stack = (len2 <= NL_LEVEN_MAX_LEN);
+    
+    int prev_stack[NL_LEVEN_MAX_LEN + 1];
+    int curr_stack[NL_LEVEN_MAX_LEN + 1];
+    int* prev = use_stack ? prev_stack : (int*)malloc((len2 + 1) * sizeof(int));
+    int* curr = use_stack ? curr_stack : (int*)malloc((len2 + 1) * sizeof(int));
     
     if (!prev || !curr) {
-        free(prev);
-        free(curr);
+        if (!use_stack) {
+            free(prev);
+            free(curr);
+        }
         return -1;
     }
     
@@ -130,8 +178,11 @@ int nl_levenshtein_distance(const char* s1, const char* s2) {
     }
     
     int result = prev[len2];
-    free(prev);
-    free(curr);
+    
+    if (!use_stack) {
+        free(prev);
+        free(curr);
+    }
     
     return result;
 }
@@ -301,6 +352,8 @@ static void add_segment_to_tree(struct nl_route_matcher* matcher, const char* pa
             child = create_node(segment);
             if (child && current->child_count < 32) {
                 current->children[current->child_count++] = child;
+            } else if (child) {
+                free(child);
             }
         }
         
@@ -404,21 +457,15 @@ int nl_route_matcher_get_suggestions(nl_route_matcher_t* matcher, const char* pa
     int count = 0;
     collect_all_routes(matcher->root, NULL, routes, &count, 256);
     
-    for (int i = 0; i < count && i < 256; i++) {
+    for (int i = 0; i < count && i < max_count; i++) {
         suggestions[i].score = nl_route_similarity(path, routes[i]);
         strncpy(suggestions[i].path, routes[i], sizeof(suggestions[i].path) - 1);
         suggestions[i].path[sizeof(suggestions[i].path) - 1] = '\0';
     }
     
-    for (int i = 0; i < count - 1 && i < max_count - 1; i++) {
-        for (int j = i + 1; j < count && j < max_count; j++) {
-            if (suggestions[j].score > suggestions[i].score) {
-                nl_route_suggestion_t tmp = suggestions[i];
-                suggestions[i] = suggestions[j];
-                suggestions[j] = tmp;
-            }
-        }
-    }
+    // Use qsort instead of bubble sort for better performance
+    int sort_count = (count < max_count) ? count : max_count;
+    qsort(suggestions, sort_count, sizeof(nl_route_suggestion_t), nl_route_suggestion_compare);
     
     for (int i = max_count; i < count && i < 256; i++) {
         free(routes[i]);
@@ -490,6 +537,9 @@ nl_route_matcher_t* nl_autoroute_get_global_matcher(void) {
 }
 
 void nl_autoroute_set_global_matcher(nl_route_matcher_t* matcher) {
+    if (g_global_matcher) {
+        nl_route_matcher_destroy(g_global_matcher);
+    }
     g_global_matcher = matcher;
 }
 

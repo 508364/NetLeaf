@@ -1,5 +1,78 @@
 # NetLeaf 版本历史
 
+## v2.2.1
+
+**平台支持:**
+- ✅ Windows (IOCP) - 完全支持
+- ✅ Linux (epoll) - 完全支持
+- ✅ macOS (kqueue) - 主库功能完全支持
+
+**新增功能 - IPC通讯服务 (netleaf_ipc):**
+- **功能**: 进程间通讯服务，支持 Windows Named Pipe 和 Linux Unix Domain Socket
+- **文件**: `src/ipc/`
+  - `netleaf_ipc.c` - 核心模块
+  - `src/windows/netleaf_ipc_windows.c` - Windows 实现
+  - `src/linux/netleaf_ipc_linux.c` - Linux 实现
+- **特性**:
+  - 支持服务端监听和客户端连接
+  - 跨进程数据传输
+  - 线程安全设计
+- **平台**: Windows/Linux（macOS暂不支持）
+
+**新增功能 - 同端口链路聚合 (netleaf_linkagg):**
+- **功能**: 单端口监听，将请求转发到多个后端（HTTP/IPC）
+- **文件**: `src/linkagg/`
+  - `netleaf_linkagg.c` - 核心模块
+  - `src/windows/netleaf_linkagg_windows.c` - Windows 实现
+  - `src/linux/netleaf_linkagg_linux.c` - Linux 实现
+- **特性**:
+  - 负载均衡策略: Round Robin, Random, Least Connections, Weighted Round Robin
+  - 支持 HTTP 和 IPC 后端
+  - 同端口路由聚合
+- **平台**: Windows/Linux（macOS暂不支持）
+
+**统一模块接口:**
+- **功能**: 所有独立模块通过统一接口进行管理
+- **文件**: `include/netleaf_module.h`, `src/netleaf_module.c`
+- **特性**:
+  - 模块信息结构 `nl_module_info_t`
+  - 模块注册/注销 API
+  - 模块版本、能力、平台支持查询
+  - 统一的模块管理 API
+
+**多语言错误消息 (netleaf_lang):**
+- **功能**: 统一的多语言错误消息翻译库
+- **文件**: `include/netleaf_lang.h`, `src/lang/netleaf_lang.c`
+- **特性**:
+  - 无限语言支持（en_us, zh_cn, ja_jp, ko_kr 等）
+  - 语言代码格式强制 `xx_xx`（忽略大小写）
+  - 分开注册语言和错误消息
+  - 自定义语言代码和错误码注册
+  - 多文件支持（一个库多个语言文件）
+  - 多库共享文件（需显示声明）
+  - 错误码重复检测
+  - 异步加载支持
+  - 跨平台：Windows / Linux / macOS
+- **平台**: ✅ Windows / ✅ Linux / ✅ macOS
+
+**Bug修复:**
+- 修复边缘触发 epoll 循环读取问题
+- 修复 socket 双重关闭问题
+- 修复内存泄漏问题（Levenshtein栈分配、g_global_matcher释放）
+- 修复缓冲区溢出问题
+- 修复线程安全问题（原子操作、线程安全时间函数）
+
+**优化:**
+- 启用 LTO 链接时优化
+- 移除 usleep(100ms) 忙等待，改用 poll
+- Bubble sort 替换为 qsort
+- 添加安全加固编译标志
+- 构建系统优化（OBJECT库避免重复编译）
+
+**构建系统更新:**
+- CMake选项: `BUILD_IPC=ON`, `BUILD_LINKAGG=ON`
+- ASan支持: `BUILD_ASAN=ON`
+
 ## v2.2.0
 
 **平台支持:**
