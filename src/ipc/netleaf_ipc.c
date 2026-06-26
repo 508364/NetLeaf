@@ -23,7 +23,7 @@ static nl_module_info_t g_ipc_module_info = {
     .is_available = nl_ipc_is_available,
     .get_version = nl_ipc_version,
     .description = "Inter-process communication (Named Pipe/Unix Socket)",
-    .author = "NetLeaf Team",
+    .author = "508364",
     .next = NULL
 };
 

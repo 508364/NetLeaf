@@ -1,6 +1,6 @@
 <img src="Logo.svg" width="40" height="40" align="left"> 
 
-# NetLeaf v2.2.1
+# NetLeaf v2.2.2
 
 High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.
 
@@ -144,11 +144,11 @@ MIT License
 
 ## Version
 
-2.2.1
+2.2.2
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v2.2.1) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v2.2.2) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 
@@ -398,3 +398,45 @@ int main() {
 ```
 
 **Build Option:** `BUILD_LANG=ON` (default)
+
+---
+
+### 7. Vue Module (netleaf_vue)
+
+**Features:**
+- **Vue CDN Configuration**: Support for unpkg, cdnjs, jsdelivr, and local Vue files
+- **Vue Code Detection**: Auto-detect Vue code patterns in HTML
+- **Auto Import**: Automatically add Vue CDN import when Vue code is detected
+- **HTML Generation**: Generate complete HTML pages with Vue integration
+- **Predefined Components**: Counter, Dashboard, and Form components
+- **Variable Substitution**: Support for template variable replacement
+
+**Platform Support:**
+- ✅ Windows
+- ✅ Linux
+- ✅ macOS
+
+**Usage:**
+```c
+#include "netleaf_vue.h"
+
+int main() {
+    nl_vue_init();
+    
+    // Generate a counter page
+    char* html = nl_vue_generate_counter("My Counter");
+    // Serve the HTML...
+    free(html);
+    
+    // Generate a page with custom Vue code
+    const char* vue_code = "<div>{{ message }}</div>";
+    char* page = nl_vue_generate_page(vue_code, "My Page", NL_VUE_CDN_UNPKG, "3.4.0");
+    // Serve the page...
+    free(page);
+    
+    nl_vue_shutdown();
+    return 0;
+}
+```
+
+**Build Option:** `BUILD_VUE=ON` (default)

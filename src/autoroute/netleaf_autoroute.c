@@ -39,7 +39,7 @@ static nl_module_info_t g_autoroute_module_info = {
     .is_available = nl_autoroute_is_available,
     .get_version = nl_autoroute_version,
     .description = "Automatic route suggestions and matching",
-    .author = "NetLeaf Team",
+    .author = "508364",
     .next = NULL
 };
 

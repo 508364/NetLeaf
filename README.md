@@ -1,6 +1,6 @@
 <img src="./Logo.svg" width="50" height="50" align="left"> 
 
-### **NetLeaf v2.2.1**
+### **NetLeaf v2.2.2**
 高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器
 
 **平台支持:**
@@ -560,7 +560,7 @@ int nl_serve_dashboard(int port, const char* title);
 
 ## 附加模块
 
-以下模块是从主库分离出来的独立库，与主库共用版本号(v2.2.0)，构建时一起构建。
+以下模块是从主库分离出来的独立库，与主库共用版本号(v2.2.2)，构建时一起构建。
 
 ### 1. Auto-complete 模块 (netleaf_autocomplete)
 
@@ -812,3 +812,49 @@ int main() {
 ```
 
 **构建选项：** `BUILD_LANG=ON` (默认)
+
+### 7. Vue 模块 (netleaf_vue)
+
+**功能：** Vue.js 后端支持和 HTML 生成。
+
+**特性：**
+- Vue CDN 配置（unpkg、cdnjs、jsdelivr、local）
+- Vue 代码检测和自动导入
+- HTML 页面生成（带 Vue CDN）
+- 预定义组件（Counter、Dashboard、Form）
+- 变量替换支持
+
+**平台支持：**
+- ✅ Windows - 完全支持
+- ✅ Linux - 完全支持
+- ✅ macOS - 完全支持
+
+**使用示例：**
+```c
+#include "netleaf_vue.h"
+
+int main() {
+    // 初始化模块
+    nl_vue_init();
+    
+    // 生成计数器页面
+    char* counter = nl_vue_generate_counter("计数器");
+    if (counter) {
+        printf("%s\n", counter);
+        free(counter);
+    }
+    
+    // 生成仪表盘页面
+    char* dashboard = nl_vue_generate_dashboard("监控面板");
+    if (dashboard) {
+        printf("%s\n", dashboard);
+        free(dashboard);
+    }
+    
+    // 清理
+    nl_vue_shutdown();
+    return 0;
+}
+```
+
+**构建选项：** `BUILD_VUE=ON` (默认)

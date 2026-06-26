@@ -45,7 +45,7 @@ static nl_module_info_t g_errorpage_module_info = {
     .is_available = nl_errorpage_is_available,
     .get_version = nl_errorpage_version,
     .description = "Template-based error pages",
-    .author = "NetLeaf Team",
+    .author = "508364",
     .next = NULL
 };
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(NetLeaf VERSION 2.2.1 LANGUAGES C)
+project(NetLeaf VERSION 2.2.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -15,6 +15,7 @@ option(BUILD_AUTOROUTE "Build autoroute module (auto route suggestions)" ON)
 option(BUILD_ERRORPAGE "Build errorpage module (better error pages with templates)" ON)
 option(BUILD_IPC "Build IPC communication module (Windows/Linux only)" ON)
 option(BUILD_LINKAGG "Build link aggregation module (Windows/Linux only)" ON)
+option(BUILD_VUE "Build Vue module (Vue.js backend support)" ON)
 option(BUILD_ASAN "Build with AddressSanitizer (Debug only)" OFF)
 
 # 平台检测
@@ -261,6 +262,12 @@ if(BUILD_LINKAGG)
     add_subdirectory(src/linkagg)
 endif()
 
+# 可选模块 - Vue (Vue.js backend support)
+if(BUILD_VUE)
+    message(STATUS "Building vue module...")
+    add_subdirectory(src/vue)
+endif()
+
 # 添加测试程序
 
 # 构建摘要
@@ -280,6 +287,7 @@ message(STATUS "Build autoroute: ${BUILD_AUTOROUTE}")
 message(STATUS "Build errorpage: ${BUILD_ERRORPAGE}")
 message(STATUS "Build ipc: ${BUILD_IPC}")
 message(STATUS "Build linkagg: ${BUILD_LINKAGG}")
+message(STATUS "Build vue: ${BUILD_VUE}")
 message(STATUS "")
 message(STATUS "Output directories:")
 message(STATUS "  Libraries: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")

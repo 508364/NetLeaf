@@ -1,5 +1,38 @@
 # NetLeaf 版本历史
 
+## v2.2.2
+
+**平台支持:**
+- ✅ Windows (IOCP) - 完全支持
+- ✅ Linux (epoll) - 完全支持
+- ✅ macOS (kqueue) - 完全支持（所有模块）
+
+**新增功能 - Vue 后端支持 (netleaf_vue):**
+- **功能**: Vue.js 后端支持和 HTML 生成模块
+- **文件**: `include/netleaf_vue.h`, `src/vue/netleaf_vue.c`
+- **特性**:
+  - Vue CDN 配置（unpkg, cdnjs, jsdelivr, local）
+  - Vue 代码检测和自动导入
+  - HTML 页面生成（带 Vue CDN）
+  - 预定义组件生成（Counter, Dashboard, Form）
+  - 变量替换支持
+- **平台**: Windows/Linux/macOS（全平台支持）
+
+**多语言错误消息增强:**
+- 支持一个库指定多个同语言文件
+- 支持多库共享翻译文件（需显式声明）
+- 错误码重复注册检测
+- 异步加载支持优化
+
+**模块系统优化:**
+- 新增 Vue 模块类型 `NL_MODULE_VUE`
+- 统一的模块注册和管理
+- 跨平台兼容性改进
+
+**Bug 修复:**
+- 修复 Linux 构建警告
+- 修复 macOS 链接器选项问题
+
 ## v2.2.1
 
 **平台支持:**

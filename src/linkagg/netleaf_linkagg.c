@@ -185,7 +185,7 @@ static nl_module_info_t g_linkagg_module_info = {
     .is_available = nl_lagg_is_available,
     .get_version = nl_lagg_version,
     .description = "Same-port link aggregation and load balancing",
-    .author = "NetLeaf Team",
+    .author = "508364",
     .next = NULL
 };
 

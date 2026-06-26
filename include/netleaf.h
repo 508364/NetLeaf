@@ -20,10 +20,10 @@
 extern "C" {
 #endif
 
-#define NETLEAF_VERSION "2.2.1"
+#define NETLEAF_VERSION "2.2.2"
 #define NETLEAF_VERSION_MAJOR 2
 #define NETLEAF_VERSION_MINOR 2
-#define NETLEAF_VERSION_PATCH 1
+#define NETLEAF_VERSION_PATCH 2
 
 // =========================================
 // Module Management API

@@ -38,7 +38,7 @@ static nl_module_info_t g_autocomplete_module_info = {
     .is_available = nl_autocomplete_is_available,
     .get_version = nl_autocomplete_version,
     .description = "Auto-completion for charset and Vue imports",
-    .author = "NetLeaf Team",
+    .author = "508364",
     .next = NULL
 };
 
