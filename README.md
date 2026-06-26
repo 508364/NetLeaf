@@ -175,25 +175,6 @@ int main() {
 
 ## 更新日志
 
-## 新增功能 (v2.2.1)
-
-- ✅ **IPC通讯服务**: 进程间通讯服务，支持Windows Named Pipe和Linux Unix Domain Socket（独立模块）
-- ✅ **同端口链路聚合**: 单端口监听，支持Round Robin/Random/Least Connections/Weighted Round Robin负载均衡（独立模块）
-- ✅ **多语言错误消息**: 统一的中英文错误消息翻译库 (netleaf_lang)
-- ✅ **统一模块接口**: 所有独立模块通过`nl_module_info_t`结构统一管理
-- ✅ **ASan支持**: 支持AddressSanitizer内存检测
-- ✅ **多项Bug修复**: 修复边缘触发epoll、socket双重关闭、内存泄漏等问题
-- ✅ **性能优化**: LTO链接优化、qsort替代bubble sort、移除忙等待
-
-## 新增功能 (v2.2.0)
-
-- ✅ **macOS平台支持**: 初步支持macOS (kqueue事件机制)
-- ✅ **Auto-complete机制**: 自动补全charset标签和自动引入Vue库（独立可拆卸模块）
-- ✅ **Auto-route机制**: 404时自动查找相近端点并提示（独立可拆卸模块）
-- ✅ **自定义错误页面**: 支持设置自定义错误页面模板，强制预留变量区域
-- ✅ **错误页面联动**: 错误页面可与autoroute联动，显示路由建议
-
-
 **查看完整版本历史:** [CHANGELOG.md](CHANGELOG.md)
 
 ## Wiki - 最佳实践
