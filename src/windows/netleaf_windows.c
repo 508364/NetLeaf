@@ -1493,11 +1493,21 @@ int nl_serve(int port, nl_http_handler_t default_handler, void* user_data) {
 // Inline HTML/Vue Modern Web Server - Windows
 // =========================================
 
+// Route type enumeration
+typedef enum {
+    NL_ROUTE_TYPE_CONTENT = 0,    // Static content (html/vue/json)
+    NL_ROUTE_TYPE_FILE = 1,       // File-based (hot reload)
+    NL_ROUTE_TYPE_REDIRECT = 2    // HTTP 302 redirect
+} nl_route_type_t;
+
 typedef struct nl_web_route {
     char path[256];
     char* content;
     size_t content_size;
     char content_type[64];
+    nl_route_type_t type;         // Route type
+    char file_path[512];          // File path for hot reload
+    char redirect_url[512];       // Redirect URL for 302
     struct nl_web_route* next;
 } nl_web_route_t;
 
@@ -1514,6 +1524,7 @@ struct nl_web_server {
     struct nl_web_server* next;
     int error_suggestions_enabled;
     char error_page_templates[8][256];
+    nl_redirect_type_t redirect_type;  // Default redirect type (301 or 302)
 };
 
 static struct nl_web_server* g_web_servers = NULL;
@@ -1588,10 +1599,74 @@ static DWORD WINAPI web_server_thread(LPVOID arg) {
         nl_web_route_t* route = server->routes;
         while (route) {
             if (strcmp(route->path, path) == 0) {
-                LeaveCriticalSection(&server->mutex);
-                send_http_response(client, route->content_type, route->content, route->content_size);
-                closesocket(client);
-                goto next_conn;
+                // Handle different route types
+                if (route->type == NL_ROUTE_TYPE_REDIRECT) {
+                    // Send redirect (301 or 302 based on server setting)
+                    int redirect_code = server->redirect_type;
+                    const char* redirect_text = (redirect_code == 301) ? "Moved Permanently" : "Found";
+                    LeaveCriticalSection(&server->mutex);
+                    char redirect_response[1024];
+                    snprintf(redirect_response, sizeof(redirect_response),
+                        "HTTP/1.1 %d %s\r\n"
+                        "Location: %s\r\n"
+                        "Content-Length: 0\r\n"
+                        "Connection: close\r\n"
+                        "\r\n",
+                        redirect_code, redirect_text, route->redirect_url);
+                    (void)send(client, redirect_response, (int)strlen(redirect_response), 0);
+                    closesocket(client);
+                    goto next_conn;
+                }
+                else if (route->type == NL_ROUTE_TYPE_FILE) {
+                    // Hot reload: read file content on each request
+                    LeaveCriticalSection(&server->mutex);
+                    
+                    // Read file content
+                    FILE* fp = fopen(route->file_path, "rb");
+                    if (!fp) {
+                        send_http_error(client, 404, "File Not Found");
+                        closesocket(client);
+                        goto next_conn;
+                    }
+                    
+                    // Get file size
+                    fseek(fp, 0, SEEK_END);
+                    long file_size = ftell(fp);
+                    fseek(fp, 0, SEEK_SET);
+                    
+                    if (file_size <= 0 || file_size > 10 * 1024 * 1024) {  // Max 10MB
+                        fclose(fp);
+                        send_http_error(client, 500, "File Too Large");
+                        closesocket(client);
+                        goto next_conn;
+                    }
+                    
+                    // Allocate and read
+                    char* file_content = (char*)malloc(file_size + 1);
+                    if (!file_content) {
+                        fclose(fp);
+                        send_http_error(client, 500, "Memory Error");
+                        closesocket(client);
+                        goto next_conn;
+                    }
+                    
+                    size_t read_size = fread(file_content, 1, file_size, fp);
+                    fclose(fp);
+                    file_content[read_size] = '\0';
+                    
+                    // Send response
+                    send_http_response(client, route->content_type, file_content, read_size);
+                    free(file_content);
+                    closesocket(client);
+                    goto next_conn;
+                }
+                else {
+                    // Static content
+                    LeaveCriticalSection(&server->mutex);
+                    send_http_response(client, route->content_type, route->content, route->content_size);
+                    closesocket(client);
+                    goto next_conn;
+                }
             }
             route = route->next;
         }
@@ -1629,6 +1704,7 @@ nl_web_server_t* nl_web_create(int port) {
     server->routes = NULL;
     InitializeCriticalSection(&server->mutex);
     strncpy(server->encoding, "UTF-8", sizeof(server->encoding) - 1);
+    server->redirect_type = NL_REDIRECT_TEMPORARY;  // Default: 302
     server->next = g_web_servers;
     g_web_servers = server;
     LeaveCriticalSection(&g_web_servers_mutex);
@@ -1810,10 +1886,88 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
         strcpy(route->content, content);
         strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
         route->content_type[sizeof(route->content_type) - 1] = '\0';
+        route->type = NL_ROUTE_TYPE_CONTENT;  // Default: static content
+        route->file_path[0] = '\0';
+        route->redirect_url[0] = '\0';
         route->next = server->routes;
         server->routes = route;
     }
     LeaveCriticalSection(&server->mutex);
+}
+
+static int is_url(const char* str) {
+    if (!str) return 0;
+    size_t len = strlen(str);
+    if (len < 7) return 0;
+    if ((strncmp(str, "http://", 7) == 0) || (strncmp(str, "https://", 8) == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int is_file_path(const char* str, char* abs_path, size_t abs_path_size) {
+    if (!str || !abs_path) return 0;
+    
+    char full_path[512];
+    if (_fullpath(full_path, str, sizeof(full_path))) {
+        strncpy(abs_path, full_path, abs_path_size - 1);
+    } else {
+        strncpy(abs_path, str, abs_path_size - 1);
+    }
+    abs_path[abs_path_size - 1] = '\0';
+    
+    FILE* fp = fopen(abs_path, "rb");
+    if (fp) {
+        fclose(fp);
+        return 1;
+    }
+    return 0;
+}
+
+static void add_web_route_smart(nl_web_server_t* server, const char* path, const char* content, const char* content_type) {
+    if (!server || !path || !content) return;
+    
+    // Priority 1: Check for URL (302/301 redirect)
+    if (is_url(content)) {
+        EnterCriticalSection(&server->mutex);
+        nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+        if (route) {
+            strncpy(route->path, path, sizeof(route->path) - 1);
+            route->path[sizeof(route->path) - 1] = '\0';
+            strncpy(route->redirect_url, content, sizeof(route->redirect_url) - 1);
+            route->redirect_url[sizeof(route->redirect_url) - 1] = '\0';
+            strncpy(route->content_type, "text/html", sizeof(route->content_type) - 1);
+            route->type = NL_ROUTE_TYPE_REDIRECT;
+            route->next = server->routes;
+            server->routes = route;
+        }
+        LeaveCriticalSection(&server->mutex);
+        windows_log(NL_LOG_INFO, "Added redirect: %s -> %s", path, content);
+        return;
+    }
+    
+    // Priority 2: Check for file path (hot reload)
+    char abs_path[512];
+    if (is_file_path(content, abs_path, sizeof(abs_path))) {
+        EnterCriticalSection(&server->mutex);
+        nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+        if (route) {
+            strncpy(route->path, path, sizeof(route->path) - 1);
+            route->path[sizeof(route->path) - 1] = '\0';
+            strncpy(route->file_path, abs_path, sizeof(route->file_path) - 1);
+            route->file_path[sizeof(route->file_path) - 1] = '\0';
+            strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+            route->type = NL_ROUTE_TYPE_FILE;
+            route->next = server->routes;
+            server->routes = route;
+        }
+        LeaveCriticalSection(&server->mutex);
+        windows_log(NL_LOG_INFO, "Added file route: %s -> %s (hot reload)", path, abs_path);
+        return;
+    }
+    
+    // Priority 3: Static content
+    add_web_route(server, path, content, content_type);
 }
 
 static int charset_module_loaded = 0;
@@ -1961,14 +2115,40 @@ static char* add_charset_if_missing(nl_web_server_t* server, const char* html) {
 }
 
 void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html) {
+    // Smart detection: URL redirect, file path hot reload, or static content
+    if (is_url(html)) {
+        add_web_route_smart(server, path, html, "text/html");
+        return;
+    }
+    
+    char abs_path[512];
+    if (is_file_path(html, abs_path, sizeof(abs_path))) {
+        add_web_route_smart(server, path, html, "text/html");
+        return;
+    }
+    
+    // Static content with charset processing
     char* processed = add_charset_if_missing(server, html);
     if (processed) {
-        add_web_route(server, path, processed, "text/html");
+        add_web_route_smart(server, path, processed, "text/html");
         free(processed);
     }
 }
 
 void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code) {
+    // Smart detection: URL redirect or file path hot reload
+    if (is_url(vue_code)) {
+        add_web_route_smart(server, path, vue_code, "text/html");
+        return;
+    }
+    
+    char abs_path[512];
+    if (is_file_path(vue_code, abs_path, sizeof(abs_path))) {
+        add_web_route_smart(server, path, vue_code, "text/html");
+        return;
+    }
+    
+    // Vue code wrapped in full HTML
     char full_html[32768];
     snprintf(full_html, sizeof(full_html),
         "<!DOCTYPE html>\n"
@@ -1989,7 +2169,7 @@ void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_c
         "</script>\n"
         "</body></html>",
         nl_responsive_css, nl_vue_cdn, vue_code);
-    add_web_route(server, path, full_html, "text/html");
+    add_web_route_smart(server, path, full_html, "text/html");
 }
 
 void nl_web_set_encoding(nl_web_server_t* server, const char* encoding) {
@@ -2236,7 +2416,34 @@ void nl_web_add_vue_with_vars(nl_web_server_t* server, const char* path, const c
 }
 
 void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json) {
-    add_web_route(server, path, json, "application/json");
+    // Smart detection: URL redirect or file path hot reload
+    if (is_url(json)) {
+        add_web_route_smart(server, path, json, "text/html");
+        return;
+    }
+    
+    char abs_path[512];
+    if (is_file_path(json, abs_path, sizeof(abs_path))) {
+        add_web_route_smart(server, path, json, "application/json");
+        return;
+    }
+    
+    // Static JSON content
+    add_web_route_smart(server, path, json, "application/json");
+}
+
+// Redirect Type API
+void nl_web_set_redirect_type(nl_web_server_t* server, nl_redirect_type_t type) {
+    if (!server) return;
+    EnterCriticalSection(&server->mutex);
+    server->redirect_type = type;
+    LeaveCriticalSection(&server->mutex);
+    windows_log(NL_LOG_INFO, "Redirect type set to %d", type);
+}
+
+nl_redirect_type_t nl_web_get_redirect_type(nl_web_server_t* server) {
+    if (!server) return NL_REDIRECT_TEMPORARY;
+    return server->redirect_type;
 }
 
 void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* title) {

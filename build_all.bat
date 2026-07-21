@@ -3,16 +3,20 @@ chcp 65001 >nul 2>&1
 REM NetLeaf Multi-Architecture Build Script
 REM This script builds NetLeaf for Windows x86, x64, and ARM64
 
-set VERSION=2.2.1
+set VERSION=2.2.2
 
 echo ========================================
 echo   NetLeaf v%VERSION% Build Script
 echo ========================================
 echo.
+echo Usage: Just run build_all.bat
+echo Output: releases/ directory
+echo.
 
 REM Create output directories
 if not exist "build" mkdir build
 if not exist "releases" mkdir releases
+if not exist "extensions" mkdir extensions
 
 REM Check if VS environment is available
 where cl >nul 2>nul

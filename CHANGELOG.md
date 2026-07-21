@@ -7,6 +7,63 @@
 - ✅ Linux (epoll) - 完全支持
 - ✅ macOS (kqueue) - 完全支持（所有模块）
 
+**重要变更 - 静态库支持:**
+- ⚠️ **静态库已不再支持** - 由于扩展库需要动态链接以共享全局状态
+- 如需静态链接，请使用 v2.2.1 或更早版本
+- 所有模块现在仅构建为动态库（DLL/SO）
+
+**新增功能 - 扩展库系统:**
+- **功能**: 支持第三方开发者创建动态扩展库
+- **文件**: `include/netleaf_module.h`, `src/netleaf_module.c`
+- **特性**:
+  - 扩展库定义结构 `nl_extension_info_t`
+  - 用户定义字段：库名称、库ID、版本、作者、详情（可选，限制50个中文字符）
+  - 平台支持字符串：`"Windows,Linux,MacOS"` 或 `"all"`（大小写不限，顺序不限）
+  - `library_value` 由主库自动分配，用户无需设置
+  - 扩展库自动加载：放入 `extensions/` 目录，`nl_modules_init()` 时自动加载
+  - 扩展库注册/注销 API
+  - 查询 API：`nl_extension_get_value_by_id()` / `nl_extension_get_id_by_value()`
+  - 描述长度验证（最多50个中文字符）
+- **示例**: `examples/plugin_example/`
+- **文档**: `wiki/Extension.md`
+
+**新增功能 - Web服务器文件热加载 (v2.2.2):**
+- **功能**: 支持从外部文件加载HTML/Vue/JSON，修改后刷新立即生效
+- **API**:
+  - `nl_web_add_html_file(server, path, file_path)` - 从文件加载HTML
+  - `nl_web_add_vue_file(server, path, file_path)` - 从文件加载Vue
+  - `nl_web_add_json_file(server, path, file_path)` - 从文件加载JSON
+- **特性**:
+  - 每次请求时重新读取文件内容
+  - 最大支持10MB文件
+  - 自动获取文件绝对路径
+  - 返回值：`NL_OK`/`NL_EINVAL`/`NL_EFILE`/`NL_ENOMEM`
+- **平台**: Windows/Linux/macOS（全平台支持）
+
+**新增功能 - HTTP重定向 (v2.2.2):**
+- **功能**: 支持配置临时重定向（302）和永久重定向（301），可在运行时切换
+- **API**:
+  - `nl_web_add_redirect(server, path, target_url)` - 添加重定向
+  - `nl_web_set_redirect_type(server, type)` - 运行时设置重定向类型（301/302）
+  - `nl_web_get_redirect_type(server)` - 查询当前重定向类型
+- **特性**:
+  - 支持内部重定向（同服务器路径）
+  - 支持外部重定向（完整URL）
+  - 默认302临时重定向，可运行时切换为301永久重定向
+  - 返回标准HTTP响应头
+- **平台**: Windows/Linux/macOS（全平台支持）
+
+**新增功能 - 智能检测 (v2.2.2):**
+- **功能**: `nl_web_add_html`、`nl_web_add_vue`、`nl_web_add_json` 自动识别内容类型
+- **特性**:
+  - URL (`http://`/`https://`) → 自动创建重定向路由
+  - 文件路径 → 自动创建热更新路由
+  - 静态内容 → 直接作为内联内容处理
+- **平台**: Windows/Linux/macOS（全平台支持）
+
+**移除的公开API:**
+- 布尔值转换API（`nl_bool_from_string`等）已改为内部静默处理，不再对外暴露
+
 **新增功能 - Vue 后端支持 (netleaf_vue):**
 - **功能**: Vue.js 后端支持和 HTML 生成模块
 - **文件**: `include/netleaf_vue.h`, `src/vue/netleaf_vue.c`
@@ -14,9 +71,14 @@
   - Vue CDN 配置（unpkg, cdnjs, jsdelivr, local）
   - Vue 代码检测和自动导入
   - HTML 页面生成（带 Vue CDN）
-  - 预定义组件生成（Counter, Dashboard, Form）
+  - 预定义组件生成（系统信息、性能监控）
   - 变量替换支持
 - **平台**: Windows/Linux/macOS（全平台支持）
+
+**构建流程简化:**
+- `build_all.bat` / `build_all.sh` - 直接运行即可构建
+- 自动创建 `extensions/` 目录
+- 版本号更新为 2.2.2
 
 **多语言错误消息增强:**
 - 支持一个库指定多个同语言文件
@@ -26,12 +88,16 @@
 
 **模块系统优化:**
 - 新增 Vue 模块类型 `NL_MODULE_VUE`
+- 新增扩展库管理 API
 - 统一的模块注册和管理
 - 跨平台兼容性改进
 
 **Bug 修复:**
-- 修复 Linux 构建警告
-- 修复 macOS 链接器选项问题
+- 修复 Linux 构建警告（`strdup` 隐式声明、未使用参数）
+- 修复 macOS 链接器选项问题（`-fstack-protector-strong` 仅 Linux）
+- 修复插件加载中的 `va_list` 未声明问题
+- 修复跨平台类型兼容性问题（`HMODULE*` 替换为 `nl_plugin_handle_t*`）
+- 修复枚举重复定义问题（`nl_lazy_status_t` → `nl_module_lazy_status_t`）
 
 ## v2.2.1
 

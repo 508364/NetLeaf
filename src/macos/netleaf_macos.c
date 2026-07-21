@@ -1438,11 +1438,21 @@ int nl_serve(int port, nl_http_handler_t default_handler, void* user_data) {
 }
 
 // Web Server Implementation
+// Route type enumeration
+typedef enum {
+    NL_ROUTE_TYPE_CONTENT = 0,    // Static content (html/vue/json)
+    NL_ROUTE_TYPE_FILE = 1,       // File-based (hot reload)
+    NL_ROUTE_TYPE_REDIRECT = 2    // HTTP 302 redirect
+} nl_route_type_t;
+
 typedef struct nl_web_route {
     char path[256];
     char* content;
     size_t content_size;
     char content_type[64];
+    nl_route_type_t type;         // Route type
+    char file_path[512];          // File path for hot reload
+    char redirect_url[512];       // Redirect URL for 302
     struct nl_web_route* next;
 } nl_web_route_t;
 
@@ -1516,10 +1526,67 @@ static void* web_server_thread(void* arg) {
         nl_web_route_t* route = server->routes;
         while (route) {
             if (strcmp(route->path, path) == 0) {
-                pthread_mutex_unlock(&server->mutex);
-                send_http_response(client, route->content_type, route->content, route->content_size);
-                close(client);
-                goto next_conn;
+                // Handle different route types
+                if (route->type == NL_ROUTE_TYPE_REDIRECT) {
+                    // Send 302 redirect
+                    pthread_mutex_unlock(&server->mutex);
+                    char redirect_response[1024];
+                    snprintf(redirect_response, sizeof(redirect_response),
+                        "HTTP/1.1 302 Found\r\n"
+                        "Location: %s\r\n"
+                        "Content-Length: 0\r\n"
+                        "Connection: close\r\n"
+                        "\r\n",
+                        route->redirect_url);
+                    (void)write(client, redirect_response, strlen(redirect_response));
+                    close(client);
+                    goto next_conn;
+                }
+                else if (route->type == NL_ROUTE_TYPE_FILE) {
+                    // Hot reload: read file content on each request
+                    pthread_mutex_unlock(&server->mutex);
+                    
+                    FILE* fp = fopen(route->file_path, "rb");
+                    if (!fp) {
+                        send_http_error(client, 404, "File Not Found");
+                        close(client);
+                        goto next_conn;
+                    }
+                    
+                    fseek(fp, 0, SEEK_END);
+                    long file_size = ftell(fp);
+                    fseek(fp, 0, SEEK_SET);
+                    
+                    if (file_size <= 0 || file_size > 10 * 1024 * 1024) {
+                        fclose(fp);
+                        send_http_error(client, 500, "File Too Large");
+                        close(client);
+                        goto next_conn;
+                    }
+                    
+                    char* file_content = (char*)malloc(file_size + 1);
+                    if (!file_content) {
+                        fclose(fp);
+                        send_http_error(client, 500, "Memory Error");
+                        close(client);
+                        goto next_conn;
+                    }
+                    
+                    size_t read_size = fread(file_content, 1, file_size, fp);
+                    fclose(fp);
+                    file_content[read_size] = '\0';
+                    
+                    send_http_response(client, route->content_type, file_content, read_size);
+                    free(file_content);
+                    close(client);
+                    goto next_conn;
+                }
+                else {
+                    pthread_mutex_unlock(&server->mutex);
+                    send_http_response(client, route->content_type, route->content, route->content_size);
+                    close(client);
+                    goto next_conn;
+                }
             }
             route = route->next;
         }
@@ -1649,6 +1716,9 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
         }
         strcpy(route->content, content);
         strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+        route->type = NL_ROUTE_TYPE_CONTENT;  // Default: static content
+        route->file_path[0] = '\0';
+        route->redirect_url[0] = '\0';
         route->next = server->routes;
         server->routes = route;
     }
@@ -1747,6 +1817,154 @@ void nl_web_add_vue_with_vars(nl_web_server_t* server, const char* path, const c
 
 void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json) {
     add_web_route(server, path, json, "application/json");
+}
+
+// Add HTML from external file (hot reload support)
+int nl_web_add_html_file(nl_web_server_t* server, const char* path, const char* file_path) {
+    if (!server || !path || !file_path) return NL_EINVAL;
+    
+    char abs_path[512];
+    if (realpath(file_path, abs_path) == NULL) {
+        strncpy(abs_path, file_path, sizeof(abs_path) - 1);
+    }
+    abs_path[sizeof(abs_path) - 1] = '\0';
+    
+    FILE* fp = fopen(abs_path, "rb");
+    if (!fp) {
+        printf("Error: File not found: %s\n", abs_path);
+        return NL_EFILE;
+    }
+    fclose(fp);
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (!route) {
+        pthread_mutex_unlock(&server->mutex);
+        return NL_ENOMEM;
+    }
+    
+    strncpy(route->path, path, sizeof(route->path) - 1);
+    route->path[sizeof(route->path) - 1] = '\0';
+    strncpy(route->file_path, abs_path, sizeof(route->file_path) - 1);
+    route->file_path[sizeof(route->file_path) - 1] = '\0';
+    strncpy(route->content_type, "text/html", sizeof(route->content_type) - 1);
+    route->type = NL_ROUTE_TYPE_FILE;
+    route->content = NULL;
+    route->content_size = 0;
+    route->redirect_url[0] = '\0';
+    route->next = server->routes;
+    server->routes = route;
+    pthread_mutex_unlock(&server->mutex);
+    
+    printf("Added HTML file route: %s -> %s (hot reload)\n", path, abs_path);
+    return NL_OK;
+}
+
+int nl_web_add_vue_file(nl_web_server_t* server, const char* path, const char* file_path) {
+    if (!server || !path || !file_path) return NL_EINVAL;
+    
+    char abs_path[512];
+    if (realpath(file_path, abs_path) == NULL) {
+        strncpy(abs_path, file_path, sizeof(abs_path) - 1);
+    }
+    abs_path[sizeof(abs_path) - 1] = '\0';
+    
+    FILE* fp = fopen(abs_path, "rb");
+    if (!fp) {
+        printf("Error: File not found: %s\n", abs_path);
+        return NL_EFILE;
+    }
+    fclose(fp);
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (!route) {
+        pthread_mutex_unlock(&server->mutex);
+        return NL_ENOMEM;
+    }
+    
+    strncpy(route->path, path, sizeof(route->path) - 1);
+    route->path[sizeof(route->path) - 1] = '\0';
+    strncpy(route->file_path, abs_path, sizeof(route->file_path) - 1);
+    route->file_path[sizeof(route->file_path) - 1] = '\0';
+    strncpy(route->content_type, "text/html", sizeof(route->content_type) - 1);
+    route->type = NL_ROUTE_TYPE_FILE;
+    route->content = NULL;
+    route->content_size = 0;
+    route->redirect_url[0] = '\0';
+    route->next = server->routes;
+    server->routes = route;
+    pthread_mutex_unlock(&server->mutex);
+    
+    printf("Added Vue file route: %s -> %s (hot reload)\n", path, abs_path);
+    return NL_OK;
+}
+
+int nl_web_add_json_file(nl_web_server_t* server, const char* path, const char* file_path) {
+    if (!server || !path || !file_path) return NL_EINVAL;
+    
+    char abs_path[512];
+    if (realpath(file_path, abs_path) == NULL) {
+        strncpy(abs_path, file_path, sizeof(abs_path) - 1);
+    }
+    abs_path[sizeof(abs_path) - 1] = '\0';
+    
+    FILE* fp = fopen(abs_path, "rb");
+    if (!fp) {
+        printf("Error: File not found: %s\n", abs_path);
+        return NL_EFILE;
+    }
+    fclose(fp);
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (!route) {
+        pthread_mutex_unlock(&server->mutex);
+        return NL_ENOMEM;
+    }
+    
+    strncpy(route->path, path, sizeof(route->path) - 1);
+    route->path[sizeof(route->path) - 1] = '\0';
+    strncpy(route->file_path, abs_path, sizeof(route->file_path) - 1);
+    route->file_path[sizeof(route->file_path) - 1] = '\0';
+    strncpy(route->content_type, "application/json", sizeof(route->content_type) - 1);
+    route->type = NL_ROUTE_TYPE_FILE;
+    route->content = NULL;
+    route->content_size = 0;
+    route->redirect_url[0] = '\0';
+    route->next = server->routes;
+    server->routes = route;
+    pthread_mutex_unlock(&server->mutex);
+    
+    printf("Added JSON file route: %s -> %s (hot reload)\n", path, abs_path);
+    return NL_OK;
+}
+
+void nl_web_add_redirect(nl_web_server_t* server, const char* path, const char* target_url) {
+    nl_web_add_redirect_302(server, path, target_url);
+}
+
+void nl_web_add_redirect_302(nl_web_server_t* server, const char* path, const char* target_url) {
+    if (!server || !path || !target_url) return;
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (route) {
+        strncpy(route->path, path, sizeof(route->path) - 1);
+        route->path[sizeof(route->path) - 1] = '\0';
+        strncpy(route->redirect_url, target_url, sizeof(route->redirect_url) - 1);
+        route->redirect_url[sizeof(route->redirect_url) - 1] = '\0';
+        strncpy(route->content_type, "text/html", sizeof(route->content_type) - 1);
+        route->type = NL_ROUTE_TYPE_REDIRECT;
+        route->content = NULL;
+        route->content_size = 0;
+        route->file_path[0] = '\0';
+        route->next = server->routes;
+        server->routes = route;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    
+    printf("Added redirect: %s -> %s (302)\n", path, target_url);
 }
 
 void nl_web_stop_by_port(int port) {

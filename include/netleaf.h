@@ -97,16 +97,20 @@ typedef enum {
     NL_LOG_ERROR
 } nl_log_level_t;
 
-// Debug mode API
-NL_API void nl_debug_enable(int enable);
-NL_API int nl_debug_is_enabled(void);
-
+// =========================================
 // Logging API
+// =========================================
 NL_API void nl_log(nl_log_level_t level, const char* format, ...);
 NL_API void nl_log_debug(const char* format, ...);
 NL_API void nl_log_info(const char* format, ...);
 NL_API void nl_log_warn(const char* format, ...);
 NL_API void nl_log_error(const char* format, ...);
+
+// =========================================
+// Debug Mode API
+// =========================================
+NL_API void nl_debug_enable(int enable);
+NL_API int nl_debug_is_enabled(void);
 
 typedef enum {
     NL_OPT_TCP_NODELAY = 1,
@@ -266,6 +270,21 @@ NL_API void nl_web_set_encoding(nl_web_server_t* server, const char* encoding);
 
 // Validate encoding string
 NL_API int nl_web_validate_encoding(const char* encoding);
+
+// =========================================
+// Redirect Type API (Runtime Configuration)
+// =========================================
+
+typedef enum {
+    NL_REDIRECT_TEMPORARY = 302,   // 302 Found (Temporary redirect)
+    NL_REDIRECT_PERMANENT = 301    // 301 Moved Permanently (Permanent redirect)
+} nl_redirect_type_t;
+
+// Set default redirect type for all redirects (default: 302)
+NL_API void nl_web_set_redirect_type(nl_web_server_t* server, nl_redirect_type_t type);
+
+// Get current redirect type setting
+NL_API nl_redirect_type_t nl_web_get_redirect_type(nl_web_server_t* server);
 
 // =========================================
 // Error Page API (v2.2.0)
@@ -432,6 +451,16 @@ NL_API int nl_web_get_last_warning(nl_warning_t* warning);
 NL_API void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html);
 NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
 NL_API void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
+
+// Add HTML/Vue from external file (hot reload support)
+// These functions read file content on each request, allowing live updates
+NL_API int nl_web_add_html_file(nl_web_server_t* server, const char* path, const char* file_path);
+NL_API int nl_web_add_vue_file(nl_web_server_t* server, const char* path, const char* file_path);
+NL_API int nl_web_add_json_file(nl_web_server_t* server, const char* path, const char* file_path);
+
+// Add HTTP 302 temporary redirect
+NL_API void nl_web_add_redirect(nl_web_server_t* server, const char* path, const char* target_url);
+NL_API void nl_web_add_redirect_302(nl_web_server_t* server, const char* path, const char* target_url);
 
 // Add inline HTML/Vue with variable substitution
 // Variables are in format: {{<var>variable_name</var>}}

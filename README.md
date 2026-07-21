@@ -8,6 +8,11 @@
 - ✅ Linux (epoll) - 完全支持
 - ✅ macOS (kqueue) - 完全支持
 
+**重要变更 (v2.2.2):**
+- ⚠️ 静态库已不再支持，仅提供动态库（DLL/SO）
+- 原因：扩展库需要动态链接以共享全局状态
+- 如需静态链接，请使用 v2.2.1 或更早版本
+
 **仓库地址:**
 - GitHub: [https://github.com/508364/NetLeaf](https://github.com/508364/NetLeaf)
 - Gitee: [https://gitee.com/x508364/NetLeaf](https://gitee.com/x508364/NetLeaf)
@@ -60,9 +65,11 @@ build_all_windows.bat
 
 ```
 build/
-├── bin/Release/netleaf.dll (Windows) | libnetleaf.so (Linux)
-└── lib/Release/netleaf.lib (Windows) | libnetleaf.a (Linux)
+├── bin/Release/netleaf.dll (Windows) | libnetleaf.so (Linux) | libnetleaf.dylib (macOS)
+└── lib/Release/netleaf.lib (Windows导入库) | libnetleaf.a (Linux符号库)
 ```
+
+注：v2.2.2 仅提供动态库，静态库已不再支持。
 
 ## 使用示例
 
@@ -102,9 +109,9 @@ int main() {
 }
 ```
 
-### 3. 变量硬编码（新增）
+### 3. 文件热加载（v2.2.2新增）
 
-**变量在服务器端替换，用户F12看不到原始变量名：**
+修改外部文件后刷新页面立即生效，无需重启服务器。
 
 ```c
 #include "netleaf.h"
@@ -112,32 +119,65 @@ int main() {
 int main() {
     nl_web_server_t* server = nl_web_create(8080);
     
-    // 设置编码
-    nl_web_set_encoding(server, "UTF-8");
+    // 从文件加载HTML - 修改index.html后刷新立即生效
+    nl_web_add_html_file(server, "/", "index.html");
     
-    // 定义变量
-    const char* vars[] = {"username", "user_id"};
-    const char* values[] = {"张三", "12345"};
+    // 从文件加载Vue
+    nl_web_add_vue_file(server, "/app", "app.vue");
     
-    // 添加带变量的页面
-    nl_web_add_html_with_vars(server, "/profile",
-        "<h1>欢迎, {{<var>username</var>}}</h1>"
-        "<p>用户ID: {{<var>user_id</var>}}</p>",
-        vars, values, 2);
+    // 从文件加载JSON
+    nl_web_add_json_file(server, "/data", "data.json");
     
-    nl_web_start(server);
     while (1) Sleep(1000);
     return 0;
 }
 ```
 
-**输出到客户端：**
-```html
-<h1>欢迎, 张三</h1>
-<p>用户ID: 12345</p>
+### 4. HTTP重定向（v2.2.2新增）
+
+支持302临时重定向和301永久重定向，可在运行时切换。
+
+```c
+#include "netleaf.h"
+
+int main() {
+    nl_web_server_t* server = nl_web_create(8080);
+    
+    // 添加重定向（默认使用当前设置的重定向类型）
+    nl_web_add_redirect(server, "/old", "/new");
+    nl_web_add_redirect(server, "/google", "https://google.com");
+    
+    // 运行时切换为301永久重定向
+    nl_web_set_redirect_type(server, NL_REDIRECT_PERMANENT);
+    nl_web_add_redirect(server, "/moved", "/new-location");
+    
+    // 查询当前重定向类型
+    nl_redirect_type_t type = nl_web_get_redirect_type(server);
+    
+    while (1) Sleep(1000);
+    return 0;
+}
 ```
 
-### 4. 使用预设组件
+### 5. 智能检测（v2.2.2新增）
+
+`nl_web_add_html`、`nl_web_add_vue`、`nl_web_add_json` 自动识别内容类型：
+- URL (`http://`/`https://`) → 自动创建重定向路由
+- 文件路径 → 自动创建热更新路由
+- 静态内容 → 直接作为内联内容处理
+
+```c
+// 传入URL → 自动重定向
+nl_web_add_html(server, "/goto", "https://google.com");
+
+// 传文件路径 → 自动热加载
+nl_web_add_html(server, "/", "index.html");
+
+// 传静态HTML → 内联内容
+nl_web_add_html(server, "/hello", "<h1>Hello</h1>");
+```
+
+### 6. 使用预设组件
 
 ```c
 // 计数器
@@ -151,7 +191,7 @@ const char* fields[] = {"name", "email", "message"};
 nl_web_add_form(server, "/contact", "Contact Us", fields, 3);
 ```
 
-### 5. TCP服务器
+### 7. TCP服务器
 
 ```c
 #include "netleaf.h"

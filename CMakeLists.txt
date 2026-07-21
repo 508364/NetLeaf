@@ -8,7 +8,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 # 宽可用库配置选项
 option(WIDE_LIB "Build as wide-usable library (simple output structure)" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
-option(BUILD_STATIC_LIBS "Build static libraries" ON)
+# v2.2.2: 静态库已不再支持，因为扩展库需要动态链接以共享全局状态
+# If you need static linking, use v2.2.1 or earlier
+option(BUILD_STATIC_LIBS "Build static libraries (DEPRECATED since v2.2.2)" OFF)
 option(BUILD_EXAMPLES "Build example programs" OFF)
 option(BUILD_AUTOCOMPLETE "Build autocomplete module (auto charset/Vue completion)" ON)
 option(BUILD_AUTOROUTE "Build autoroute module (auto route suggestions)" ON)
@@ -216,15 +218,23 @@ if(BUILD_EXAMPLES)
     
     add_executable(example_all_features ${EXAMPLES_DIR}/example_all_features.c)
     target_link_libraries(example_all_features 
-        netleaf_static 
-        netleaf_autocomplete
-        netleaf_autoroute
-        netleaf_errorpage
+        netleaf_shared
+        netleaf_autocomplete_shared
+        netleaf_autoroute_shared
+        netleaf_errorpage_shared
         ${LINK_LIBS}
     )
     target_compile_definitions(example_all_features PRIVATE DEBUG_LOGGING)
     
     message(STATUS "Examples will be built to: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+endif()
+
+# 动态扩展库示例 - 类似于linkagg/vue等模块，但支持动态加载
+option(BUILD_EXTENSION_EXAMPLE "Build extension library example" ON)
+if(BUILD_EXTENSION_EXAMPLE)
+    message(STATUS "Building extension library example...")
+    # 必须在主库构建完成后才能添加扩展库
+    add_subdirectory(examples/plugin_example)
 endif()
 
 # 可选模块 - Auto-complete

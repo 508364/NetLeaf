@@ -3,11 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
+#define getcwd _getcwd
 #else
 #include <dlfcn.h>
+#include <dirent.h>
+#include <unistd.h>
 #endif
 
 static nl_module_info_t* g_module_list = NULL;
@@ -15,15 +20,9 @@ static int g_module_count = 0;
 static int g_modules_initialized = 0;
 static int g_lazy_enabled = 1;
 
-#ifdef _WIN32
-static HMODULE* g_plugin_handles = NULL;
+static nl_plugin_handle_t* g_plugin_handles = NULL;
 static int g_plugin_count = 0;
 static char g_last_error[512] = "";
-#else
-static void** g_plugin_handles = NULL;
-static int g_plugin_count = 0;
-static char g_last_error[512] = "";
-#endif
 
 static nl_module_info_t g_core_module_info = {
     .type = NL_MODULE_CORE,
@@ -42,7 +41,7 @@ static nl_module_info_t g_core_module_info = {
     .author = "508364",
     .lazy_load = NULL,
     .lazy_unload = NULL,
-    .lazy_status = NL_LAZY_STATUS_UNLOADED,
+    .lazy_status = NL_MODULE_LAZY_UNLOADED,
     .next = NULL,
     .dependencies = NULL
 };
@@ -195,7 +194,7 @@ void nl_module_lazy_clear_cache(void) {
     nl_module_info_t* current = g_module_list;
     while (current) {
         if (NL_CAP_HAS(current->capabilities, NL_CAP_LAZY_LOAD)) {
-            current->lazy_status = NL_LAZY_STATUS_UNLOADED;
+            current->lazy_status = NL_MODULE_LAZY_UNLOADED;
         }
         current = current->next;
     }
@@ -209,9 +208,9 @@ int nl_module_lazy_load(nl_module_type_t type) {
     
     if (!NL_CAP_HAS(info->capabilities, NL_CAP_LAZY_LOAD)) return NL_EINVAL;
     
-    if (info->lazy_status == NL_LAZY_STATUS_LOADED) return NL_OK;
+    if (info->lazy_status == NL_MODULE_LAZY_LOADED) return NL_OK;
     
-    info->lazy_status = NL_LAZY_STATUS_LOADING;
+    info->lazy_status = NL_MODULE_LAZY_LOADING;
     
     if (info->lazy_load) {
         info->lazy_load();
@@ -219,7 +218,7 @@ int nl_module_lazy_load(nl_module_type_t type) {
         info->init();
     }
     
-    info->lazy_status = NL_LAZY_STATUS_LOADED;
+    info->lazy_status = NL_MODULE_LAZY_LOADED;
     info->status = NL_MODULE_STATUS_INITIALIZED;
     
     return NL_OK;
@@ -231,9 +230,9 @@ int nl_module_lazy_unload(nl_module_type_t type) {
     
     if (!NL_CAP_HAS(info->capabilities, NL_CAP_LAZY_LOAD)) return NL_EINVAL;
     
-    if (info->lazy_status != NL_LAZY_STATUS_LOADED) return NL_OK;
+    if (info->lazy_status != NL_MODULE_LAZY_LOADED) return NL_OK;
     
-    info->lazy_status = NL_LAZY_STATUS_STOPPING;
+    info->lazy_status = NL_MODULE_LAZY_STOPPING;
     
     if (info->lazy_unload) {
         info->lazy_unload();
@@ -241,20 +240,20 @@ int nl_module_lazy_unload(nl_module_type_t type) {
         info->shutdown();
     }
     
-    info->lazy_status = NL_LAZY_STATUS_STOPPED;
+    info->lazy_status = NL_MODULE_LAZY_STOPPED;
     info->status = NL_MODULE_STATUS_STOPPED;
     
     return NL_OK;
 }
 
-nl_lazy_status_t nl_module_lazy_get_status(nl_module_type_t type) {
+nl_module_lazy_status_t nl_module_lazy_get_status(nl_module_type_t type) {
     nl_module_info_t* info = nl_module_get_info(type);
-    return info ? info->lazy_status : NL_LAZY_STATUS_UNLOADED;
+    return info ? info->lazy_status : NL_MODULE_LAZY_UNLOADED;
 }
 
 int nl_module_lazy_is_loaded(nl_module_type_t type) {
     nl_module_info_t* info = nl_module_get_info(type);
-    return info && info->lazy_status == NL_LAZY_STATUS_LOADED;
+    return info && info->lazy_status == NL_MODULE_LAZY_LOADED;
 }
 
 void nl_module_lazy_preload_all(void) {
@@ -290,11 +289,13 @@ static void set_last_error(const char* fmt, ...) {
     va_end(args);
 }
 
-nl_plugin_handle_t nl_plugin_load(const char* plugin_path) {
+NL_API nl_plugin_handle_t nl_plugin_load(const char* plugin_path) {
     if (!plugin_path) return NULL;
     
+    nl_plugin_handle_t handle = NULL;
+    
 #ifdef _WIN32
-    HMODULE handle = LoadLibraryA(plugin_path);
+    handle = (nl_plugin_handle_t)LoadLibraryA(plugin_path);
     if (!handle) {
         DWORD err = GetLastError();
         char msg[256];
@@ -305,17 +306,17 @@ nl_plugin_handle_t nl_plugin_load(const char* plugin_path) {
         return NULL;
     }
 #else
-    void* handle = dlopen(plugin_path, RTLD_LAZY);
+    handle = (nl_plugin_handle_t)dlopen(plugin_path, RTLD_LAZY);
     if (!handle) {
         set_last_error("Failed to load plugin %s: %s", plugin_path, dlerror());
         return NULL;
     }
 #endif
     
-    HMODULE* new_handles = realloc(g_plugin_handles, (g_plugin_count + 1) * sizeof(HMODULE));
+    nl_plugin_handle_t* new_handles = realloc(g_plugin_handles, (g_plugin_count + 1) * sizeof(nl_plugin_handle_t));
     if (!new_handles) {
 #ifdef _WIN32
-        FreeLibrary(handle);
+        FreeLibrary((HMODULE)handle);
 #else
         dlclose(handle);
 #endif
@@ -329,7 +330,7 @@ nl_plugin_handle_t nl_plugin_load(const char* plugin_path) {
     return handle;
 }
 
-int nl_plugin_unload(nl_plugin_handle_t handle) {
+NL_API int nl_plugin_unload(nl_plugin_handle_t handle) {
     if (!handle) return NL_EINVAL;
     
     int i;
@@ -358,7 +359,7 @@ int nl_plugin_unload(nl_plugin_handle_t handle) {
     return NL_OK;
 }
 
-int nl_plugin_register(nl_plugin_handle_t handle) {
+NL_API int nl_plugin_register(nl_plugin_handle_t handle) {
     if (!handle) return NL_EINVAL;
     
 #ifdef _WIN32
@@ -379,21 +380,21 @@ int nl_plugin_register(nl_plugin_handle_t handle) {
     return NL_OK;
 }
 
-nl_plugin_descriptor_t* nl_plugin_get_descriptor(nl_plugin_handle_t handle) {
+NL_API nl_plugin_descriptor_t* nl_plugin_get_descriptor(nl_plugin_handle_t handle) {
     if (!handle) return NULL;
     
 #ifdef _WIN32
     FARPROC fn = GetProcAddress((HMODULE)handle, "nl_plugin_get_descriptor");
     if (!fn) return NULL;
-#else
-    nl_plugin_descriptor_t* (*fn)(void) = dlsym(handle, "nl_plugin_get_descriptor");
-    if (!fn) return NULL;
-#endif
-    
     return ((nl_plugin_descriptor_t* (*)(void))fn)();
+#else
+    nl_plugin_descriptor_t* (*fn)(void) = (nl_plugin_descriptor_t* (*)(void))dlsym(handle, "nl_plugin_get_descriptor");
+    if (!fn) return NULL;
+    return fn();
+#endif
 }
 
-int nl_plugin_is_loaded(nl_plugin_handle_t handle) {
+NL_API int nl_plugin_is_loaded(nl_plugin_handle_t handle) {
     if (!handle) return 0;
     
     for (int i = 0; i < g_plugin_count; i++) {
@@ -402,17 +403,17 @@ int nl_plugin_is_loaded(nl_plugin_handle_t handle) {
     return 0;
 }
 
-int nl_plugin_get_count(void) {
+NL_API int nl_plugin_get_count(void) {
     return g_plugin_count;
 }
 
-nl_plugin_handle_t* nl_plugin_get_all(int* count) {
+NL_API nl_plugin_handle_t* nl_plugin_get_all(int* count) {
     if (!count) return NULL;
     *count = g_plugin_count;
     return (nl_plugin_handle_t*)g_plugin_handles;
 }
 
-const char* nl_plugin_get_error(void) {
+NL_API const char* nl_plugin_get_error(void) {
     return g_last_error;
 }
 
@@ -472,8 +473,7 @@ int nl_module_check_dependencies(nl_module_type_t module) {
     
     nl_module_info_t* current = module_info->dependencies;
     while (current) {
-        if (current->status != NL_MODULE_STATUS_INITIALIZED &&
-            current->status != NL_MODULE_STATUS_LOADED) {
+        if (current->status != NL_MODULE_STATUS_INITIALIZED) {
             return NL_EAGAIN;
         }
         current = current->next;
@@ -544,6 +544,12 @@ NL_API int nl_modules_init(void) {
         current = current->next;
     }
     
+    // Auto-load extensions from extensions/ directory
+    int ext_loaded = nl_extension_auto_load();
+    if (ext_loaded > 0) {
+        printf("[NetLeaf] Auto-loaded %d extension(s)\n", ext_loaded);
+    }
+    
     g_modules_initialized = 1;
     return NL_OK;
 }
@@ -583,11 +589,11 @@ NL_API void nl_print_modules(void) {
         
         const char* lazy_str;
         switch (current->lazy_status) {
-            case NL_LAZY_STATUS_UNLOADED: lazy_str = "Unloaded"; break;
-            case NL_LAZY_STATUS_LOADING: lazy_str = "Loading"; break;
-            case NL_LAZY_STATUS_LOADED: lazy_str = "Loaded"; break;
-            case NL_LAZY_STATUS_STOPPING: lazy_str = "Stopping"; break;
-            case NL_LAZY_STATUS_STOPPED: lazy_str = "Stopped"; break;
+            case NL_MODULE_LAZY_UNLOADED: lazy_str = "Unloaded"; break;
+            case NL_MODULE_LAZY_LOADING: lazy_str = "Loading"; break;
+            case NL_MODULE_LAZY_LOADED: lazy_str = "Loaded"; break;
+            case NL_MODULE_LAZY_STOPPING: lazy_str = "Stopping"; break;
+            case NL_MODULE_LAZY_STOPPED: lazy_str = "Stopped"; break;
             default: lazy_str = "N/A"; break;
         }
         
@@ -606,4 +612,428 @@ NL_API void nl_print_modules(void) {
     printf("  Total modules: %d\n", g_module_count);
     printf("  Total plugins: %d\n", g_plugin_count);
     printf("========================================\n\n");
+}
+
+// =========================================
+// Extension Library API Implementation
+// =========================================
+
+static nl_extension_info_t* g_extension_list = NULL;
+static int g_extension_count = 0;
+static int32_t g_extension_value_counter = 1;  // Start from 1, 0 is reserved
+
+// Validate description length (max 50 Chinese characters or equivalent)
+NL_API int nl_extension_validate_description(const char* description) {
+    if (!description) return NL_OK; // Description is optional
+    
+    size_t len = strlen(description);
+    if (len > NL_EXTENSION_DESC_MAX_LEN) {
+        return NL_EINVAL;
+    }
+    
+    // Check for reasonable character count
+    // Chinese characters are typically 3 bytes in UTF-8
+    // Allow mixed content with reasonable limits
+    int char_count = 0;
+    const char* p = description;
+    while (*p) {
+        if ((*p & 0x80) == 0) {
+            // ASCII character (1 byte)
+            p++;
+            char_count++;
+        } else if ((*p & 0xE0) == 0xC0) {
+            // 2-byte UTF-8
+            p += 2;
+            char_count++;
+        } else if ((*p & 0xF0) == 0xE0) {
+            // 3-byte UTF-8 (Chinese characters)
+            p += 3;
+            char_count++;
+        } else if ((*p & 0xF8) == 0xF4) {
+            // 4-byte UTF-8
+            p += 4;
+            char_count++;
+        } else {
+            p++;
+            char_count++;
+        }
+    }
+    
+    // Max 50 "character units" (Chinese chars count as 1)
+    if (char_count > 50) {
+        return NL_EINVAL;
+    }
+    
+    return NL_OK;
+}
+
+NL_API nl_extension_info_t* nl_extension_get_info(const char* library_id) {
+    if (!library_id) return NULL;
+    
+    nl_extension_info_t* current = g_extension_list;
+    while (current) {
+        if (strcmp(current->library_id, library_id) == 0) {
+            return current;
+        }
+        current = current->next;
+    }
+    
+    return NULL;
+}
+
+NL_API int nl_extension_register(nl_extension_info_t* info) {
+    if (!info) return NL_EINVAL;
+    if (!info->library_id) return NL_EINVAL;
+    if (!info->library_name) return NL_EINVAL;
+    if (!info->version) return NL_EINVAL;
+    if (!info->author) return NL_EINVAL;
+    
+    // Validate description length
+    if (nl_extension_validate_description(info->description) != NL_OK) {
+        set_last_error("Extension description exceeds limit (max 50 Chinese characters)");
+        return NL_EINVAL;
+    }
+    
+    // Check for duplicate
+    nl_extension_info_t* existing = g_extension_list;
+    while (existing) {
+        if (strcmp(existing->library_id, info->library_id) == 0) {
+            return NL_OK; // Already registered
+        }
+        existing = existing->next;
+    }
+    
+    // Parse platforms string at runtime
+    if (info->platforms) {
+        const char* plat = info->platforms;
+        info->platform_windows = (strstr(plat, "windows") || strstr(plat, "Windows") || 
+                                  strstr(plat, "win") || strstr(plat, "WIN") ||
+                                  strcmp(plat, "all") == 0);
+        info->platform_linux = (strstr(plat, "linux") || strstr(plat, "Linux") || 
+                                strstr(plat, "lin") || strstr(plat, "LIN") ||
+                                strcmp(plat, "all") == 0);
+        info->platform_macos = (strstr(plat, "macos") || strstr(plat, "MacOS") || 
+                                strstr(plat, "mac") || strstr(plat, "MAC") ||
+                                strstr(plat, "darwin") || strstr(plat, "Darwin") ||
+                                strcmp(plat, "all") == 0);
+    } else {
+        info->platform_windows = 1;
+        info->platform_linux = 1;
+        info->platform_macos = 1;
+    }
+    
+    // Auto-assign library_value
+    info->library_value = g_extension_value_counter++;
+    
+    // Add to list
+    info->next = g_extension_list;
+    g_extension_list = info;
+    g_extension_count++;
+    
+    // Initialize if init function provided
+    if (info->init) {
+        info->init();
+    }
+    
+    return NL_OK;
+}
+
+NL_API int nl_extension_unregister(const char* library_id) {
+    if (!library_id) return NL_EINVAL;
+    
+    nl_extension_info_t* prev = NULL;
+    nl_extension_info_t* current = g_extension_list;
+    
+    while (current) {
+        if (strcmp(current->library_id, library_id) == 0) {
+            // Shutdown if function provided
+            if (current->shutdown) {
+                current->shutdown();
+            }
+            
+            // Remove from list
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                g_extension_list = current->next;
+            }
+            
+            g_extension_count--;
+            return NL_OK;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    return NL_EINVAL;
+}
+
+NL_API int nl_extension_get_count(void) {
+    return g_extension_count;
+}
+
+NL_API nl_extension_info_t** nl_extension_get_all(int* count) {
+    if (!count) return NULL;
+    
+    *count = g_extension_count;
+    if (g_extension_count == 0) return NULL;
+    
+    nl_extension_info_t** array = malloc(g_extension_count * sizeof(nl_extension_info_t*));
+    if (!array) return NULL;
+    
+    nl_extension_info_t* current = g_extension_list;
+    int i = 0;
+    while (current && i < g_extension_count) {
+        array[i++] = current;
+        current = current->next;
+    }
+    
+    return array;
+}
+
+// Query API - get value by identifier
+NL_API int32_t nl_extension_get_value_by_id(const char* library_id) {
+    if (!library_id) return 0;
+    
+    nl_extension_info_t* current = g_extension_list;
+    while (current) {
+        if (strcmp(current->library_id, library_id) == 0) {
+            return current->library_value;
+        }
+        current = current->next;
+    }
+    
+    return 0; // Not found
+}
+
+// Query API - get identifier by value
+NL_API const char* nl_extension_get_id_by_value(int32_t library_value) {
+    if (library_value == 0) return NULL;
+    
+    nl_extension_info_t* current = g_extension_list;
+    while (current) {
+        if (current->library_value == library_value) {
+            return current->library_id;
+        }
+        current = current->next;
+    }
+    
+    return NULL; // Not found
+}
+
+// =========================================
+// Extension Auto-Load Implementation
+// =========================================
+
+static char g_extension_dir[256] = "extensions";
+
+void nl_extension_set_auto_load_dir(const char* directory) {
+    if (directory) {
+        strncpy(g_extension_dir, directory, sizeof(g_extension_dir) - 1);
+        g_extension_dir[sizeof(g_extension_dir) - 1] = '\0';
+    }
+}
+
+NL_API const char* nl_extension_get_auto_load_dir(void) {
+    return g_extension_dir;
+}
+
+NL_API int nl_extension_auto_load_from_dir(const char* directory) {
+    if (!directory) return NL_EINVAL;
+    
+    int loaded_count = 0;
+    
+#ifdef _WIN32
+    char search_path[512];
+    snprintf(search_path, sizeof(search_path), "%s\\*.dll", directory);
+    
+    WIN32_FIND_DATAA find_data;
+    HANDLE h_find = FindFirstFileA(search_path, &find_data);
+    
+    if (h_find == INVALID_HANDLE_VALUE) {
+        return 0; // No extensions found
+    }
+    
+    do {
+        char ext_path[512];
+        snprintf(ext_path, sizeof(ext_path), "%s\\%s", directory, find_data.cFileName);
+        
+        // Skip netleaf.dll itself
+        if (strstr(find_data.cFileName, "netleaf.dll") != NULL ||
+            strstr(find_data.cFileName, "netleaf.") == NULL) {
+            continue;
+        }
+        
+        nl_plugin_handle_t ext = nl_plugin_load(ext_path);
+        if (ext) {
+            // Try to get extension info
+            typedef nl_extension_info_t* (*get_ext_info_func)(void);
+            get_ext_info_func get_info = (get_ext_info_func)GetProcAddress((HMODULE)ext, "nl_extension_get_info");
+            
+            // Also try legacy function names
+            if (!get_info) {
+                get_info = (get_ext_info_func)GetProcAddress((HMODULE)ext, "nl_example_get_extension_info");
+            }
+            
+            if (get_info) {
+                nl_extension_info_t* info = get_info();
+                if (info && nl_extension_register(info) == NL_OK) {
+                    loaded_count++;
+                }
+            }
+        }
+    } while (FindNextFileA(h_find, &find_data));
+    
+    FindClose(h_find);
+    
+#else
+    // Linux/macOS implementation
+    DIR* dir = opendir(directory);
+    if (!dir) return 0;
+    
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, ".so") == NULL) continue;
+        
+        // Skip netleaf.so itself
+        if (strstr(entry->d_name, "netleaf.so") != NULL) continue;
+        
+        char ext_path[512];
+        snprintf(ext_path, sizeof(ext_path), "%s/%s", directory, entry->d_name);
+        
+        nl_plugin_handle_t ext = nl_plugin_load(ext_path);
+        if (ext) {
+            typedef nl_extension_info_t* (*get_ext_info_func)(void);
+            get_ext_info_func get_info = (get_ext_info_func)dlsym(ext, "nl_extension_get_info");
+            
+            if (!get_info) {
+                get_info = (get_ext_info_func)dlsym(ext, "nl_example_get_extension_info");
+            }
+            
+            if (get_info) {
+                nl_extension_info_t* info = get_info();
+                if (info && nl_extension_register(info) == NL_OK) {
+                    loaded_count++;
+                }
+            }
+        }
+    }
+    
+    closedir(dir);
+#endif
+    
+    return loaded_count;
+}
+
+NL_API int nl_extension_auto_load(void) {
+    // Try multiple directories in order
+    char cwd[256];
+    getcwd(cwd, sizeof(cwd));
+    
+    // 1. Try extensions/ subdirectory relative to current working directory
+    char ext_dir[512];
+    snprintf(ext_dir, sizeof(ext_dir), "%s/extensions", cwd);
+    int count = nl_extension_auto_load_from_dir(ext_dir);
+    
+    // 2. Try extensions/ relative to executable location
+#ifdef _WIN32
+    char exe_path[256];
+    GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
+    // Get directory part
+    char* last_slash = strrchr(exe_path, '\\');
+    if (last_slash) {
+        *last_slash = '\0';
+        snprintf(ext_dir, sizeof(ext_dir), "%s/extensions", exe_path);
+        count += nl_extension_auto_load_from_dir(ext_dir);
+    }
+#endif
+    
+    // 3. Try configured directory
+    if (strcmp(g_extension_dir, "extensions") != 0) {
+        count += nl_extension_auto_load_from_dir(g_extension_dir);
+    }
+    
+    return count;
+}
+
+// =========================================
+// Boolean Value Conversion Implementation
+// =========================================
+
+// Helper function for case-insensitive string comparison
+static int str_equals_ci(const char* str, const char* match) {
+    if (!str || !match) return 0;
+    
+    while (*str && *match) {
+        char c1 = *str;
+        char c2 = *match;
+        
+        // Convert to lowercase
+        if (c1 >= 'A' && c1 <= 'Z') c1 = c1 - 'A' + 'a';
+        if (c2 >= 'A' && c2 <= 'Z') c2 = c2 - 'A' + 'a';
+        
+        if (c1 != c2) return 0;
+        str++;
+        match++;
+    }
+    
+    return (*str == '\0' && *match == '\0');
+}
+
+// Check if string represents a true value
+NL_API int nl_bool_is_true(const char* str) {
+    if (!str) return 0;
+    
+    // Trim leading whitespace
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    
+    // Check for true-like values
+    if (str_equals_ci(str, "true")) return 1;
+    if (str_equals_ci(str, "yes")) return 1;
+    if (str_equals_ci(str, "on")) return 1;
+    if (str_equals_ci(str, "1")) return 1;
+    if (str_equals_ci(str, "enabled")) return 1;
+    if (str_equals_ci(str, "enable")) return 1;
+    if (str_equals_ci(str, "active")) return 1;
+    if (str_equals_ci(str, "ok")) return 1;
+    
+    return 0;
+}
+
+// Check if string represents a false value
+NL_API int nl_bool_is_false(const char* str) {
+    if (!str) return 0;
+    
+    // Trim leading whitespace
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    
+    // Check for false-like values
+    if (str_equals_ci(str, "false")) return 1;
+    if (str_equals_ci(str, "no")) return 1;
+    if (str_equals_ci(str, "off")) return 1;
+    if (str_equals_ci(str, "0")) return 1;
+    if (str_equals_ci(str, "disabled")) return 1;
+    if (str_equals_ci(str, "disable")) return 1;
+    if (str_equals_ci(str, "inactive")) return 1;
+    
+    return 0;
+}
+
+// Convert string to boolean value
+NL_API int nl_bool_from_string(const char* str) {
+    if (!str) return 0;
+    
+    // First check for true values
+    if (nl_bool_is_true(str)) return 1;
+    
+    // Then check for false values
+    if (nl_bool_is_false(str)) return 0;
+    
+    // Default: any non-empty non-false string is considered true
+    return 0;
+}
+
+// Convert boolean value to string
+NL_API const char* nl_bool_to_string(int value) {
+    return value ? "true" : "false";
 }

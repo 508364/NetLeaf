@@ -27,6 +27,9 @@ High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HT
 - ✅ **Link Aggregation**: Same-port load balancing with multiple backends
 - ✅ **Unified Module Interface**: Centralized module management via nl_module_info_t
 - ✅ **ASan Support**: AddressSanitizer memory detection
+- ✅ **File Hot Reload**: Modify external HTML/Vue/JSON files and see changes on refresh
+- ✅ **HTTP Redirect**: Configurable 301/302 redirects with runtime switching
+- ✅ **Smart Detection**: `nl_web_add_html/vue/json` auto-detects URL/file/static content
 
 ## Quick Start
 

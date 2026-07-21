@@ -3,7 +3,7 @@
 # This script builds NetLeaf for multiple Linux architectures
 # It automatically detects available cross-compilers and builds packages
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"

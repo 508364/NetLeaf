@@ -4,6 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef _WIN32
+    #ifdef NL_EXPORTS
+        #define NL_API __declspec(dllexport)
+    #else
+        #define NL_API __declspec(dllimport)
+    #endif
+#else
+    #define NL_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -53,14 +63,14 @@ typedef enum {
     NL_MODULE_STATUS_STOPPED = 5
 } nl_module_status_t;
 
-// Lazy loading status
+// Module lazy loading status
 typedef enum {
-    NL_LAZY_STATUS_UNLOADED = 0,
-    NL_LAZY_STATUS_LOADING = 1,
-    NL_LAZY_STATUS_LOADED = 2,
-    NL_LAZY_STATUS_STOPPING = 3,
-    NL_LAZY_STATUS_STOPPED = 4
-} nl_lazy_status_t;
+    NL_MODULE_LAZY_UNLOADED = 0,
+    NL_MODULE_LAZY_LOADING = 1,
+    NL_MODULE_LAZY_LOADED = 2,
+    NL_MODULE_LAZY_STOPPING = 3,
+    NL_MODULE_LAZY_STOPPED = 4
+} nl_module_lazy_status_t;
 
 // =========================================
 // Module Information Structure
@@ -87,7 +97,7 @@ typedef struct nl_module_info {
     
     void* (*lazy_load)(void);   // Lazy load function (optional)
     void (*lazy_unload)(void);  // Lazy unload function (optional)
-    nl_lazy_status_t lazy_status; // Lazy loading status
+    nl_module_lazy_status_t lazy_status; // Lazy loading status
     
     struct nl_module_info* next; // Linked list next pointer
     struct nl_module_info* dependencies; // Module dependencies
@@ -118,7 +128,7 @@ typedef struct nl_module_info {
         .author = author, \
         .lazy_load = NULL, \
         .lazy_unload = NULL, \
-        .lazy_status = NL_LAZY_STATUS_UNLOADED, \
+        .lazy_status = NL_MODULE_LAZY_UNLOADED, \
         .next = NULL, \
         .dependencies = NULL \
     }
@@ -144,7 +154,7 @@ typedef struct nl_module_info {
         .author = author, \
         .lazy_load = lazy_load_fn, \
         .lazy_unload = lazy_unload_fn, \
-        .lazy_status = NL_LAZY_STATUS_UNLOADED, \
+        .lazy_status = NL_MODULE_LAZY_UNLOADED, \
         .next = NULL, \
         .dependencies = NULL \
     }
@@ -184,7 +194,7 @@ int nl_module_lazy_is_enabled(nl_module_type_t type);
 void nl_module_lazy_clear_cache(void);
 int nl_module_lazy_load(nl_module_type_t type);
 int nl_module_lazy_unload(nl_module_type_t type);
-nl_lazy_status_t nl_module_lazy_get_status(nl_module_type_t type);
+nl_module_lazy_status_t nl_module_lazy_get_status(nl_module_type_t type);
 int nl_module_lazy_is_loaded(nl_module_type_t type);
 void nl_module_lazy_preload_all(void);
 void nl_module_lazy_unload_all(void);
@@ -205,25 +215,161 @@ typedef struct {
     int (*register_module)(nl_module_info_t** module_info);
 } nl_plugin_descriptor_t;
 
-#define NL_PLUGIN_EXPORT extern "C" __declspec(dllexport)
+// =========================================
+// Extension Library Definition
+// =========================================
 
-nl_plugin_handle_t nl_plugin_load(const char* plugin_path);
-int nl_plugin_unload(nl_plugin_handle_t handle);
-int nl_plugin_register(nl_plugin_handle_t handle);
-nl_plugin_descriptor_t* nl_plugin_get_descriptor(nl_plugin_handle_t handle);
-int nl_plugin_is_loaded(nl_plugin_handle_t handle);
-int nl_plugin_get_count(void);
-nl_plugin_handle_t* nl_plugin_get_all(int* count);
-const char* nl_plugin_get_error(void);
+// Extension library info structure for user-defined extensions
+// v2.2.2: Extensions must be dynamically loaded to share global state
+// Description limit: 50 Chinese characters (or equivalent byte size)
+
+#define NL_EXTENSION_NAME_MAX_LEN 64
+#define NL_EXTENSION_ID_MAX_LEN 32
+#define NL_EXTENSION_VERSION_MAX_LEN 16
+#define NL_EXTENSION_AUTHOR_MAX_LEN 64
+#define NL_EXTENSION_DESC_MAX_LEN 150  // ~50 Chinese characters (3 bytes each)
+
+typedef struct nl_extension_info {
+    const char* library_name;     // Library display name (e.g., "My Extension")
+    const char* library_id;       // Unique identifier string (e.g., "my_ext")
+    const char* version;          // Version string (e.g., "1.0.0")
+    const char* author;           // Author name (e.g., "508364")
+    const char* description;      // Brief description (max 50 Chinese chars)
+    const char* platforms;        // Platform support string (e.g., "Windows,Linux,MacOS")
+    
+    uint32_t capabilities;        // Capability flags
+    int platform_windows;         // 1 if supported on Windows (auto-set from platforms)
+    int platform_linux;           // 1 if supported on Linux (auto-set from platforms)
+    int platform_macos;           // 1 if supported on macOS (auto-set from platforms)
+    
+    int32_t library_value;        // Auto-assigned value by main library (read-only, DO NOT set)
+    
+    int (*init)(void);            // Initialize extension
+    void (*shutdown)(void);       // Shutdown extension
+    int (*is_available)(void);     // Check if extension is available
+    const char* (*get_version)(void); // Get version string
+    
+    void* (*lazy_load)(void);     // Lazy load function (optional)
+    void (*lazy_unload)(void);    // Lazy unload function (optional)
+    nl_module_lazy_status_t lazy_status;
+    
+    struct nl_extension_info* next;
+} nl_extension_info_t;
+
+// Platform string parsing helper (internal use)
+// Parse platforms string like "Windows,Linux,MacOS" (case insensitive, any order)
+#define NL_PARSE_PLATFORMS_WIN(platforms_str) \
+    (strstr(platforms_str, "windows") != NULL || strstr(platforms_str, "Windows") != NULL || \
+     strstr(platforms_str, "win") != NULL || strstr(platforms_str, "WIN") != NULL)
+
+#define NL_PARSE_PLATFORMS_LINUX(platforms_str) \
+    (strstr(platforms_str, "linux") != NULL || strstr(platforms_str, "Linux") != NULL || \
+     strstr(platforms_str, "lin") != NULL || strstr(platforms_str, "LIN") != NULL)
+
+#define NL_PARSE_PLATFORMS_MACOS(platforms_str) \
+    (strstr(platforms_str, "macos") != NULL || strstr(platforms_str, "MacOS") != NULL || \
+     strstr(platforms_str, "mac") != NULL || strstr(platforms_str, "MAC") != NULL || \
+     strstr(platforms_str, "darwin") != NULL || strstr(platforms_str, "Darwin") != NULL)
+
+// Simplified extension definition macro with platform string
+// platforms: "Windows,Linux,MacOS" (case insensitive, any order, or "all" for all platforms)
+// Note: library_value is auto-assigned by main library, do NOT set it manually
+#define NL_EXTENSION_DEFINE(ext_id, ext_name, ext_version, ext_author, ext_desc, \
+                           platforms_str, caps, \
+                           init_fn, shutdown_fn, available_fn, version_fn) \
+    static nl_extension_info_t nl_extension_info_##ext_id = { \
+        .library_name = ext_name, \
+        .library_id = #ext_id, \
+        .version = ext_version, \
+        .author = ext_author, \
+        .description = ext_desc, \
+        .platforms = platforms_str, \
+        .capabilities = caps | NL_CAP_DYNAMIC | NL_CAP_LAZY_LOAD, \
+        .platform_windows = 0, \
+        .platform_linux = 0, \
+        .platform_macos = 0, \
+        .library_value = 0, \
+        .init = init_fn, \
+        .shutdown = shutdown_fn, \
+        .is_available = available_fn, \
+        .get_version = version_fn, \
+        .lazy_load = NULL, \
+        .lazy_unload = NULL, \
+        .lazy_status = NL_MODULE_LAZY_UNLOADED, \
+        .next = NULL \
+    };
+
+#define NL_EXTENSION_DEFINE_LAZY(ext_id, ext_name, ext_version, ext_author, ext_desc, \
+                                 platforms_str, caps, \
+                                 init_fn, shutdown_fn, available_fn, version_fn, \
+                                 lazy_load_fn, lazy_unload_fn) \
+    static nl_extension_info_t nl_extension_info_##ext_id = { \
+        .library_name = ext_name, \
+        .library_id = #ext_id, \
+        .version = ext_version, \
+        .author = ext_author, \
+        .description = ext_desc, \
+        .platforms = platforms_str, \
+        .capabilities = caps | NL_CAP_DYNAMIC | NL_CAP_LAZY_LOAD, \
+        .platform_windows = 0, \
+        .platform_linux = 0, \
+        .platform_macos = 0, \
+        .library_value = 0, \
+        .init = init_fn, \
+        .shutdown = shutdown_fn, \
+        .is_available = available_fn, \
+        .get_version = version_fn, \
+        .lazy_load = lazy_load_fn, \
+        .lazy_unload = lazy_unload_fn, \
+        .lazy_status = NL_MODULE_LAZY_UNLOADED, \
+        .next = NULL \
+    };
+
+#define NL_EXTENSION_GET_INFO(ext_id) (&nl_extension_info_##ext_id)
+
+// Extension API functions
+NL_API nl_extension_info_t* nl_extension_get_info(const char* library_id);
+NL_API int nl_extension_register(nl_extension_info_t* info);
+NL_API int nl_extension_unregister(const char* library_id);
+NL_API int nl_extension_get_count(void);
+NL_API nl_extension_info_t** nl_extension_get_all(int* count);
+NL_API int nl_extension_validate_description(const char* description);
+
+// Query API - get value by identifier
+NL_API int32_t nl_extension_get_value_by_id(const char* library_id);
+NL_API const char* nl_extension_get_id_by_value(int32_t library_value);
+
+// Auto-load extensions from directory
+// Extensions should be placed in "extensions/" subdirectory next to netleaf.dll
+// Called automatically during nl_modules_init()
+NL_API int nl_extension_auto_load(void);
+NL_API int nl_extension_auto_load_from_dir(const char* directory);
+NL_API void nl_extension_set_auto_load_dir(const char* directory);
+NL_API const char* nl_extension_get_auto_load_dir(void);
+
+#ifdef __cplusplus
+#define NL_PLUGIN_EXPORT extern "C" __declspec(dllexport)
+#else
+#define NL_PLUGIN_EXPORT __declspec(dllexport)
+#endif
+
+NL_API nl_plugin_handle_t nl_plugin_load(const char* plugin_path);
+NL_API int nl_plugin_unload(nl_plugin_handle_t handle);
+NL_API int nl_plugin_register(nl_plugin_handle_t handle);
+NL_API nl_plugin_descriptor_t* nl_plugin_get_descriptor(nl_plugin_handle_t handle);
+NL_API int nl_plugin_is_loaded(nl_plugin_handle_t handle);
+NL_API int nl_plugin_get_count(void);
+NL_API nl_plugin_handle_t* nl_plugin_get_all(int* count);
+NL_API const char* nl_plugin_get_error(void);
 
 // =========================================
 // Module Dependency API
 // =========================================
 
-int nl_module_add_dependency(nl_module_type_t module, nl_module_type_t dependency);
-int nl_module_remove_dependency(nl_module_type_t module, nl_module_type_t dependency);
-int nl_module_check_dependencies(nl_module_type_t module);
-nl_module_info_t* nl_module_get_dependencies(nl_module_type_t module);
+NL_API int nl_module_add_dependency(nl_module_type_t module, nl_module_type_t dependency);
+NL_API int nl_module_remove_dependency(nl_module_type_t module, nl_module_type_t dependency);
+NL_API int nl_module_check_dependencies(nl_module_type_t module);
+NL_API nl_module_info_t* nl_module_get_dependencies(nl_module_type_t module);
 
 // =========================================
 // Convenience Macros for Each Module
