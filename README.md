@@ -177,7 +177,49 @@ nl_web_add_html(server, "/", "index.html");
 nl_web_add_html(server, "/hello", "<h1>Hello</h1>");
 ```
 
-### 6. 使用预设组件
+### 6. 运行时动态路由管理（v2.2.2新增）
+
+在服务器运行期间添加、移除、查询和更新路由。
+
+```c
+#include "netleaf.h"
+
+int main() {
+    nl_web_server_t* server = nl_web_create(8080);
+    
+    // 运行时添加新路由
+    nl_web_add_route(server, "/api/status", "{\"status\":\"ok\"}", "application/json");
+    
+    // 查询路由数量
+    int count = nl_web_get_route_count(server);
+    printf("Routes: %d\n", count);
+    
+    // 列出所有路由
+    char* paths[32];
+    for (int i = 0; i < 32; i++) paths[i] = (char*)calloc(256, 1);
+    int n = nl_web_list_routes(server, paths, 32);
+    for (int i = 0; i < n; i++) printf("%s\n", paths[i]);
+    
+    // 更新路由内容
+    nl_web_update_route(server, "/api/status", 
+        "{\"status\":\"maintenance\"}", "application/json");
+    
+    // 移除路由
+    nl_web_remove_route(server, "/api/status");
+    
+    while (1) Sleep(1000);
+    return 0;
+}
+```
+
+**API:**
+- `nl_web_add_route()` - 添加静态内容路由
+- `nl_web_remove_route()` - 移除指定路径的路由
+- `nl_web_get_route_count()` - 获取当前路由数量
+- `nl_web_list_routes()` - 列出所有路由路径
+- `nl_web_update_route()` - 更新路由内容
+
+### 7. 使用预设组件
 
 ```c
 // 计数器
@@ -191,7 +233,7 @@ const char* fields[] = {"name", "email", "message"};
 nl_web_add_form(server, "/contact", "Contact Us", fields, 3);
 ```
 
-### 7. TCP服务器
+### 8. TCP服务器
 
 ```c
 #include "netleaf.h"

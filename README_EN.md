@@ -30,6 +30,7 @@ High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HT
 - ✅ **File Hot Reload**: Modify external HTML/Vue/JSON files and see changes on refresh
 - ✅ **HTTP Redirect**: Configurable 301/302 redirects with runtime switching
 - ✅ **Smart Detection**: `nl_web_add_html/vue/json` auto-detects URL/file/static content
+- ✅ **Runtime Route Management**: Add, remove, query, and update routes while server is running
 
 ## Quick Start
 

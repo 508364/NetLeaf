@@ -61,6 +61,20 @@
   - 静态内容 → 直接作为内联内容处理
 - **平台**: Windows/Linux/macOS（全平台支持）
 
+**新增功能 - 运行时动态路由管理 (v2.2.2):**
+- **功能**: 在服务器运行期间动态添加、移除、查询和更新路由
+- **API**:
+  - `nl_web_add_route(server, path, content, content_type)` - 添加静态内容路由
+  - `nl_web_remove_route(server, path)` - 移除指定路径的路由
+  - `nl_web_get_route_count(server)` - 获取当前路由数量
+  - `nl_web_list_routes(server, paths, max_paths)` - 列出所有路由路径
+  - `nl_web_update_route(server, path, content, content_type)` - 更新路由内容
+- **特性**:
+  - 线程安全：使用互斥锁保护路由操作
+  - 支持运行时动态修改路由，无需重启服务器
+  - 仅支持静态内容类型路由的更新（不支持重定向和文件路由）
+- **平台**: Windows/Linux/macOS（全平台支持）
+
 **移除的公开API:**
 - 布尔值转换API（`nl_bool_from_string`等）已改为内部静默处理，不再对外暴露
 

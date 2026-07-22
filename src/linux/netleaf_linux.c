@@ -2182,6 +2182,123 @@ void nl_web_add_redirect_302(nl_web_server_t* server, const char* path, const ch
     printf("Added redirect: %s -> %s (302)\n", path, target_url);
 }
 
+// Runtime route management APIs (v2.2.2)
+
+int nl_web_add_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type) {
+    if (!server || !path || !content) return NL_EINVAL;
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (route) {
+        strncpy(route->path, path, sizeof(route->path) - 1);
+        route->path[sizeof(route->path) - 1] = '\0';
+        route->content_size = strlen(content);
+        route->content = (char*)malloc(route->content_size + 1);
+        if (!route->content) {
+            free(route);
+            pthread_mutex_unlock(&server->mutex);
+            return NL_ENOMEM;
+        }
+        strcpy(route->content, content);
+        strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+        route->content_type[sizeof(route->content_type) - 1] = '\0';
+        route->type = NL_ROUTE_TYPE_CONTENT;
+        route->file_path[0] = '\0';
+        route->redirect_url[0] = '\0';
+        route->next = server->routes;
+        server->routes = route;
+        pthread_mutex_unlock(&server->mutex);
+        printf("Added route: %s\n", path);
+        return NL_OK;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return NL_ENOMEM;
+}
+
+int nl_web_remove_route(nl_web_server_t* server, const char* path) {
+    if (!server || !path) return NL_EINVAL;
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t** pp = &server->routes;
+    while (*pp) {
+        if (strcmp((*pp)->path, path) == 0) {
+            nl_web_route_t* target = *pp;
+            *pp = target->next;
+            if (target->content) free(target->content);
+            free(target);
+            pthread_mutex_unlock(&server->mutex);
+            printf("Removed route: %s\n", path);
+            return NL_OK;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return NL_ENOENT;
+}
+
+int nl_web_get_route_count(nl_web_server_t* server) {
+    if (!server) return 0;
+    
+    pthread_mutex_lock(&server->mutex);
+    int count = 0;
+    nl_web_route_t* route = server->routes;
+    while (route) {
+        count++;
+        route = route->next;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return count;
+}
+
+int nl_web_list_routes(nl_web_server_t* server, char** paths, int max_paths) {
+    if (!server || !paths) return NL_EINVAL;
+    
+    pthread_mutex_lock(&server->mutex);
+    int count = 0;
+    nl_web_route_t* route = server->routes;
+    while (route) {
+        if (count < max_paths && paths[count]) {
+            strncpy(paths[count], route->path, 256);
+            paths[count][255] = '\0';
+        }
+        count++;
+        route = route->next;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return count;
+}
+
+int nl_web_update_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type) {
+    if (!server || !path || !content) return NL_EINVAL;
+    
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = server->routes;
+    while (route) {
+        if (strcmp(route->path, path) == 0) {
+            if (route->type != NL_ROUTE_TYPE_REDIRECT && route->type != NL_ROUTE_TYPE_FILE) {
+                if (route->content) free(route->content);
+                route->content_size = strlen(content);
+                route->content = (char*)malloc(route->content_size + 1);
+                if (!route->content) {
+                    pthread_mutex_unlock(&server->mutex);
+                    return NL_ERROR;
+                }
+                strcpy(route->content, content);
+                if (content_type) {
+                    strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+                    route->content_type[sizeof(route->content_type) - 1] = '\0';
+                }
+            }
+            pthread_mutex_unlock(&server->mutex);
+            printf("Updated route: %s\n", path);
+            return NL_OK;
+        }
+        route = route->next;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return NL_ENOENT;
+}
+
 void nl_web_stop_by_port(int port) {
     pthread_mutex_lock(&g_web_servers_mutex);
     struct nl_web_server* server = g_web_servers;

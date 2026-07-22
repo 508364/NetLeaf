@@ -77,10 +77,11 @@ typedef enum {
     NL_EPARSE = -9,
     NL_ESYNTAX = -10,
     NL_EFILE = -11,
-    NL_EKEY_NOT_FOUND = -11,
-    NL_EKEY_TYPE = -12,
-    NL_EBUFFER = -13,
-    NL_EOF = -14
+    NL_ENOENT = -12,
+    NL_EKEY_NOT_FOUND = -13,
+    NL_EKEY_TYPE = -14,
+    NL_EBUFFER = -15,
+    NL_EOF = -16
 } nl_status_t;
 
 typedef enum {
@@ -474,6 +475,13 @@ NL_API void nl_web_add_form(nl_web_server_t* server, const char* path, const cha
 NL_API void nl_web_add_todo(nl_web_server_t* server, const char* path, const char* title);
 NL_API void nl_web_add_chat(nl_web_server_t* server, const char* path, const char* title);
 NL_API void nl_web_add_gallery(nl_web_server_t* server, const char* path, const char* title, const char** image_urls, int count);
+
+// Runtime route management (v2.2.2)
+NL_API int nl_web_add_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type);
+NL_API int nl_web_remove_route(nl_web_server_t* server, const char* path);
+NL_API int nl_web_get_route_count(nl_web_server_t* server);
+NL_API int nl_web_list_routes(nl_web_server_t* server, char** paths, int max_paths);
+NL_API int nl_web_update_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type);
 
 // Simple one-liner: serve inline HTML
 NL_API int nl_serve_html(int port, const char* html);

@@ -1970,6 +1970,123 @@ static void add_web_route_smart(nl_web_server_t* server, const char* path, const
     add_web_route(server, path, content, content_type);
 }
 
+// Runtime route management APIs (v2.2.2)
+
+int nl_web_add_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type) {
+    if (!server || !path || !content) return NL_EINVAL;
+    
+    EnterCriticalSection(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (route) {
+        strncpy(route->path, path, sizeof(route->path) - 1);
+        route->path[sizeof(route->path) - 1] = '\0';
+        route->content_size = strlen(content);
+        route->content = (char*)malloc(route->content_size + 1);
+        if (!route->content) {
+            free(route);
+            LeaveCriticalSection(&server->mutex);
+            return NL_ENOMEM;
+        }
+        strcpy(route->content, content);
+        strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+        route->content_type[sizeof(route->content_type) - 1] = '\0';
+        route->type = NL_ROUTE_TYPE_CONTENT;
+        route->file_path[0] = '\0';
+        route->redirect_url[0] = '\0';
+        route->next = server->routes;
+        server->routes = route;
+        windows_log(NL_LOG_INFO, "Added route: %s", path);
+        LeaveCriticalSection(&server->mutex);
+        return NL_OK;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return NL_ENOMEM;
+}
+
+int nl_web_remove_route(nl_web_server_t* server, const char* path) {
+    if (!server || !path) return NL_EINVAL;
+    
+    EnterCriticalSection(&server->mutex);
+    nl_web_route_t** pp = &server->routes;
+    while (*pp) {
+        if (strcmp((*pp)->path, path) == 0) {
+            nl_web_route_t* target = *pp;
+            *pp = target->next;
+            if (target->content) free(target->content);
+            free(target);
+            LeaveCriticalSection(&server->mutex);
+            windows_log(NL_LOG_INFO, "Removed route: %s", path);
+            return NL_OK;
+        }
+        pp = &(*pp)->next;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return NL_ENOENT;
+}
+
+int nl_web_get_route_count(nl_web_server_t* server) {
+    if (!server) return 0;
+    
+    EnterCriticalSection(&server->mutex);
+    int count = 0;
+    nl_web_route_t* route = server->routes;
+    while (route) {
+        count++;
+        route = route->next;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return count;
+}
+
+int nl_web_list_routes(nl_web_server_t* server, char** paths, int max_paths) {
+    if (!server || !paths) return NL_EINVAL;
+    
+    EnterCriticalSection(&server->mutex);
+    int count = 0;
+    nl_web_route_t* route = server->routes;
+    while (route) {
+        if (count < max_paths && paths[count]) {
+            strncpy(paths[count], route->path, 256);
+            paths[count][255] = '\0';
+        }
+        count++;
+        route = route->next;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return count;
+}
+
+int nl_web_update_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type) {
+    if (!server || !path || !content) return NL_EINVAL;
+    
+    EnterCriticalSection(&server->mutex);
+    nl_web_route_t* route = server->routes;
+    while (route) {
+        if (strcmp(route->path, path) == 0) {
+            if (route->type != NL_ROUTE_TYPE_REDIRECT && route->type != NL_ROUTE_TYPE_FILE) {
+                if (route->content) free(route->content);
+                route->content_size = strlen(content);
+                route->content = (char*)malloc(route->content_size + 1);
+                if (!route->content) {
+                    LeaveCriticalSection(&server->mutex);
+                    return NL_ERROR;
+                }
+                strcpy(route->content, content);
+                if (content_type) {
+                    strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+                    route->content_type[sizeof(route->content_type) - 1] = '\0';
+                }
+            }
+            LeaveCriticalSection(&server->mutex);
+            windows_log(NL_LOG_INFO, "Updated route: %s", path);
+            return NL_OK;
+        }
+        route = route->next;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return NL_ENOENT;
+}
+
 static int charset_module_loaded = 0;
 
 static void charset_module_init(void) {
