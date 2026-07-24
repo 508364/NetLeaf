@@ -977,8 +977,7 @@ char* nl_vue_generate_sysinfo_inline(const char* title, const char* vue_filepath
         __DATE__ " " __TIME__,
         NL_VUE_VERSION,
         title ? title : "NetLeaf System Info",
-        NL_VUE_VERSION,
-        __DATE__ " " __TIME__);
+        NL_VUE_VERSION);
     
     free(vue_content);
     return result;

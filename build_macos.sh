@@ -2,7 +2,7 @@
 # NetLeaf macOS Build Script (Cross-compile from Linux using osxcross)
 # This script builds NetLeaf for macOS x86_64 and arm64 and packages the output
 
-VERSION="2.2.0"
+VERSION="2.2.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"

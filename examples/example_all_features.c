@@ -58,7 +58,7 @@ const char* HOME_HTML =
     "<!DOCTYPE html>\n"
     "<html>\n"
     "<head>\n"
-    "  <title>NetLeaf v2.1.6 - 完整功能演示</title>\n"
+    "  <title>NetLeaf v2.2.2 - 完整功能演示</title>\n"
     "  <meta charset=\"UTF-8\">\n"
     "  <style>\n"
     "    * { margin:0; padding:0; box-sizing:border-box; }\n"

@@ -19,7 +19,7 @@ if(WIN32)
     target_compile_definitions(netleaf_extension PRIVATE NL_EXTENSION_EXPORTS)
     target_link_libraries(netleaf_extension netleaf_shared ws2_32)
 else()
-    target_link_libraries(netleaf_extension -L${CMAKE_RUNTIME_OUTPUT_DIRECTORY} -lnetleaf -ldl -lpthread)
+    target_link_libraries(netleaf_extension netleaf_shared m dl pthread)
 endif()
 
 # Set output name and remove 'lib' prefix on Windows
@@ -36,7 +36,7 @@ add_executable(test_extension test_extension.c)
 if(WIN32)
     target_link_libraries(test_extension netleaf_shared ws2_32)
 else()
-    target_link_libraries(test_extension -L${CMAKE_RUNTIME_OUTPUT_DIRECTORY} -lnetleaf -ldl -lpthread)
+    target_link_libraries(test_extension netleaf_shared m dl pthread)
 endif()
 
 set_target_properties(test_extension PROPERTIES
