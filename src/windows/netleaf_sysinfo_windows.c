@@ -1,11 +1,10 @@
 #ifdef _WIN32
+    #include "netleaf.h"
     #include <windows.h>
     #include <tchar.h>
     #include <stdio.h>
     #include <string.h>
     #include <stdlib.h>
-
-    #include "netleaf.h"
 
     static int sys_info_loaded = 0;
     static nl_ram_unit_t ram_unit = NL_RAM_UNIT_BINARY;
@@ -19,15 +18,17 @@
     static void load_sys_info(void) {
         if (sys_info_loaded) return;
 
+#if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable: 4996)
+#endif
         OSVERSIONINFOEX osvi;
         ZeroMemory(&osvi, sizeof(OSVERSIONINFOEX));
         osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
 
         if (GetVersionEx((LPOSVERSIONINFO)&osvi)) {
             if (osvi.dwMajorVersion == 10 && osvi.dwMinorVersion == 0) {
-                snprintf(os_name, sizeof(os_name), "Windows 10/11 %d.%d", 
+                snprintf(os_name, sizeof(os_name), "Windows 10/11 %lu.%lu",
                          osvi.dwMajorVersion, osvi.dwMinorVersion);
             } else if (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion == 3) {
                 snprintf(os_name, sizeof(os_name), "Windows 8.1");
@@ -36,13 +37,15 @@
             } else if (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion == 1) {
                 snprintf(os_name, sizeof(os_name), "Windows 7");
             } else {
-                snprintf(os_name, sizeof(os_name), "Windows %d.%d", 
+                snprintf(os_name, sizeof(os_name), "Windows %lu.%lu",
                          osvi.dwMajorVersion, osvi.dwMinorVersion);
             }
         } else {
             snprintf(os_name, sizeof(os_name), "Windows");
         }
+#if defined(_MSC_VER)
 #pragma warning(pop)
+#endif
 
         SYSTEM_INFO si;
         GetNativeSystemInfo(&si);

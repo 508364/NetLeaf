@@ -10,7 +10,9 @@
 #define MAX_CLIENTS 256
 #define BUFFER_SIZE 16384
 
+#if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 typedef struct ws_client {
     SOCKET fd;

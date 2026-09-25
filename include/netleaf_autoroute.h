@@ -25,7 +25,7 @@ extern "C" {
 #ifdef NL_VERSION
 #define NL_AUTOROUTE_VERSION NL_VERSION
 #else
-#define NL_AUTOROUTE_VERSION "2.2.1"
+#define NL_AUTOROUTE_VERSION "2.4.1"
 #endif
 
 #define NL_AUTOROUTE_VERSION_MAJOR 2
@@ -42,6 +42,9 @@ extern "C" {
 
 // Autoroute module info structure (defined in implementation)
 NL_AUTOROUTE_API nl_module_info_t* nl_autoroute_get_module_info(void);
+
+// Autoroute extension entry point (for dynamic loading)
+NL_AUTOROUTE_API nl_extension_info_t* nl_autoroute_get_extension_info(void);
 
 // =========================================
 // Flexible Enable/Disable API

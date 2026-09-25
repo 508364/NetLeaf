@@ -2,8 +2,12 @@
 # NetLeaf Multi-Architecture Build Script for Linux
 # This script builds NetLeaf for multiple Linux architectures
 # It automatically detects available cross-compilers and builds packages
+#
+# Usage: Run on Linux or via WSL on Windows
+#   On Windows: wsl bash build_all.sh
+#   On Linux: ./build_all.sh
 
-VERSION="2.2.2"
+VERSION="2.4.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -49,6 +53,10 @@ echo "========================================"
 echo "  NetLeaf v${VERSION} Linux Build Script"
 echo "========================================"
 echo
+echo "Usage: Run on Linux or via WSL"
+echo "  On Windows: wsl bash build_all.sh"
+echo "  On Linux:   ./build_all.sh"
+echo
 
 # Create output directories
 mkdir -p "${BUILD_DIR}"
@@ -57,6 +65,19 @@ mkdir -p "${RELEASES_DIR}"
 # Check if cmake is available
 if ! command -v cmake &> /dev/null; then
     echo -e "${RED}[ERROR] cmake not found. Please install cmake first.${NC}"
+    exit 1
+fi
+
+# Check cmake version (minimum 3.14)
+cmake_version=$(cmake --version | head -1 | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+cmake_major=$(echo "${cmake_version}" | cut -d. -f1)
+cmake_minor=$(echo "${cmake_version}" | cut -d. -f2)
+if [ "${cmake_major}" -lt 3 ] || ([ "${cmake_major}" -eq 3 ] && [ "${cmake_minor}" -lt 14 ]); then
+    echo -e "${RED}[ERROR] CMake version ${cmake_version} is too old. Need CMake >= 3.14${NC}"
+    echo "Upgrade CMake with:"
+    echo "  sudo apt install cmake       # Ubuntu/Debian"
+    echo "  sudo yum install cmake       # CentOS/RHEL"
+    echo "  curl -LO https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz && sudo tar -xzf cmake-*.tar.gz -C /usr/local --strip-components=1"
     exit 1
 fi
 
@@ -90,32 +111,31 @@ build_arch() {
     local compiler_prefix
     compiler_prefix=$(get_compiler_prefix "$arch")
     local arch_name="${ARCH_NAMES[$arch]}"
-    
+
     echo "----------------------------------------"
     echo -e "[Building] Linux ${arch_name}..."
-    
+
     local arch_build_dir="${BUILD_DIR}/linux_${arch}"
     if [ -d "${arch_build_dir}" ]; then
         rm -rf "${arch_build_dir}"
     fi
     mkdir -p "${arch_build_dir}"
-    
+
     cd "${arch_build_dir}"
-    
+
     # Set up cross-compilation environment
     export CROSS_COMPILE="${compiler_prefix}"
-    
+
     # Build command
     local cmake_args=()
     cmake_args+=("-DCMAKE_BUILD_TYPE=Release")
     cmake_args+=("-DWIDE_LIB=ON")
     cmake_args+=("-DBUILD_SHARED_LIBS=ON")
-    cmake_args+=("-DBUILD_STATIC_LIBS=ON")
     cmake_args+=("-DBUILD_EXAMPLES=ON")
-    cmake_args+=("-DBUILD_AUTOCOMPLETE=ON")
-    cmake_args+=("-DBUILD_AUTOROUTE=ON")
-    cmake_args+=("-DBUILD_ERRORPAGE=ON")
-    
+    cmake_args+=("-DBUILD_TLS=ON")
+    cmake_args+=("-DBUILD_MQTT=ON")
+    cmake_args+=("-DBUILD_MQTT_SERVER=ON")
+
     if [ -n "$compiler_prefix" ]; then
         # Cross-compilation: set toolchain variables
         local gcc_path
@@ -123,10 +143,10 @@ build_arch() {
         local ar_path
         ar_path=$(command -v "${compiler_prefix}-ar")
         local ranlib_path
-        
+
         cmake_args+=("-DCMAKE_C_COMPILER=${gcc_path}")
         cmake_args+=("-DCMAKE_AR=${ar_path}")
-        
+
         # Handle missing ranlib (some cross-compilers don't have it)
         if command -v "${compiler_prefix}-ranlib" &> /dev/null; then
             ranlib_path=$(command -v "${compiler_prefix}-ranlib")
@@ -134,25 +154,25 @@ build_arch() {
             ranlib_path="${ar_path}"
         fi
         cmake_args+=("-DCMAKE_RANLIB=${ranlib_path}")
-        
+
         cmake_args+=("-DCMAKE_STRIP=$(command -v "${compiler_prefix}-strip")")
         cmake_args+=("-DCMAKE_SYSTEM_NAME=Linux")
     fi
-    
+
     cmake "${cmake_args[@]}" "${SCRIPT_DIR}"
     if [ $? -ne 0 ]; then
         echo -e "${RED}[FAIL] CMake configuration failed for ${arch_name}.${NC}"
         cd "${SCRIPT_DIR}"
         return 1
     fi
-    
+
     cmake --build . -j$(nproc)
     if [ $? -ne 0 ]; then
         echo -e "${RED}[FAIL] Build failed for ${arch_name}.${NC}"
         cd "${SCRIPT_DIR}"
         return 1
     fi
-    
+
     cd "${SCRIPT_DIR}"
     echo -e "${GREEN}[OK] Linux ${arch_name} build completed!${NC}"
     return 0
@@ -162,53 +182,42 @@ build_arch() {
 package_arch() {
     local arch="$1"
     local arch_name="${ARCH_NAMES[$arch]}"
-    
+
     echo "Creating ${arch_name} package..."
-    
+
     local arch_build_dir="${BUILD_DIR}/linux_${arch}"
     cd "${arch_build_dir}"
-    
+
     # Create temporary directory for packaging
     local PKG_TMP="pkg_tmp_${arch}_$$"
     mkdir -p "${PKG_TMP}"
-    
+
     # Copy library files
-    for f in lib/*.so lib/*.so.* lib/*.a; do
+    for f in lib/*.so lib/*.so.*; do
         if [ -e "${f}" ]; then
             cp -r "${f}" "${PKG_TMP}/" 2>/dev/null || true
         fi
     done
-    
+
+    # Copy header files
+    for h in ../../include/netleaf*.h; do
+        if [ -e "${h}" ]; then
+            cp -r "${h}" "${PKG_TMP}/" 2>/dev/null || true
+        fi
+    done
+
     # Copy executable and source files
     if [ -e "bin/example_all_features" ]; then
         cp -r bin/example_all_features "${PKG_TMP}/"
     fi
-    if [ -e "../../include/netleaf.h" ]; then
-        cp -r ../../include/netleaf.h "${PKG_TMP}/"
-    fi
-    if [ -e "../../include/netleaf_autocomplete.h" ]; then
-        cp -r ../../include/netleaf_autocomplete.h "${PKG_TMP}/"
-    fi
-    if [ -e "../../include/netleaf_autoroute.h" ]; then
-        cp -r ../../include/netleaf_autoroute.h "${PKG_TMP}/"
-    fi
-    if [ -e "../../include/netleaf_errorpage.h" ]; then
-        cp -r ../../include/netleaf_errorpage.h "${PKG_TMP}/"
-    fi
-    if [ -e "../../include/netleaf_ipc.h" ]; then
-        cp -r ../../include/netleaf_ipc.h "${PKG_TMP}/"
-    fi
-    if [ -e "../../include/netleaf_linkagg.h" ]; then
-        cp -r ../../include/netleaf_linkagg.h "${PKG_TMP}/"
-    fi
     if [ -e "../../examples/example_all_features.c" ]; then
         cp -r ../../examples/example_all_features.c "${PKG_TMP}/"
     fi
-    
+
     # Create tar.gz package
     tar -czf "${RELEASES_DIR}/NetLeaf-${VERSION}-linux-${arch}.tar.gz" -C "${PKG_TMP}" .
     rm -rf "${PKG_TMP}"
-    
+
     echo -e "${GREEN}[OK] ${arch_name} package created!${NC}"
 }
 
@@ -221,7 +230,7 @@ BUILD_ARCHS=()
 for arch in "${!CROSS_COMPILERS[@]}"; do
     compiler_prefix=$(get_compiler_prefix "$arch")
     arch_name="${ARCH_NAMES[$arch]}"
-    
+
     if check_compiler "$compiler_prefix"; then
         BUILD_ARCHS+=("$arch")
         echo -e "${GREEN}  [FOUND]${NC} Linux ${arch_name} compiler available"
@@ -243,6 +252,24 @@ if [ ${#BUILD_ARCHS[@]} -eq 0 ]; then
     echo "  sudo apt install gcc-mips64el-linux-gnu"
     echo "  sudo apt install gcc-s390x-linux-gnu"
     exit 1
+fi
+
+# Optional: build only the requested architecture
+#   Usage: ./build_all.sh <arch>   (e.g. ./build_all.sh amd64)
+if [ -n "$1" ]; then
+    REQUESTED_ARCH="$1"
+    if [ -z "${CROSS_COMPILERS[$REQUESTED_ARCH]}" ]; then
+        echo -e "${RED}[ERROR] Unknown architecture: ${REQUESTED_ARCH}${NC}"
+        echo "Available: ${!CROSS_COMPILERS[@]}"
+        exit 1
+    fi
+    if ! printf '%s\n' "${BUILD_ARCHS[@]}" | grep -qx "${REQUESTED_ARCH}"; then
+        echo -e "${RED}[ERROR] Compiler for ${REQUESTED_ARCH} is not installed.${NC}"
+        exit 1
+    fi
+    BUILD_ARCHS=("${REQUESTED_ARCH}")
+    echo -e "${GREEN}Building only requested architecture: ${ARCH_NAMES[$REQUESTED_ARCH]}${NC}"
+    echo
 fi
 
 # Build and package each architecture

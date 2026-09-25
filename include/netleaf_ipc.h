@@ -22,9 +22,9 @@ extern "C" {
     #define NL_IPC_API
 #endif
 
-#define NL_IPC_VERSION "2.2.1"
+#define NL_IPC_VERSION "2.4.1"
 #define NL_IPC_VERSION_MAJOR 2
-#define NL_IPC_VERSION_MINOR 2
+#define NL_IPC_VERSION_MINOR 4
 #define NL_IPC_VERSION_PATCH 1
 
 // =========================================
@@ -38,6 +38,9 @@ extern "C" {
 
 // IPC module info structure (defined in implementation)
 NL_IPC_API nl_module_info_t* nl_ipc_get_module_info(void);
+
+// IPC extension entry point (for dynamic loading)
+NL_IPC_API nl_extension_info_t* nl_ipc_get_extension_info(void);
 
 // Check if IPC is available on current platform
 NL_IPC_API int nl_ipc_is_available(void);

@@ -5,7 +5,7 @@
 #include "netleaf_ipc.h"
 #include "netleaf_ipc_internal.h"
 
-nl_ipc_t* nl_ipc_create(const char* endpoint) {
+NL_IPC_API nl_ipc_t* nl_ipc_create(const char* endpoint) {
     if (!endpoint) return NULL;
     
     nl_ipc_t* ipc = (nl_ipc_t*)calloc(1, sizeof(nl_ipc_t));
@@ -18,7 +18,7 @@ nl_ipc_t* nl_ipc_create(const char* endpoint) {
     return ipc;
 }
 
-void nl_ipc_destroy(nl_ipc_t* ipc) {
+NL_IPC_API void nl_ipc_destroy(nl_ipc_t* ipc) {
     if (!ipc) return;
     
     if (ipc->pipe_handle != INVALID_HANDLE_VALUE) {
@@ -29,7 +29,7 @@ void nl_ipc_destroy(nl_ipc_t* ipc) {
     free(ipc);
 }
 
-int nl_ipc_listen(nl_ipc_t* ipc) {
+NL_IPC_API int nl_ipc_listen(nl_ipc_t* ipc) {
     if (!ipc) return -1;
     if (ipc->listening) return 0; // Already listening
     
@@ -47,7 +47,7 @@ int nl_ipc_listen(nl_ipc_t* ipc) {
     return 0;
 }
 
-int nl_ipc_accept(nl_ipc_t* ipc, void** conn) {
+NL_IPC_API int nl_ipc_accept(nl_ipc_t* ipc, void** conn) {
     if (!ipc || !conn) return -1;
     
     nl_ipc_conn_t* c = (nl_ipc_conn_t*)calloc(1, sizeof(nl_ipc_conn_t));
@@ -103,7 +103,7 @@ int nl_ipc_accept(nl_ipc_t* ipc, void** conn) {
     return 0;
 }
 
-int nl_ipc_connect(nl_ipc_t* ipc, void** conn) {
+NL_IPC_API int nl_ipc_connect(nl_ipc_t* ipc, void** conn) {
     if (!ipc || !conn) return -1;
     
     if (!WaitNamedPipe(ipc->endpoint, NMPWAIT_WAIT_FOREVER)) return -1;
@@ -137,14 +137,14 @@ static int write_all(HANDLE h, const void* data, size_t len) {
     return (int)sent;
 }
 
-int nl_ipc_send(void* conn, const void* data, size_t len) {
+NL_IPC_API int nl_ipc_send(void* conn, const void* data, size_t len) {
     if (!conn || !data || len == 0) return -1;
     
     nl_ipc_conn_t* c = (nl_ipc_conn_t*)conn;
     return write_all(c->pipe_handle, data, len);
 }
 
-int nl_ipc_recv(void* conn, void* buf, size_t buf_len, size_t* out_len) {
+NL_IPC_API int nl_ipc_recv(void* conn, void* buf, size_t buf_len, size_t* out_len) {
     if (!conn || !buf) return -1;
     
     nl_ipc_conn_t* c = (nl_ipc_conn_t*)conn;
@@ -157,7 +157,7 @@ int nl_ipc_recv(void* conn, void* buf, size_t buf_len, size_t* out_len) {
     return 0;
 }
 
-int nl_ipc_close(void* conn) {
+NL_IPC_API int nl_ipc_close(void* conn) {
     if (!conn) return -1;
     
     nl_ipc_conn_t* c = (nl_ipc_conn_t*)conn;

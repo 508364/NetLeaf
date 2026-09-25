@@ -256,22 +256,6 @@ int main() {
     // 添加首页
     nl_web_add_html(server, "/", HOME_HTML);
     
-    // 添加计数器
-    nl_web_add_counter(server, "/counter", "交互式计数器");
-    
-    // 添加数据面板
-    nl_web_add_dashboard(server, "/dashboard", "实时数据面板");
-    
-    // 添加表单
-    const char* form_fields[] = {"姓名", "邮箱", "消息"};
-    nl_web_add_form(server, "/form", "联系表单", form_fields, 3);
-    
-    // 添加待办事项
-    nl_web_add_todo(server, "/todo", "任务清单");
-    
-    // 添加聊天
-    nl_web_add_chat(server, "/chat", "NetLeaf聊天助手");
-    
     // 添加编码测试页面（v2.1.6新功能）
     nl_web_add_html(server, "/encoding", ENCODING_TEST_HTML);
     

@@ -26,7 +26,7 @@ extern "C" {
 #ifdef NL_VERSION
 #define NL_AUTOCOMPLETE_VERSION NL_VERSION
 #else
-#define NL_AUTOCOMPLETE_VERSION "2.2.1"
+#define NL_AUTOCOMPLETE_VERSION "2.4.1"
 #endif
 
 #define NL_AUTOCOMPLETE_VERSION_MAJOR 2
@@ -43,6 +43,9 @@ extern "C" {
 
 // Autocomplete module info structure (defined in implementation)
 NL_AUTOCOMPLETE_API nl_module_info_t* nl_autocomplete_get_module_info(void);
+
+// Autocomplete extension entry point (for dynamic loading)
+NL_AUTOCOMPLETE_API nl_extension_info_t* nl_autocomplete_get_extension_info(void);
 
 // =========================================
 // Internal Helper Functions

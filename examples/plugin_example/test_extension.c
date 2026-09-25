@@ -1,3 +1,9 @@
+/**
+ * @file test_extension.c
+ * @brief 测试插件扩展的独立可执行文件 (NL扩展系统 v2.4.0)
+ * @date 2026-09-12
+ */
+
 #include "netleaf.h"
 #include "netleaf_module.h"
 #include <stdio.h>
@@ -14,12 +20,12 @@ static void print_separator(void) {
     printf("==================================================\n");
 }
 
-int main() {
+int main(void) {
     int result = 0;
     
     printf("\n");
     print_separator();
-    printf("  NetLeaf Extension Library Test (v2.2.2)\n");
+    printf("  NetLeaf Extension Library Test (v2.4.0)\n");
     print_separator();
     printf("\n");
     

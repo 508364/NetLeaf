@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L  // Enable POSIX functions including strdup
 #include "netleaf_errorpage.h"
 #include "netleaf_module.h"
+#include "netleaf_errorpage_lang.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -185,12 +186,27 @@ int nl_errorpage_init(void) {
         g_errorpage_available = 1;
         g_errorpage_enabled = 1;
         (void)g_var_names; // Mark reserved interface as used
+        NL_ERRORPAGE_REGISTER_LANG();
     }
     return g_errorpage_available;
 }
 
 const char* nl_errorpage_version(void) {
     return NL_ERRORPAGE_VERSION;
+}
+
+// =========================================
+// Extension Definition (for dynamic loading)
+// =========================================
+
+NL_EXTENSION_DEFINE(errorpage, "ErrorPage", NL_ERRORPAGE_VERSION, "508364",
+    "Template-based error pages",
+    "Windows,Linux,MacOS",
+    NL_CAP_THREAD_SAFE,
+    nl_errorpage_init, NULL, nl_errorpage_is_available, nl_errorpage_version);
+
+nl_extension_info_t* nl_errorpage_get_extension_info(void) {
+    return &nl_extension_info_errorpage;
 }
 
 // =========================================
@@ -215,23 +231,34 @@ int nl_errorpage_is_enabled(void) {
 
 const char* nl_errorpage_status_message(int status_code) {
     static const char* messages[] = {
-        "Continue", "Switching Protocols", "OK", "Created",
-        "Accepted", "Non-Authoritative Information", "No Content",
-        "Reset Content", "Partial Content", "Multiple Choices",
-        "Moved Permanently", "Found", "See Other", "Not Modified",
-        "Use Proxy", "(Unused)", "Temporary Redirect", "Permanent Redirect",
-        "Bad Request", "Unauthorized", "Payment Required", "Forbidden",
-        "Not Found", "Method Not Allowed", "Not Acceptable",
-        "Proxy Authentication Required", "Request Timeout", "Conflict",
-        "Gone", "Length Required", "Precondition Failed",
-        "Payload Too Large", "URI Too Long", "Unsupported Media Type",
-        "Range Not Satisfiable", "Expectation Failed",
-        "Internal Server Error", "Not Implemented", "Bad Gateway",
-        "Service Unavailable", "Gateway Timeout", "HTTP Version Not Supported"
+        [100] = "Continue", [101] = "Switching Protocols",
+        [200] = "OK", [201] = "Created",
+        [202] = "Accepted", [203] = "Non-Authoritative Information",
+        [204] = "No Content", [205] = "Reset Content",
+        [206] = "Partial Content", [207] = "Multiple Choices",
+        [301] = "Moved Permanently", [302] = "Found",
+        [303] = "See Other", [304] = "Not Modified",
+        [305] = "Use Proxy", [307] = "Temporary Redirect",
+        [308] = "Permanent Redirect",
+        [400] = "Bad Request", [401] = "Unauthorized",
+        [402] = "Payment Required", [403] = "Forbidden",
+        [404] = "Not Found", [405] = "Method Not Allowed",
+        [406] = "Not Acceptable",
+        [407] = "Proxy Authentication Required",
+        [408] = "Request Timeout", [409] = "Conflict",
+        [410] = "Gone", [411] = "Length Required",
+        [412] = "Precondition Failed",
+        [413] = "Payload Too Large", [414] = "URI Too Long",
+        [415] = "Unsupported Media Type",
+        [416] = "Range Not Satisfiable",
+        [417] = "Expectation Failed",
+        [500] = "Internal Server Error", [501] = "Not Implemented",
+        [502] = "Bad Gateway", [503] = "Service Unavailable",
+        [504] = "Gateway Timeout",
+        [505] = "HTTP Version Not Supported"
     };
-    int idx = status_code - 100;
-    if (idx >= 0 && idx < (int)(sizeof(messages)/sizeof(messages[0]))) {
-        return messages[idx];
+    if (status_code >= 100 && status_code < 600 && status_code < (int)(sizeof(messages)/sizeof(messages[0]))) {
+        return messages[status_code];
     }
     return "Unknown Error";
 }
@@ -269,10 +296,12 @@ int nl_errorpage_load_template(int status_code, const char* template_path) {
     if (!f) return -1;
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
+    // ftell 失败返回 -1，需在 malloc 前校验，避免 malloc(0) 及 fread((size_t)-1) 造成堆溢出
+    if (len < 0) { fclose(f); return -1; }
     fseek(f, 0, SEEK_SET);
-    char* content = (char*)malloc(len + 1);
+    char* content = (char*)malloc((size_t)len + 1);
     if (!content) { fclose(f); return -1; }
-    size_t read_len = fread(content, 1, len, f);
+    size_t read_len = fread(content, 1, (size_t)len, f);
     content[read_len] = '\0';
     fclose(f);
     int result = nl_errorpage_set_template(status_code, content);
@@ -328,14 +357,45 @@ static char* substitute_variables(const char* template, const char** vars, const
         return result;
     }
     
-    size_t result_size = strlen(template) * 2;
-    char* result = (char*)malloc(result_size);
+    // 第一遍：完整扫描模板，精确计算替换后所需总长度。
+    // 旧实现仅保证“当前替换点”装得下，未给替换点之后的字面量预留空间，
+    // 且逐字符拷贝分支无边界检查，故改为先扫描计算总长再一次性分配。
+    size_t total_len = 0;
+    const char* scan = template;
+    while (*scan) {
+        if (strncmp(scan, "{{<var>", 7) == 0) {
+            const char* var_start = scan + 7;
+            const char* var_end = strstr(var_start, "</var>}}");
+            if (var_end) {
+                size_t var_len = var_end - var_start;
+                char var_name[256];
+                if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
+                strncpy(var_name, var_start, var_len);
+                var_name[var_len] = '\0';
+                const char* replacement = "";
+                for (int i = 0; i < count; i++) {
+                    if (strcmp(vars[i], var_name) == 0) {
+                        replacement = values[i] ? values[i] : "";
+                        break;
+                    }
+                }
+                total_len += strlen(replacement);
+                scan = var_end + 8;
+                continue;
+            }
+        }
+        total_len++;
+        scan++;
+    }
+    
+    // 一次性分配精确容量（+1 存放结尾 '\0'），从根本上杜绝堆越界
+    char* result = (char*)malloc(total_len + 1);
     if (!result) return NULL;
     
+    // 第二遍：按同样规则拷贝，逐字符分支同样受剩余容量约束
     char* ptr = result;
     const char* src = template;
-    *ptr = '\0';
-    
+    size_t remaining = total_len;
     while (*src) {
         if (strncmp(src, "{{<var>", 7) == 0) {
             const char* var_start = src + 7;
@@ -346,7 +406,6 @@ static char* substitute_variables(const char* template, const char** vars, const
                 if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
                 strncpy(var_name, var_start, var_len);
                 var_name[var_len] = '\0';
-                
                 const char* replacement = "";
                 for (int i = 0; i < count; i++) {
                     if (strcmp(vars[i], var_name) == 0) {
@@ -354,28 +413,22 @@ static char* substitute_variables(const char* template, const char** vars, const
                         break;
                     }
                 }
-                
                 size_t rep_len = strlen(replacement);
-                size_t current_len = strlen(result);
-                if (current_len + rep_len + 1 > result_size) {
-                    result_size *= 2;
-                    char* new_result = (char*)realloc(result, result_size);
-                    if (!new_result) { free(result); return NULL; }
-                    result = new_result;
-                    ptr = result + current_len;
+                if (rep_len > remaining) rep_len = remaining;
+                if (rep_len > 0) {
+                    memcpy(ptr, replacement, rep_len);
+                    ptr += rep_len;
+                    remaining -= rep_len;
                 }
-                strcpy(ptr, replacement);
-                ptr += rep_len;
-                
                 src = var_end + 8;
                 continue;
             }
         }
-        
+        if (remaining == 0) break;
         *ptr++ = *src++;
-        *ptr = '\0';
+        remaining--;
     }
-    
+    *ptr = '\0';
     return result;
 }
 
@@ -436,7 +489,7 @@ static char* render_template(const char* template_content, nl_errorpage_vars_t* 
         error_msg,
         vars->requested_path ? vars->requested_path : "",
         suggestion_html,
-        vars->server_version ? vars->server_version : "NetLeaf v2.2.0",
+        vars->server_version ? vars->server_version : "NetLeaf v2.4.0",
         vars->timestamp ? vars->timestamp : ""
     };
     
@@ -487,7 +540,7 @@ char* nl_errorpage_quick_response(int status_code, const char* message, const ch
     vars.status_code = status_code;
     vars.error_message = message ? message : nl_errorpage_status_message(status_code);
     vars.requested_path = path;
-    vars.server_version = "NetLeaf v2.2.0";
+    vars.server_version = "NetLeaf v2.4.0";
     
     time_t now = time(NULL);
     struct tm tm_buf;
@@ -510,7 +563,7 @@ char* nl_errorpage_404_with_suggestion(const char* path, const char* suggestion)
     vars.error_message = "Not Found";
     vars.requested_path = path;
     vars.suggestion = suggestion;
-    vars.server_version = "NetLeaf v2.2.0";
+    vars.server_version = "NetLeaf v2.4.0";
     
     time_t now = time(NULL);
     struct tm tm_buf;

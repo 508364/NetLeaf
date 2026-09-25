@@ -1,373 +1,363 @@
-# NetLeaf 版本历史
+# Changelog
 
-## v2.2.2
+所有重要变更将记录在此文件中。
 
-**平台支持:**
-- ✅ Windows (IOCP) - 完全支持
-- ✅ Linux (epoll) - 完全支持
-- ✅ macOS (kqueue) - 完全支持（所有模块）
+遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 规范。
 
-**重要变更 - 静态库支持:**
-- ⚠️ **静态库已不再支持** - 由于扩展库需要动态链接以共享全局状态
-- 如需静态链接，请使用 v2.2.1 或更早版本
-- 所有模块现在仅构建为动态库（DLL/SO）
+## [2.4.1] - 2026-09-24
 
-**新增功能 - 扩展库系统:**
-- **功能**: 支持第三方开发者创建动态扩展库
-- **文件**: `include/netleaf_module.h`, `src/netleaf_module.c`
-- **特性**:
-  - 扩展库定义结构 `nl_extension_info_t`
-  - 用户定义字段：库名称、库ID、版本、作者、详情（可选，限制50个中文字符）
-  - 平台支持字符串：`"Windows,Linux,MacOS"` 或 `"all"`（大小写不限，顺序不限）
-  - `library_value` 由主库自动分配，用户无需设置
-  - 扩展库自动加载：放入 `extensions/` 目录，`nl_modules_init()` 时自动加载
-  - 扩展库注册/注销 API
-  - 查询 API：`nl_extension_get_value_by_id()` / `nl_extension_get_id_by_value()`
-  - 描述长度验证（最多50个中文字符）
-- **示例**: `examples/plugin_example/`
-- **文档**: `wiki/Extension.md`
+### 变更
 
-**新增功能 - Web服务器文件热加载 (v2.2.2):**
-- **功能**: 支持从外部文件加载HTML/Vue/JSON，修改后刷新立即生效
-- **API**:
-  - `nl_web_add_html_file(server, path, file_path)` - 从文件加载HTML
-  - `nl_web_add_vue_file(server, path, file_path)` - 从文件加载Vue
-  - `nl_web_add_json_file(server, path, file_path)` - 从文件加载JSON
-- **特性**:
-  - 每次请求时重新读取文件内容
-  - 最大支持10MB文件
-  - 自动获取文件绝对路径
-  - 返回值：`NL_OK`/`NL_EINVAL`/`NL_EFILE`/`NL_ENOMEM`
-- **平台**: Windows/Linux/macOS（全平台支持）
+#### Lang：错误码接入多语言 + 变量系统支持动态/外部变量 (v2.4.1)
+- 新增表驱动错误注册基础设施：`NL_ERROR_BEGIN / NL_ERROR / NL_ERROR_END` 宏与
+  `nl_lang_register_errors()` / `nl_lang_register_errors_ex()`，一次注册中英双语错误表
+- 让此前"只声明、未生效"的模块真正接入 Lang：autoroute / autocomplete / errorpage / ipc
+  （补充初始化注册调用与对 `netleaf_lang` 的链接依赖）；连同 linkagg / tls / mqtt / mqtt_server，
+  各模块返回码/错误码均纳入多语言
+- 变量增强（动态变量与外部变量）：
+  - `nl_lang_var_set_provider()` / `nl_lang_var_is_dynamic()`：provider 按需计算变量值（锁外调用）
+  - `nl_lang_var_bind_env()`：变量绑定环境变量，访问时实时读取
+  - `nl_lang_var_load_env()` / `nl_lang_var_load_file()`：批量导入环境变量与 .env 文件
+  - `{{name}}` 与 `{{<var>name</var>}}` 替换、`get_int/float/bool` 均支持动态/外部变量
 
-**新增功能 - HTTP重定向 (v2.2.2):**
-- **功能**: 支持配置临时重定向（302）和永久重定向（301），可在运行时切换
-- **API**:
-  - `nl_web_add_redirect(server, path, target_url)` - 添加重定向
-  - `nl_web_set_redirect_type(server, type)` - 运行时设置重定向类型（301/302）
-  - `nl_web_get_redirect_type(server)` - 查询当前重定向类型
-- **特性**:
-  - 支持内部重定向（同服务器路径）
-  - 支持外部重定向（完整URL）
-  - 默认302临时重定向，可运行时切换为301永久重定向
-  - 返回标准HTTP响应头
-- **平台**: Windows/Linux/macOS（全平台支持）
+#### TLS 扩展：迁移到 mbedTLS 2.28.10 LTS，支持 TLS 1.0 - 1.3
+- 内置 mbedTLS 由 3.5.2 更换为 **2.28.10 LTS**，以真正支持 **TLS 1.0 / 1.1 / 1.2 / 1.3**
+  （mbedTLS 3.x 已从协议内核移除 TLS 1.0/1.1，无法通过配置开启）
+- `src/tls/netleaf_tls.c`、`src/mqtt/netleaf_mqtt_tls.c` 适配 2.28 API：
+  协议版本改用 `MBEDTLS_SSL_MINOR_VERSION_1..4` 映射、SSL 错误码调整、
+  `mbedtls_pk_parse_keyfile` 三参签名、`nl_tls_is_active` 改用 `MBEDTLS_SSL_HANDSHAKE_OVER`、
+  `nl_tls_handshake` 使用 `net_context.fd` 绑定套接字
+- 构建仅生成 mbedTLS 静态库，并在构建目录生成用户配置以启用
+  `MBEDTLS_SSL_PROTO_TLS1_3_EXPERIMENTAL`
+- `nl_tls_config_t` 的 `min_proto` / `max_proto` 现覆盖 TLS 1.0 - TLS 1.3 全区间
 
-**新增功能 - 智能检测 (v2.2.2):**
-- **功能**: `nl_web_add_html`、`nl_web_add_vue`、`nl_web_add_json` 自动识别内容类型
-- **特性**:
-  - URL (`http://`/`https://`) → 自动创建重定向路由
-  - 文件路径 → 自动创建热更新路由
-  - 静态内容 → 直接作为内联内容处理
-- **平台**: Windows/Linux/macOS（全平台支持）
+### 修复
 
-**新增功能 - 运行时动态路由管理 (v2.2.2):**
-- **功能**: 在服务器运行期间动态添加、移除、查询和更新路由
-- **API**:
-  - `nl_web_add_route(server, path, content, content_type)` - 添加静态内容路由
-  - `nl_web_remove_route(server, path)` - 移除指定路径的路由
-  - `nl_web_get_route_count(server)` - 获取当前路由数量
-  - `nl_web_list_routes(server, paths, max_paths)` - 列出所有路由路径
-  - `nl_web_update_route(server, path, content, content_type)` - 更新路由内容
-- **特性**:
-  - 线程安全：使用互斥锁保护路由操作
-  - 支持运行时动态修改路由，无需重启服务器
-  - 仅支持静态内容类型路由的更新（不支持重定向和文件路由）
-- **平台**: Windows/Linux/macOS（全平台支持）
+#### Windows 多架构构建修复 (LLVM-MinGW / Clang)
+- 移除构建脚本中不被 MinGW 支持的 `-target` 编译参数（`build_all-Clang.bat`、`build_tls.bat`）
+- 清理源码根目录残留的 in-source 构建产物（`CMakeCache.txt`、`CMakeFiles/`、`Makefile`、
+  `bin/`、`lib/`、`mbedtls/` 等），并在 `.gitignore` 中忽略以防误提交
+- 修正 CMake 关闭 mbedTLS 测试套件的配置（改用 CACHE FORCE，不再编译 mbedTLS 自带测试）
+- TLS 扩展补充链接 `netleaf_lang`；MQTT 直接链接 mbedTLS 库，解决未定义符号
+- 适配 mbedTLS 2.28 在 CMake 4.0 下的兼容性（`CMAKE_POLICY_VERSION_MINIMUM=3.5`）
+- 修复 mbedTLS 2.28 在 ARM64/Windows 上 `timing.c` 的 `gettimeofday` 未声明问题
+- 修复 `netleaf_mqtt.c` 中 `strndup` 与 UCRT 头文件冲突，以及 Windows 下 `EAGAIN` 未定义
+- 修复 `test_variable_substitution.c` 中 GCC 专属嵌套函数（Clang 不兼容）
+- 更新 `test_all.c` 版本断言以对照 `NETLEAF_VERSION_*` 宏
+- `include/netleaf.h` 补全 JSON/TOML/Encoding/System Info/Web/Lazy/版本 等
+  已实现但未声明的公共 API
 
-**移除的公开API:**
-- 布尔值转换API（`nl_bool_from_string`等）已改为内部静默处理，不再对外暴露
+#### 编译告警清理与健壮性修复 (v2.4.1)
+- 修复 Linux 上 `strdup` 隐式声明（指针截断隐患）：`src/netleaf_module.c` 顶部 `_GNU_SOURCE`
+- 修复 `vue` 内联模板格式串中裸 `%` 导致的非法转换符（未知行为）
+- 初始化 MQTT 报文 ID 变量（`netleaf_mqtt.c` 6 处 `pid = 0`）
+- 检查 `fread`/`write` 返回值（`netleaf_vue.c`、`src/linux/netleaf_linux.c`）
+- 为 `netleaf_mqtt` 目标定义 `NL_MQTT_TLS_STATIC`，消除同 DLL 内 dllimport（LNK4217）
+- 消除大量编译告警：`NL_EXTENSION_DEFINE` 多余分号、文件末尾缺换行、winsock2 顺序、
+  `DWORD` 用 `%d`、`int main()` 无原型、`_environ` 重声明等
 
-**新增功能 - Vue 后端支持 (netleaf_vue):**
-- **功能**: Vue.js 后端支持和 HTML 生成模块
-- **文件**: `include/netleaf_vue.h`, `src/vue/netleaf_vue.c`
-- **特性**:
-  - Vue CDN 配置（unpkg, cdnjs, jsdelivr, local）
-  - Vue 代码检测和自动导入
-  - HTML 页面生成（带 Vue CDN）
-  - 预定义组件生成（系统信息、性能监控）
-  - 变量替换支持
-- **平台**: Windows/Linux/macOS（全平台支持）
+### 构建验证
+- Windows x64 / i686 / arm64 三架构全部构建成功
+- 一键脚本（`build_all-Clang.bat`）完成全平台交叉编译并打包：
+  Windows(x64/x86/arm64)、Linux(amd64/i686/arm/arm64/mips/mipsel/mips64/mips64el/
+  powerpc/powerpc64/powerpc64le/riscv64/s390x)、macOS(x86_64/arm64) 全部成功
+- 版本号统一为 `2.4.1`（含 `build_macos.sh`、`build_all-MSVC.bat` 修正）
+- TLS 配置探针确认 TLS 1.0 / 1.1 / 1.2 / 1.3 均已启用
+- 四个测试程序（test_all / test_full / test_modules / test_variable_substitution）全部通过
 
-**构建流程简化:**
-- `build_all.bat` / `build_all.sh` - 直接运行即可构建
-- 自动创建 `extensions/` 目录
-- 版本号更新为 2.2.2
+### 安全提示
+- TLS 1.0 / 1.1 已被 RFC 8996 废弃且不再安全，仅建议用于兼容老旧对端；
+  生产环境建议将最小版本设置为 TLS 1.2 及以上
 
-**多语言错误消息增强:**
-- 支持一个库指定多个同语言文件
-- 支持多库共享翻译文件（需显式声明）
-- 错误码重复注册检测
-- 异步加载支持优化
+### 文档
+- 在 `README.md` / `README_EN.md` / `wiki`（Home、Features、TLS）中补充安全说明：
+  **不推荐使用 TLS 1.0 / 1.1**，并说明 NetLeaf 的 TLS 能力由**独立的 TLS 扩展库**（`netleaf_tls`）负责；
+  如确需使用请将 `min_proto` 设置为 `NL_TLS_PROTO_TLS1_2` 或更高
+- 将文档"架构说明"中的字符画（ASCII 图）改为 **Mermaid 图表**，便于阅读与维护
+  （涉及 `README.md`、`wiki/TLS.md`、`wiki/Features.md`、`wiki/LinkAgg.md`）
 
-**模块系统优化:**
-- 新增 Vue 模块类型 `NL_MODULE_VUE`
-- 新增扩展库管理 API
-- 统一的模块注册和管理
-- 跨平台兼容性改进
+## [2.4.0] - 2026-09-19
 
-**Bug 修复:**
-- 修复 Linux 构建警告（`strdup` 隐式声明、未使用参数）
-- 修复 macOS 链接器选项问题（`-fstack-protector-strong` 仅 Linux）
-- 修复插件加载中的 `va_list` 未声明问题
-- 修复跨平台类型兼容性问题（`HMODULE*` 替换为 `nl_plugin_handle_t*`）
-- 修复枚举重复定义问题（`nl_lazy_status_t` → `nl_module_lazy_status_t`）
+### 新增功能
 
-## v2.2.1
+#### TLS/SSL 内置扩展 (v2.4.0)
 
-**平台支持:**
-- ✅ Windows (IOCP) - 完全支持
-- ✅ Linux (epoll) - 完全支持
-- ✅ macOS (kqueue) - 主库功能完全支持
+**mbedTLS 集成：**
+- 创建 `include/netleaf_tls.h` - TLS/SSL 扩展头文件
+- 创建 `src/tls/netleaf_tls.c` - TLS 基础实现
+- 创建 `src/mqtt/netleaf_mqtt_tls.c` - MQTT TLS 集成实现
+- 内置 mbedTLS 源码于 `third-party/mbedTLS/`
+- 支持 TLS 1.0 - TLS 1.3 协议版本
+- 完整的证书管理：CA 证书、客户端证书、私钥
+- 支持证书验证和 peer 认证
+- 随机数生成器（entropy + CTR-DRBG）
+- 创建 TLS 构建脚本：`build_tls.bat` (Windows) 和 `build_tls.sh` (Linux/macOS)
 
-**新增功能 - IPC通讯服务 (netleaf_ipc):**
-- **功能**: 进程间通讯服务，支持 Windows Named Pipe 和 Linux Unix Domain Socket
-- **文件**: `src/ipc/`
-  - `netleaf_ipc.c` - 核心模块
-  - `src/windows/netleaf_ipc_windows.c` - Windows 实现
-  - `src/linux/netleaf_ipc_linux.c` - Linux 实现
-- **特性**:
-  - 支持服务端监听和客户端连接
-  - 跨进程数据传输
-  - 线程安全设计
-- **平台**: Windows/Linux（macOS暂不支持）
+**API 函数：**
+- `nl_tls_create()` / `nl_tls_destroy()` - 创建/销毁 TLS 上下文
+- `nl_tls_configure()` - 配置证书和选项
+- `nl_tls_set_verify()` - 设置验证选项
+- `nl_tls_handshake()` - 执行 TLS 握手
+- `nl_tls_send()` / `nl_tls_recv()` - TLS 收发数据
+- `nl_tls_close()` / `nl_tls_is_active()` - 连接管理
+- `nl_tls_get_peer_cert()` - 获取对端证书信息
+- `nl_tls_strerror()` - 错误信息
+- `nl_tls_init()` / `nl_tls_version()` / `nl_tls_is_available()` - 模块信息
 
-**新增功能 - 同端口链路聚合 (netleaf_linkagg):**
-- **功能**: 单端口监听，将请求转发到多个后端（HTTP/IPC）
-- **文件**: `src/linkagg/`
-  - `netleaf_linkagg.c` - 核心模块
-  - `src/windows/netleaf_linkagg_windows.c` - Windows 实现
-  - `src/linux/netleaf_linkagg_linux.c` - Linux 实现
-- **特性**:
-  - 负载均衡策略: Round Robin, Random, Least Connections, Weighted Round Robin
-  - 支持 HTTP 和 IPC 后端
-  - 同端口路由聚合
-- **平台**: Windows/Linux（macOS暂不支持）
+**MQTT TLS 集成：**
+- `nl_mqtt_tls_create()` / `nl_mqtt_tls_destroy()`
+- `nl_mqtt_tls_configure()` / `nl_mqtt_tls_handshake()`
+- `nl_mqtt_tls_send()` / `nl_mqtt_tls_recv()`
+- `nl_mqtt_tls_close()` / `nl_mqtt_tls_is_active()`
+- `nl_mqtt_tls_strerror()`
 
-**统一模块接口:**
-- **功能**: 所有独立模块通过统一接口进行管理
-- **文件**: `include/netleaf_module.h`, `src/netleaf_module.c`
-- **特性**:
-  - 模块信息结构 `nl_module_info_t`
-  - 模块注册/注销 API
-  - 模块版本、能力、平台支持查询
-  - 统一的模块管理 API
+**构建系统更新：**
+- CMakeLists.txt 支持内置 mbedTLS 编译
+- `BUILD_TLS=ON` 构建选项
+- `BUILD_MQTT=ON` 同时启用 MQTT + TLS
+- 自动链接 mbedtls、mbedx509、mbedcrypto 库
 
-**多语言错误消息 (netleaf_lang):**
-- **功能**: 统一的多语言错误消息翻译库
-- **文件**: `include/netleaf_lang.h`, `src/lang/netleaf_lang.c`
-- **特性**:
-  - 无限语言支持（en_us, zh_cn, ja_jp, ko_kr 等）
-  - 语言代码格式强制 `xx_xx`（忽略大小写）
-  - 分开注册语言和错误消息
-  - 自定义语言代码和错误码注册
-  - 多文件支持（一个库多个语言文件）
-  - 多库共享文件（需显示声明）
-  - 错误码重复检测
-  - 异步加载支持
-  - 跨平台：Windows / Linux / macOS
-- **平台**: ✅ Windows / ✅ Linux / ✅ macOS
+**开源项目来源：**
+- mbedTLS（当前内置 2.28.10 LTS）: https://github.com/Mbed-TLS/mbedTLS (Apache 2.0 / GPL v2.0)
+- MQTT Specification: https://mqtt.org/ (EPL-2.0 / EDL 1.0)
+- Paho MQTT C: https://github.com/eclipse/paho.mqtt.c (EPL-2.0 / EDL 1.0)
 
-**Bug修复:**
-- 修复边缘触发 epoll 循环读取问题
-- 修复 socket 双重关闭问题
-- 修复内存泄漏问题（Levenshtein栈分配、g_global_matcher释放）
-- 修复缓冲区溢出问题
-- 修复线程安全问题（原子操作、线程安全时间函数）
+#### MQTT 模块增强（v2.4.0）:
 
-**优化:**
-- 启用 LTO 链接时优化
-- 移除 usleep(100ms) 忙等待，改用 poll
-- Bubble sort 替换为 qsort
-- 添加安全加固编译标志
-- 构建系统优化（OBJECT库避免重复编译）
+#### Lang 模块增强（v2.4.0）
 
-**构建系统更新:**
-- CMake选项: `BUILD_IPC=ON`, `BUILD_LINKAGG=ON`
-- ASan支持: `BUILD_ASAN=ON`
+**变量替换系统：**
+- `nl_lang_var_set/set_int/set_float/set_bool` — 设置字符串/整数/浮点/布尔变量
+- `nl_lang_var_get/get_int/get_float/get_bool` — 获取变量值
+- `nl_lang_var_exists/remove/clear_all` — 查询、删除、清空所有变量
+- `nl_lang_var_replace` — 模板替换，支持 `{{VAR_NAME}}` 语法，自动 trim 空白
+- 最多支持 128 个并发变量，线程安全（mutex 保护）
 
-## v2.2.0
+**条件表达式求值：**
+- `nl_lang_var_condition_eval` — 支持 `== != >= <= > <` 运算符
+- 兼容数值比较和字符串比较（自动检测类型）
+- 支持字面量（数字、单引号字符串、`true`/`false`/`null`）和变量引用
 
-**平台支持:**
-- ✅ Windows (IOCP) - 完全支持
-- ✅ Linux (epoll) - 完全支持
-- 🔶 macOS (kqueue) - **初步支持**
+**脚本引擎回调接口：**
+- `nl_lang_register_script_engine` / `nl_lang_unregister_script_engine` — 注册/注销脚本引擎
+- `nl_lang_execute_script` — 执行脚本并返回结果
+- `nl_lang_get_script_engines` — 获取已注册引擎列表
+- 支持最多 8 个脚本引擎，便于后续接入 Lua/Python/JavaScript
 
-**新增功能 - macOS平台:**
-- `src/macos/` 目录下的完整实现
-- kqueue替代epoll作为事件机制
-- iconv编码转换（与Linux兼容）
-- pthread懒加载机制
-- sysctl系统信息获取
+**版本与能力更新：**
+- Lang 版本号更新为 `2.4.0`
+- 新增能力标志：`NL_LANG_CAP_VARIABLES (1<<4)`, `NL_LANG_CAP_SCRIPTING (1<<5)`, `NL_LANG_CAP_CONDITIONALS (1<<6)`
+- 模块描述更新："Multi-language error message translation with variable substitution and scripting"
 
-**附加模块 (从主库分离，与主库共用版本号):**
+#### NL扩展系统全面增强 (v2.4.0)
 
-### Auto-complete (netleaf_autocomplete)
-- **功能**: 自动补全charset标签和自动引入Vue库
-- **文件**: `src/autocomplete/`
-  - `netleaf_autocomplete.c` - 核心模块
-  - `netleaf_charset.c` - Charset自动补全
-  - `netleaf_vue_import.c` - Vue自动引入
-- **特性**:
-  - Charset自动补全：根据统一编码格式添加 `<meta charset>` 和 `<meta name="viewport">`
-  - Vue自动引用：检测Vue代码但无引用时自动从CDN引入
-  - 灵活启用方式：支持 `true/false`, `on/off`, `yes/no`, `1/0`
-  - 单独控制：charset和Vue功能可独立启用/禁用
-- **平台**: Windows/Linux/macOS 全部支持
+**扩展独立化重构：**
+- 所有扩展改为独立的动态库文件，支持运行时热加载和卸载
+- 统一命名规范：`get_extension_info()` 函数替代旧式符号查找
+- 扩展自动发现机制优化，支持标准符号名和旧版兼容名
 
-### Auto-route (netleaf_autoroute)
-- **功能**: 404时自动查找相近端点并在错误页面提示
-- **文件**: `src/autoroute/`
-  - `netleaf_autoroute.c` - 核心模块
-  - `netleaf_route_matcher.c` - 路由匹配算法
-- **特性**:
-  - Levenshtein距离算法计算路径相似度
-  - 多策略评分：路径段匹配、前缀共有、段数相同
-  - 通配符支持：`*` 和 `**`
-- **平台**: Windows/Linux/macOS 全部支持
+**扩展生命周期管理 API（新增）：**
+- `nl_extension_init()` / `nl_extension_shutdown()` - 单个扩展的初始化和关闭
+- `nl_extension_force_shutdown()` - 强制关闭扩展（跳过安全检查）
+- `nl_extension_is_initialized()` / `nl_extension_is_running()` - 状态查询
+- `nl_extension_get_state()` - 获取完整模块状态
 
-### ErrorPage (netleaf_errorpage)
-- **功能**: 支持自定义错误页面模板，强制预留变量区域
-- **文件**: `src/errorpage/`
-  - `netleaf_errorpage.c` - 完整实现
-- **特性**:
-  - 独立standalone模块，其他模块不可使用其功能
-  - 模板必须预留变量：`{{ERROR_CODE}}`, `{{ERROR_MESSAGE}}`, `{{REQUESTED_PATH}}`, `{{SERVER_VERSION}}`, `{{TIMESTAMP}}`
-  - 支持 `{{#if SUGGESTION}}` 条件块
-  - 可与Auto-route联动显示路由建议
-- **平台**: Windows/Linux/macOS 全部支持
+**扩展信息查询 API（新增）：**
+- `nl_extension_get_name()` / `nl_extension_get_author()` / `nl_extension_get_description()` - 便捷信息获取
+- `nl_extension_get_caps()` / `nl_extension_supports_platform()` - 能力和平台查询
 
-**主库API更新:**
-- `nl_web_server_set_error_page()` - 设置自定义错误页面模板
-- `nl_web_server_enable_error_suggestions()` - 启用路由建议
-- `nl_render_error_page()` - 渲染错误页面
-- `nl_make_error_response()` - 生成HTTP错误响应
+**批量操作 API（新增）：**
+- `nl_extension_init_all()` / `nl_extension_shutdown_all()` / `nl_extension_force_shutdown_all()` - 批量生命周期管理
 
-**构建系统更新:**
-- CMake选项: `BUILD_AUTOCOMPLETE=ON`, `BUILD_AUTOROUTE=ON`, `BUILD_ERRORPAGE=ON`
-- 所有附加模块默认一起构建，共用主库版本号
-- macOS交叉编译toolchain: `cmake/osxcross.cmake`
+**扩展搜索 API（新增）：**
+- `nl_extension_find_by_capability()` - 按能力筛选扩展
+- `nl_extension_find_by_platform()` - 按平台筛选扩展
+- `nl_extension_find_by_name_pattern()` - 按名称模式匹配
 
-## v2.1.6
+**热重载支持：**
+- `nl_extension_reload()` - 重载单个扩展
+- `nl_extension_reload_all()` - 重载所有扩展
 
-**新增功能 - 编码动态适配:**
-- `nl_web_enable_auto_encoding(server, enable)` - 启用/禁用自动编码协商
-- `nl_web_is_auto_encoding_enabled(server)` - 检查是否启用自动编码
-- `nl_web_set_fallback_encoding(server, encoding)` - 设置回退编码
-- `nl_web_get_negotiated_encoding(server)` - 获取协商后的编码
-- `nl_encoding_convert(input, len, src_enc, dst_enc)` - 编码转换函数
-- `nl_encoding_detect(input, len)` - 自动检测字符串编码
-- `nl_encoding_get_system_default()` - 获取系统默认编码
+**元数据管理：**
+- `nl_extension_get_metadata()` / `nl_extension_set_metadata()` - 扩展元数据的读写
 
-**编码支持:**
-- UTF-8
-- GBK
-- GB2312
-- GB18030
-- Big5
-- ISO-8859-1
-- US-ASCII
-- UTF-16
+### 修改
 
-**全场景支持:**
-- ✅ 控制台输出
-- ✅ Web响应
-- ✅ HTML页面
-- ✅ Vue组件
-- ✅ JSON响应
-- ✅ TOML响应
+#### 版本号更新
+- 主版本号和核心库版本更新为 `2.4.0`
+- 所有扩展模块版本同步更新为 `2.4.0`
+- 更新所有头文件和源文件的版本注释
 
-**特性:**
-- 自动解析客户端Accept-Charset请求头
-- 运行时自动转码响应内容
-- 双向编码转换（任意编码之间互相转换）
-- 跨平台支持（Windows/Linux）
-- 懒加载机制：功能拉起使用后自动下线，减少内存占用
-- 智能优化：仅对非ASCII字符进行转码，减少性能开销
+#### 头文件更新
+- `netleaf_module.h`: 新增 v2.4.0 扩展管理 API 声明，完整生命周期管理、搜索、元数据接口
+- `netleaf.h`: 更新版本号宏，添加 `NETLEAF_VERSION_MAJOR/MINOR/PATCH`
+- 所有扩展头文件版本统一更新为 `2.4.0`
 
-**编译器编码修复:**
-- 默认使用UTF-8编码编译
-- 解决中文乱码问题
+### 移除
 
-## v2.1.5
+- 无移除项
 
-**新增功能:**
-- `nl_sys_info_get_os_name()` - 获取操作系统名称
-- `nl_sys_info_get_architecture()` - 获取系统架构
-- `nl_sys_info_get_cpu_model()` - 获取CPU型号
-- `nl_sys_info_get_total_ram()` - 获取总内存（字节）
-- `nl_sys_info_get_runtime_version()` - 获取运行库版本
-- `nl_sys_info_set_ram_unit(unit)` - 设置RAM进制（1000/1024）
-- `nl_sys_info_clear_cache()` - 清除缓存（用于重新加载）
-- **懒加载机制**: 系统信息仅在首次调用时加载
-- **安全增强**: `nl_web_stop_by_port()` 只能停止本库启动的端口
+### 修复
 
-**RAM进制配置:**
-- Linux 默认: 1000进制（符合SI标准）
-- Windows 默认: 1024进制（传统二进制）
-- 可通过 `nl_sys_info_set_ram_unit(NL_RAM_UNIT_DECIMAL)` 或 `nl_sys_info_set_ram_unit(NL_RAM_UNIT_BINARY)` 切换
+- 修复 `strings.h` 头文件包含错误（原为 `strings.b`）
 
-**安全更新:**
-- 只能停止由本库启动的端口，防止误操作其他进程的端口
+---
 
-**懒加载支持:**
-- `nl_lazy_enable(enable)` - 全局启用/禁用懒加载
-- `nl_lazy_enable_module(module)` - 启用指定模块的懒加载
-- `nl_lazy_disable_module(module)` - 禁用指定模块的懒加载
-- `nl_lazy_is_enabled(module)` - 检查模块是否启用懒加载
-- `nl_lazy_clear_all_cache()` - 清除所有模块的缓存
-- `nl_lazy_preload_module(module)` - 预加载指定模块
+## [2.2.2-17891424] - 2026-09-12
 
-**支持懒加载的模块:**
-- HTTP (`NL_LAZY_MODULE_HTTP`)
-- WebSocket (`NL_LAZY_MODULE_WEBSOCKET`)
-- TCP (`NL_LAZY_MODULE_TCP`)
-- UDP (`NL_LAZY_MODULE_UDP`)
-- TOML (`NL_LAZY_MODULE_TOML`)
-- JSON (`NL_LAZY_MODULE_JSON`)
-- SysInfo (`NL_LAZY_MODULE_SYSINFO`)
+### 新增功能
 
-**模块启停与状态管理:**
-- `nl_lazy_stop_module(module)` - 停止指定模块并释放资源
-- `nl_lazy_get_module_status(module)` - 获取模块状态（未加载/加载中/已加载/停止中/已停止）
-- `nl_lazy_is_module_loaded(module)` - 检查模块是否已加载
+#### NL扩展系统正式命名
+- 将"动态扩展功能"正式命名为 **NL扩展系统** (NL Extension System)
+- 更新所有相关文档和注释
+- 新增 `NL_SYSTEM_NAME` 宏定义
 
-**多线程优化:**
-- `nl_lazy_set_thread_count(count)` - 设置线程池大小（1-256）
-- `nl_lazy_get_thread_count()` - 获取当前线程池大小
-- 默认线程数: 4
-- 支持根据应用场景调整：IO密集型推荐较大线程数，CPU密集型推荐CPU核心数
+#### MQTT 完整协议支持
+- 添加 `netleaf_mqtt.h` 头文件（MQTT v3.1.1 完整协议）
+- 添加 `src/mqtt/` 模块实现目录
+- 支持 QoS 0/1/2 消息质量等级
+- 支持主题通配符 (`+`, `#`)
+- 支持 CONNECT/PUBLISH/SUBSCRIBE/UNSUBSCRIBE 等全部 14 种消息类型
+- 支持遗嘱消息 (Last Will)
+- 支持保留消息 (Retained Messages)
 
-## v2.1.0
+#### 扩展系统健壮性增强
+- 新增 `NL_CAP_EXT_SYSTEM` 能力标志
+- 所有模块宏自动附加 `NL_CAP_EXT_SYSTEM` 标志
+- 扩展描述长度验证（最多 50 个中文字符）
+- 平台字符串解析增强（大小写不敏感）
+- 自动分配 `library_value`（从 1 开始，0 保留）
 
-**新增功能:**
-- `nl_web_create(port)` - 创建即启动Web服务器
-- `nl_web_stop_by_port(port)` - 按端口号停止服务器
-- `nl_web_set_auto_cleanup(enable)` - 程序退出时自动清理所有服务器
-- `nl_web_set_encoding()` - 设置响应编码
-- `nl_web_add_html_with_vars()` - 带变量的HTML页面
-- `nl_web_add_vue_with_vars()` - 带变量的Vue页面
-- `nl_debug_enable()` - 启用调试模式
-- `nl_log_debug()`, `nl_log_info()`, `nl_log_warn()`, `nl_log_error()` - 日志函数
-- 自动检测交叉编译工具链
-- 异步并发优化，完整的异步IO支持
+### 修改
 
-**Bug修复:**
-- 修复服务器端口冲突问题（重复创建相同端口返回现有实例）
-- 修复内存泄漏风险（通过`atexit`注册自动清理）
-- 修复多线程安全问题（全局服务器列表添加互斥锁保护）
+#### 版本更新
+- 版本号从 `2.2.2` 更新为 `2.2.2-17891424`
+- 更新 `NL_MODULE_VERSION` 宏
+- 更新所有头文件和源文件的版本注释
 
-**安全更新:**
-- 完善的空指针检查
-- 缓冲区溢出防护
-- 字符串格式化安全
+#### 头文件更新
+- `netleaf_module.h`: 重写文档，标注为 NL扩展系统
+- `netleaf.h`: 简化 API，添加 MQTT 基础类型定义
+- 新增 `NL_MODULE_MQTT` 模块类型
+- 新增 `NL_MODULE_MQTT_INFO` 宏定义
 
-## v2.0.0
+#### 构建系统更新
+- 更新 CMakeLists.txt 版本为 `2.2.2-17891424`
+- 添加 MQTT 模块构建选项 `BUILD_MQTT`
+- 更新构建输出路径配置
 
-- 初始版本发布
-- 支持HTTP/1.1, HTTP/2, HTTP/3
-- WebSocket支持
-- TCP/UDP基础通信
-- 文件服务器功能
-- JSON/TOML解析器
-- 路由配置API
+### 移除
+
+- 无移除项
+
+### 修复
+
+- 修复 MQTT 模块链接错误（移除对未导出符号的引用）
+- 修复构建配置中的依赖链接问题
+
+## [2.2.2] - 2026-09-09
+
+### 新增功能
+
+#### 跨平台构建优化
+- 支持 Windows (x86_64, i686, arm64)
+- 支持 Linux (x86_64, arm64)
+- 支持 macOS (x86_64, arm64)
+
+#### 模块化架构
+- 将 IPC、LinkAgg 等功能移至独立模块
+- 实现延迟加载机制
+- 添加模块依赖管理
+
+### 修改
+
+#### 文件重命名
+- `libnetleaf.dll` → `libnetleaf_core.dll` (内部)
+- `libnetleaf.exe` → `libnetleaf_core.exe` (测试程序)
+
+#### 构建配置
+- 更新 CMakeLists.txt
+- 优化编译器标志
+- 添加平台特定源文件
+
+## [2.2.1] - 2026-09-01
+
+### 修复
+
+- 修复 Windows 下链接器错误
+- 修复 macOS 编译警告
+- 修复 Linux 构建脚本
+
+## [2.2.0] - 2026-08-25
+
+### 新增功能
+
+- 添加 WebSocket 服务端和客户端支持
+- 添加 HTTP 服务器路由修正功能
+- 支持 Windows/MacOS/Linux 三平台构建
+
+### 修改
+
+- 重构网络层抽象
+- 优化事件循环性能
+- 改进错误处理机制
+
+## [2.1.0] - 2026-08-20
+
+### 新增功能
+
+- 添加智能路由修正功能
+- 添加路由匹配建议
+- 支持路由参数自动解析
+
+### 修改
+
+- 重构路由引擎
+- 优化正则表达式性能
+- 改进错误页面生成
+
+## [2.0.0] - 2026-08-15
+
+### 重大变更
+
+- 重构为模块化架构
+- 分离核心库与功能模块
+- 添加动态扩展系统
+- 引入异步 I/O 模型
+
+### 新增功能
+
+- 多语言错误消息支持
+- Vue.js 后端渲染支持
+- 自定义错误页模板
+- 进程间通信 (IPC)
+- 链接聚合与负载均衡
+
+### 移除
+
+- 移除旧的同步 API
+- 移除单线程模型支持
+
+## [1.0.0] - 2026-07-01
+
+### 初始版本
+
+- 基础 TCP/UDP 服务器
+- 基础 HTTP 处理
+- 简单的路由系统
+- Windows 平台支持
+
+---
+
+**注意**: 从 v2.0.0 开始采用语义化版本控制， breaking changes 会在主版本号升级时出现。
+
+[Unreleased]: https://github.com/508364/NetLeaf/compare/v2.4.1...HEAD
+[2.4.1]: https://github.com/508364/NetLeaf/compare/v2.4.0...v2.4.1
+[2.4.0]: https://github.com/508364/NetLeaf/compare/v2.2.2-17891424...v2.4.0
+[2.2.2-17891424]: https://github.com/508364/NetLeaf/compare/v2.2.2...v2.2.2-17891424
+[2.2.2]: https://github.com/508364/NetLeaf/compare/v2.2.1...v2.2.2
+[2.2.1]: https://github.com/508364/NetLeaf/compare/v2.2.0...v2.2.1
+[2.2.0]: https://github.com/508364/NetLeaf/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/508364/NetLeaf/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/508364/NetLeaf/compare/v1.0.0...v2.0.0
+[1.0.0]: https://github.com/508364/NetLeaf/releases/tag/v1.0.0

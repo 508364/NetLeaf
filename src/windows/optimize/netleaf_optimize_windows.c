@@ -9,8 +9,10 @@
 
 #include "../../include/optimize/netleaf_optimize.h"
 
+#if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
+#endif
 
 #define ALIGN_SIZE 64
 #define CACHE_LINE_SIZE 64

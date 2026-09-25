@@ -11,11 +11,33 @@
 #include "netleaf_linkagg_internal.h"
 #include "netleaf_ipc.h"
 
+#if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 // Backend type constants
 #define BACKEND_HTTP 0
 #define BACKEND_IPC  1
+
+// --- Global mutex for ID registry ---
+
+static CRITICAL_SECTION g_id_mutex;
+static int g_id_mutex_initialized = 0;
+
+void nl_lagg_init_global_mutex(void) {
+    if (!g_id_mutex_initialized) {
+        InitializeCriticalSection(&g_id_mutex);
+        g_id_mutex_initialized = 1;
+    }
+}
+
+void nl_lagg_mutex_lock(nl_lagg_mutex_t* m) {
+    EnterCriticalSection(m);
+}
+
+void nl_lagg_mutex_unlock(nl_lagg_mutex_t* m) {
+    LeaveCriticalSection(m);
+}
 
 // --- Load balancing ---
 
@@ -111,32 +133,9 @@ static int send_all(SOCKET sock, const char* buf, int len) {
     return sent;
 }
 
-// --- Global mutex for ID registry (exported) ---
-
-static nl_lagg_mutex_t g_id_mutex;
-static int g_id_mutex_initialized = 0;
-
-// Initialize global mutex (must be called before using ID registry)
-void nl_lagg_init_global_mutex(void) {
-    if (!g_id_mutex_initialized) {
-        NL_LAGG_MUTEX_INIT(&g_id_mutex);
-        g_id_mutex_initialized = 1;
-    }
-}
-
-// Mutex wrappers for cross-platform compatibility
-void nl_lagg_mutex_lock(nl_lagg_mutex_t* m) {
-    nl_lagg_init_global_mutex();
-    NL_LAGG_MUTEX_LOCK(m);
-}
-
-void nl_lagg_mutex_unlock(nl_lagg_mutex_t* m) {
-    NL_LAGG_MUTEX_UNLOCK(m);
-}
-
 // --- Public API ---
 
-nl_lagg_server_t* nl_lagg_create(int port) {
+NL_LINKAGG_API nl_lagg_server_t* nl_lagg_create(int port) {
     static int wsastarted = 0;
     if (!wsastarted) {
         WSADATA wsa;
@@ -166,7 +165,7 @@ nl_lagg_server_t* nl_lagg_create(int port) {
     return server;
 }
 
-void nl_lagg_destroy(nl_lagg_server_t* server) {
+NL_LINKAGG_API void nl_lagg_destroy(nl_lagg_server_t* server) {
     if (!server) return;
     
     nl_lagg_backend_t* b = server->backends;
@@ -179,7 +178,7 @@ void nl_lagg_destroy(nl_lagg_server_t* server) {
     free(server);
 }
 
-int nl_lagg_start(nl_lagg_server_t* server) {
+NL_LINKAGG_API int nl_lagg_start(nl_lagg_server_t* server) {
     if (!server || server->running) return -1;
     
     server->server_fd = (int)socket(AF_INET, SOCK_STREAM, 0);
@@ -316,7 +315,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
     return 0;
 }
 
-void nl_lagg_stop(nl_lagg_server_t* server) {
+NL_LINKAGG_API void nl_lagg_stop(nl_lagg_server_t* server) {
     if (!server) return;
     server->running = 0;
     if (server->server_fd >= 0) {
@@ -326,7 +325,7 @@ void nl_lagg_stop(nl_lagg_server_t* server) {
     }
 }
 
-int nl_lagg_add_http_backend(nl_lagg_server_t* server, const char* host, int port, int weight) {
+NL_LINKAGG_API int nl_lagg_add_http_backend(nl_lagg_server_t* server, const char* host, int port, int weight) {
     if (!server || !host || port <= 0) return NL_LINKAGG_ERROR_INVALID_PARAM;
 
     NL_LAGG_MUTEX_LOCK(&server->mutex);
@@ -354,7 +353,7 @@ int nl_lagg_add_http_backend(nl_lagg_server_t* server, const char* host, int por
     return NL_LINKAGG_OK;
 }
 
-int nl_lagg_add_ipc_backend(nl_lagg_server_t* server, const char* endpoint, int weight) {
+NL_LINKAGG_API int nl_lagg_add_ipc_backend(nl_lagg_server_t* server, const char* endpoint, int weight) {
     if (!server || !endpoint) return NL_LINKAGG_ERROR_INVALID_PARAM;
 
     NL_LAGG_MUTEX_LOCK(&server->mutex);
@@ -382,7 +381,7 @@ int nl_lagg_add_ipc_backend(nl_lagg_server_t* server, const char* endpoint, int 
     return NL_LINKAGG_OK;
 }
 
-int nl_lagg_remove_backend(nl_lagg_server_t* server, const char* endpoint) {
+NL_LINKAGG_API int nl_lagg_remove_backend(nl_lagg_server_t* server, const char* endpoint) {
     if (!server || !endpoint) return -1;
     NL_LAGG_MUTEX_LOCK(&server->mutex);
     nl_lagg_backend_t* prev = NULL;
@@ -402,18 +401,18 @@ int nl_lagg_remove_backend(nl_lagg_server_t* server, const char* endpoint) {
     return -1;
 }
 
-void nl_lagg_set_policy(nl_lagg_server_t* server, nl_lagg_policy_t policy) {
+NL_LINKAGG_API void nl_lagg_set_policy(nl_lagg_server_t* server, nl_lagg_policy_t policy) {
     if (!server) return;
     server->policy = policy;
 }
 
-void nl_lagg_set_on_connect(nl_lagg_server_t* server, nl_lagg_on_connect_cb cb, void* user_data) {
+NL_LINKAGG_API void nl_lagg_set_on_connect(nl_lagg_server_t* server, nl_lagg_on_connect_cb cb, void* user_data) {
     if (!server) return;
     server->on_connect = cb;
     server->user_data = user_data;
 }
 
-void nl_lagg_set_on_disconnect(nl_lagg_server_t* server, nl_lagg_on_disconnect_cb cb, void* user_data) {
+NL_LINKAGG_API void nl_lagg_set_on_disconnect(nl_lagg_server_t* server, nl_lagg_on_disconnect_cb cb, void* user_data) {
     if (!server) return;
     server->on_disconnect = cb;
     server->user_data = user_data;

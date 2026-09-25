@@ -29,11 +29,11 @@
 
 static nl_lagg_backend_t* select_backend(nl_lagg_server_t* server) {
     if (!server || !server->backends) return NULL;
-    
+
     NL_LAGG_MUTEX_LOCK(&server->mutex);
-    
+
     nl_lagg_backend_t* result = NULL;
-    
+
     switch (server->policy) {
         case NL_POLICY_ROUND_ROBIN:
             if (server->backends) {
@@ -72,7 +72,7 @@ static nl_lagg_backend_t* select_backend(nl_lagg_server_t* server) {
             result = server->backends;
             break;
     }
-    
+
     if (result) result->current_connections++;
     NL_LAGG_MUTEX_UNLOCK(&server->mutex);
     return result;
@@ -129,7 +129,7 @@ void nl_lagg_mutex_unlock(nl_lagg_mutex_t* m) {
 
 // --- Public API ---
 
-nl_lagg_server_t* nl_lagg_create(int port) {
+NL_LINKAGG_API nl_lagg_server_t* nl_lagg_create(int port) {
     // Initialize global ID registry mutex
     nl_lagg_init_global_mutex();
 
@@ -153,7 +153,7 @@ nl_lagg_server_t* nl_lagg_create(int port) {
     return server;
 }
 
-void nl_lagg_destroy(nl_lagg_server_t* server) {
+NL_LINKAGG_API void nl_lagg_destroy(nl_lagg_server_t* server) {
     if (!server) return;
     if (server->epoll_fd >= 0) close(server->epoll_fd);
     nl_lagg_backend_t* b = server->backends;
@@ -166,27 +166,27 @@ void nl_lagg_destroy(nl_lagg_server_t* server) {
     free(server);
 }
 
-int nl_lagg_start(nl_lagg_server_t* server) {
+NL_LINKAGG_API int nl_lagg_start(nl_lagg_server_t* server) {
     if (!server || server->running) return -1;
-    
+
     server->server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->server_fd < 0) return -1;
-    
+
     int opt = 1;
     setsockopt(server->server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+
     // Set timeout for accept so nl_lagg_stop can interrupt
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
     setsockopt(server->server_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)server->port);
     addr.sin_addr.s_addr = INADDR_ANY;
-    
+
     if (bind(server->server_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         close(server->server_fd);
         server->server_fd = -1;
@@ -197,48 +197,48 @@ int nl_lagg_start(nl_lagg_server_t* server) {
         server->server_fd = -1;
         return -1;
     }
-    
+
     server->epoll_fd = epoll_create1(0);
     if (server->epoll_fd < 0) {
         close(server->server_fd);
         server->server_fd = -1;
         return -1;
     }
-    
+
     struct epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = server->server_fd;
     epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server->server_fd, &ev);
-    
+
     server->running = 1;
-    
+
     struct epoll_event events[MAX_EVENTS];
-    
+
     while (server->running) {
         int n = epoll_wait(server->epoll_fd, events, MAX_EVENTS, 1000);
-        
+
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        
+
         for (int i = 0; i < n; i++) {
             if (events[i].data.fd == server->server_fd) {
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
                 int client_fd = accept(server->server_fd, (struct sockaddr*)&client_addr, &client_len);
-                
+
                 if (client_fd < 0) continue;
-                
+
                 int flags = fcntl(client_fd, F_GETFL, 0);
                 fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-                
+
                 ev.events = EPOLLIN | EPOLLRDHUP;
                 ev.data.fd = client_fd;
                 epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
-                
+
                 if (server->on_connect) server->on_connect(client_fd, server->user_data);
-                
+
                 // Read HTTP request
                 char request[BUFFER_SIZE];
                 int total = 0;
@@ -249,7 +249,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                     if (total >= 4 && request[total-4] == '\r' && request[total-3] == '\n' &&
                         request[total-2] == '\r' && request[total-1] == '\n') break;
                 }
-                
+
                 if (total <= 0) {
                     epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
                     close(client_fd);
@@ -257,7 +257,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                     continue;
                 }
                 request[total] = '\0';
-                
+
                 // Find body and Content-Length with overflow protection
                 char* body_start = strstr(request, "\r\n\r\n");
                 int body_offset = 0, body_len = 0;
@@ -272,7 +272,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                         }
                     }
                 }
-                
+
                 // Read body with bounds check
                 if (body_len > 0 && total < body_offset + body_len && body_offset + body_len <= BUFFER_SIZE) {
                     int remaining = body_offset + body_len - total;
@@ -283,7 +283,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                         received += ret; total += ret;
                     }
                 }
-                
+
                 nl_lagg_backend_t* backend = select_backend(server);
                 if (!backend) {
                     send(client_fd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", 58, MSG_NOSIGNAL);
@@ -291,10 +291,10 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                     close(client_fd);
                     continue;
                 }
-                
+
                 char response[RESPONSE_SIZE];
                 int resp_total = 0;
-                
+
                 if (backend->type == BACKEND_HTTP) {
                     int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
                     if (backend_fd >= 0) {
@@ -303,7 +303,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                         backend_addr.sin_family = AF_INET;
                         backend_addr.sin_port = htons((uint16_t)backend->port);
                         inet_pton(AF_INET, "127.0.0.1", &backend_addr.sin_addr);
-                        
+
                         if (connect(backend_fd, (struct sockaddr*)&backend_addr, sizeof(backend_addr)) == 0) {
                             send_all(backend_fd, request, total);
                             while (resp_total < RESPONSE_SIZE - 1) {
@@ -335,11 +335,11 @@ int nl_lagg_start(nl_lagg_server_t* server) {
                         nl_ipc_destroy(ipc);
                     }
                 }
-                
+
                 release_backend(server, backend);
                 epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
                 close(client_fd);
-                
+
                 if (server->on_disconnect) server->on_disconnect(client_fd, server->user_data);
             } else {
                 // Client event (EPOLLRDHUP = disconnect)
@@ -349,7 +349,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
             }
         }
     }
-    
+
     if (server->epoll_fd >= 0) close(server->epoll_fd);
     if (server->server_fd >= 0) close(server->server_fd);
     server->epoll_fd = -1;
@@ -358,7 +358,7 @@ int nl_lagg_start(nl_lagg_server_t* server) {
     return 0;
 }
 
-void nl_lagg_stop(nl_lagg_server_t* server) {
+NL_LINKAGG_API void nl_lagg_stop(nl_lagg_server_t* server) {
     if (!server) return;
     server->running = 0;
     if (server->server_fd >= 0) {
@@ -368,7 +368,7 @@ void nl_lagg_stop(nl_lagg_server_t* server) {
     }
 }
 
-int nl_lagg_add_http_backend(nl_lagg_server_t* server, const char* host, int port, int weight) {
+NL_LINKAGG_API int nl_lagg_add_http_backend(nl_lagg_server_t* server, const char* host, int port, int weight) {
     if (!server || !host || port <= 0) return NL_LINKAGG_ERROR_INVALID_PARAM;
 
     NL_LAGG_MUTEX_LOCK(&server->mutex);
@@ -396,7 +396,7 @@ int nl_lagg_add_http_backend(nl_lagg_server_t* server, const char* host, int por
     return NL_LINKAGG_OK;
 }
 
-int nl_lagg_add_ipc_backend(nl_lagg_server_t* server, const char* endpoint, int weight) {
+NL_LINKAGG_API int nl_lagg_add_ipc_backend(nl_lagg_server_t* server, const char* endpoint, int weight) {
     if (!server || !endpoint) return NL_LINKAGG_ERROR_INVALID_PARAM;
 
     NL_LAGG_MUTEX_LOCK(&server->mutex);
@@ -424,7 +424,7 @@ int nl_lagg_add_ipc_backend(nl_lagg_server_t* server, const char* endpoint, int 
     return NL_LINKAGG_OK;
 }
 
-int nl_lagg_remove_backend(nl_lagg_server_t* server, const char* endpoint) {
+NL_LINKAGG_API int nl_lagg_remove_backend(nl_lagg_server_t* server, const char* endpoint) {
     if (!server || !endpoint) return -1;
     NL_LAGG_MUTEX_LOCK(&server->mutex);
     nl_lagg_backend_t* prev = NULL;
@@ -444,18 +444,18 @@ int nl_lagg_remove_backend(nl_lagg_server_t* server, const char* endpoint) {
     return -1;
 }
 
-void nl_lagg_set_policy(nl_lagg_server_t* server, nl_lagg_policy_t policy) {
+NL_LINKAGG_API void nl_lagg_set_policy(nl_lagg_server_t* server, nl_lagg_policy_t policy) {
     if (!server) return;
     server->policy = policy;
 }
 
-void nl_lagg_set_on_connect(nl_lagg_server_t* server, nl_lagg_on_connect_cb cb, void* user_data) {
+NL_LINKAGG_API void nl_lagg_set_on_connect(nl_lagg_server_t* server, nl_lagg_on_connect_cb cb, void* user_data) {
     if (!server) return;
     server->on_connect = cb;
     server->user_data = user_data;
 }
 
-void nl_lagg_set_on_disconnect(nl_lagg_server_t* server, nl_lagg_on_disconnect_cb cb, void* user_data) {
+NL_LINKAGG_API void nl_lagg_set_on_disconnect(nl_lagg_server_t* server, nl_lagg_on_disconnect_cb cb, void* user_data) {
     if (!server) return;
     server->on_disconnect = cb;
     server->user_data = user_data;

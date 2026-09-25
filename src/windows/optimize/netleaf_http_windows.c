@@ -379,27 +379,37 @@ static void generate_response_http1(nl_http_response_t* resp, char** out, size_t
         if (strcmp(resp->headers[i].name, "Content-Length") == 0) {
             content_len_added = 1;
         }
-        len += _snprintf(buffer + len, initial_size - len, "%s: %s\r\n", 
+        len += snprintf(buffer + len, initial_size - len, "%s: %s\r\n", 
                         resp->headers[i].name, resp->headers[i].value);
-        if ((size_t)len >= initial_size) break;
+        // 累加后校验返回值与剩余空间，防止 size_t 下溢导致越界写
+        if (len < 0 || (size_t)len >= initial_size) break;
     }
     
-    if (!content_len_added && resp->body) {
-        len += _snprintf(buffer + len, initial_size - len, "Content-Length: %zu\r\n", 
+    if (!content_len_added && resp->body && len >= 0 && (size_t)len < initial_size) {
+        len += snprintf(buffer + len, initial_size - len, "Content-Length: %zu\r\n", 
                         resp->body_size);
     }
     
-    len += _snprintf(buffer + len, initial_size - len, "\r\n");
+    if (len >= 0 && (size_t)len < initial_size) {
+        len += snprintf(buffer + len, initial_size - len, "\r\n");
+    }
     
     if (resp->body && resp->body_size > 0) {
-        if ((size_t)len + resp->body_size < initial_size) {
+        if (len >= 0 && (size_t)len + resp->body_size < initial_size) {
             memcpy(buffer + len, resp->body, resp->body_size);
             len += (int)resp->body_size;
         }
     }
     
+    // snprintf 返回的是“理论长度”，头部过多时可能大于实际容量；
+    // 需夹取到实际容量内并保证 out_len <= cap，避免发送侧按 out_len 越界读取
+    if (len < 0) {
+        len = 0;
+    } else if ((size_t)len > initial_size) {
+        len = (int)initial_size;
+    }
     *out = buffer;
-    *out_len = len;
+    *out_len = (size_t)len;
 }
 
 static int hpack_read_varint(const uint8_t* data, size_t len, uint8_t prefix_bits, uint64_t* value, size_t* consumed) {
@@ -695,7 +705,7 @@ static int h2_send_headers(struct nl_http2_connection* conn, struct nl_http2_str
     size_t offset = 0;
     
     char status[8];
-    _snprintf(status, sizeof(status), "%d", resp->status);
+    snprintf(status, sizeof(status), "%d", resp->status);
     offset += hpack_encode_header(&conn->hpack, header_block + offset, sizeof(header_block) - offset, ":status", status);
     
     for (int i = 0; i < resp->header_count; i++) {

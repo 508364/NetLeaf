@@ -22,9 +22,9 @@ extern "C" {
     #define NL_LINKAGG_API
 #endif
 
-#define NL_LINKAGG_VERSION "2.2.1"
+#define NL_LINKAGG_VERSION "2.4.1"
 #define NL_LINKAGG_VERSION_MAJOR 2
-#define NL_LINKAGG_VERSION_MINOR 2
+#define NL_LINKAGG_VERSION_MINOR 4
 #define NL_LINKAGG_VERSION_PATCH 1
 
 // =========================================
@@ -68,6 +68,9 @@ typedef enum {
 // LinkAgg module info structure (defined in implementation)
 NL_LINKAGG_API nl_module_info_t* nl_lagg_get_module_info(void);
 
+// LinkAgg extension entry point (for dynamic loading)
+NL_LINKAGG_API nl_extension_info_t* nl_lagg_get_extension_info(void);
+
 // Check if LinkAgg is available on current platform
 NL_LINKAGG_API int nl_lagg_is_available(void);
 
@@ -91,7 +94,7 @@ typedef enum {
     NL_BACKEND_IPC
 } nl_backend_type_t;
 
-// Opaque server type
+// Opaque server type (full definition in netleaf_linkagg_internal.h)
 typedef struct nl_lagg_server nl_lagg_server_t;
 
 // Callbacks for connection lifecycle

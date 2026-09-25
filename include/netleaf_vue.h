@@ -3,10 +3,13 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "netleaf_module.h"
 
 #ifdef _WIN32
     #ifdef NL_VUE_EXPORTS
         #define NL_VUE_API __declspec(dllexport)
+    #elif defined(NL_VUE_STATIC)
+        #define NL_VUE_API
     #else
         #define NL_VUE_API __declspec(dllimport)
     #endif
@@ -14,18 +17,20 @@
     #define NL_VUE_API
 #endif
 
-#define NL_VUE_VERSION "2.2.2"
+#define NL_VUE_VERSION "2.4.1"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#ifndef NETLEAF_AUTOCOMPLETE_H
 typedef enum {
     NL_VUE_CDN_UNPKG = 0,
     NL_VUE_CDN_CDNJS,
     NL_VUE_CDN_JSDELIVR,
     NL_VUE_CDN_LOCAL
 } nl_vue_cdn_type_t;
+#endif
 
 NL_VUE_API int nl_vue_init(void);
 NL_VUE_API void nl_vue_shutdown(void);
@@ -64,6 +69,12 @@ NL_VUE_API char* nl_vue_add_import(const char* html, size_t html_len,
 // 预制页面（唯一的系统信息页面）
 NL_VUE_API char* nl_vue_generate_sysinfo(const char* title);
 NL_VUE_API char* nl_vue_generate_sysinfo_inline(const char* title, const char* vue_filepath);
+
+// Vue module info (for NL extension system)
+NL_VUE_API nl_module_info_t* nl_vue_get_module_info(void);
+
+// Vue extension entry point (for dynamic loading)
+NL_VUE_API nl_extension_info_t* nl_vue_get_extension_info(void);
 
 #ifdef __cplusplus
 }

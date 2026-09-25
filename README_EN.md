@@ -1,8 +1,14 @@
-<img src="Logo.svg" width="40" height="40" align="left"> 
-
-# NetLeaf v2.2.2
-
-High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.
+<div align="center">
+  <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
+  <h1>NetLeaf</h1>
+  <p>High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.</p>
+  <img src="https://img.shields.io/badge/NetLeaf-v2.4.1-blue?style=for-the-badge" alt="NetLeaf Version">
+  <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
+  <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28.10-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
+  <a href="https://mqttt.com"><img src="https://img.shields.io/badge/MQTT-5.0/3.1.1-yellow?style=for-the-badge" alt="MQTT v5.0/3.1.1"></a>
+  <a href="https://opensource.org/license/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
+  <a href="https://en.cppreference.com/c"><img src="https://img.shields.io/badge/C-99%2F11-red?style=for-the-badge" alt="C Standard"></a>
+</div>
 
 **Platform Support:**
 - ✅ Windows (IOCP) - Full support
@@ -14,6 +20,8 @@ High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HT
 - ✅ **Cross-platform**: Windows / Linux / macOS
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
 - ✅ **Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, TCP, UDP
+- ✅ **TLS/SSL**: Built-in mbedTLS 2.28.10 (LTS), supports TLS 1.0-1.3
+- ✅ **MQTT v5.0**: Full MQTT client with TLS support
 - ✅ **Web Server**: Built-in HTML/Vue.js support with server-side variable replacement
 - ✅ **Data Parsing**: JSON + TOML
 - ✅ **Lazy Loading**: All components support lazy loading
@@ -67,12 +75,14 @@ int main() {
 Download prebuilt libraries from [releases](releases/) or build from source:
 
 ```cmd
-build_all.bat
+REM TLS support is included in the standard build (-DBUILD_TLS=ON, on by default)
+build_all-Clang.bat
 ```
 
 ### Linux/WSL
 
 ```bash
+# TLS support is included (-DBUILD_TLS=ON, on by default)
 chmod +x build_all.sh
 ./build_all.sh
 ```
@@ -148,11 +158,30 @@ MIT License
 
 ## Version
 
-2.2.2
+2.4.1
+
+## Open Source Projects Sources
+
+This project references and integrates the following open source projects:
+
+| Project | Purpose | License | Repository |
+|---------|---------|---------|------------|
+| **mbedTLS** | TLS/SSL encryption library | Apache 2.0 / GPL v2.0 | [Mbed-TLS/mbedTLS](https://github.com/Mbed-TLS/mbedTLS) |
+| **MQTT Specification** | MQTT v5.0 protocol specification | EPL-2.0 / EDL 1.0 | [mqtt.org](https://mqtt.org/) |
+| **Paho MQTT C** | MQTT C client reference implementation | EPL-2.0 / EDL 1.0 | [eclipse/paho.mqtt.c](https://github.com/eclipse/paho.mqtt.c) |
+
+### mbedTLS Integration Notes
+
+This project includes mbedTLS 2.28.10 LTS source code (located in `third-party/mbedtls/`) to provide TLS 1.0 - TLS 1.3 encryption support. mbedTLS 2.28 is the last LTS series that still implements TLS 1.0/1.1 in addition to TLS 1.2/1.3 (mbedTLS 3.x removed TLS 1.0/1.1). The mbedTLS library is built as static libraries as part of the NetLeaf build process and linked against the TLS extension module.
+
+> ⚠️ **Security note (TLS 1.0 / 1.1 are NOT recommended)**
+> TLS 1.0 and TLS 1.1 are deprecated by [RFC 8996](https://www.rfc-editor.org/rfc/rfc8996) and have known weaknesses; **they should not be used in new projects or production**.
+> TLS in NetLeaf is provided by the **separate TLS extension module** (`netleaf_tls`, bundling mbedTLS). TLS 1.0/1.1 are kept only for interoperability with legacy peers —
+> always set `nl_tls_config_t::min_proto` to `NL_TLS_PROTO_TLS1_2` or higher.
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v2.2.2) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v2.4.1) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 
@@ -363,7 +392,7 @@ int main() {
 
 ---
 
-### 6. Lang Module (netleaf_lang)
+### 6. Lang Module (netleaf_lang) - v2.4.0
 
 **Features:**
 - **Multi-language Support**: Unlimited languages (en_us, zh_cn, ja_jp, ko_kr, etc.)
@@ -374,6 +403,9 @@ int main() {
 - **Shared Files**: Multiple libraries can share translation files
 - **Duplicate Detection**: Prevent duplicate error code registration
 - **Async Loading**: Support for asynchronous loading
+- **Variable Substitution**: `{{VAR_NAME}}` template syntax (v2.4.0)
+- **Conditional Expressions**: `== != >= <= > <` operators, numeric & string support (v2.4.0)
+- **Script Engine Callbacks**: Extensible Lua/Python/JS integration via callback API (v2.4.0)
 
 **Platform Support:**
 - ✅ Windows
@@ -387,16 +419,37 @@ int main() {
 int main() {
     // Set language
     nl_lang_set("zh_cn");
-    
+
     // Get error message
     const char* msg = nl_lang_get_error(NL_LIB_LINKAGG, -9);
     // Output: "不接入，ID被占用"
-    
+
     // Switch to English
     nl_lang_set("en_us");
     msg = nl_lang_get_error(NL_LIB_LINKAGG, -9);
     // Output: "ID already in use, not connected"
-    
+
+    // === v2.4.0 New: Variable Substitution ===
+    nl_lang_var_set("user", "Alice");
+    nl_lang_var_set_int("age", 25);
+    nl_lang_var_set_float("price", 3.14);
+    nl_lang_var_set_bool("active", 1);
+
+    char buf[256];
+    nl_lang_var_replace("Hello {{ user }}, age={{ age }}", buf, sizeof(buf));
+    // buf == "Hello Alice, age=25"
+
+    // === v2.4.0 New: Conditional Expressions ===
+    int result = nl_lang_var_condition_eval("age > 18");           // 1 (true)
+    result = nl_lang_var_condition_eval("user == 'Alice'");        // 1 (true)
+    result = nl_lang_var_condition_eval("price >= 3.0");           // 1 (true)
+
+    // === v2.4.0 New: Script Engine Registration ===
+    // nl_script_result_t* my_exec(...) { ... return &result; }
+    // nl_lang_register_script_engine("myscript", my_exec, NULL);
+    // char out[256];
+    // nl_lang_execute_script("myscript", "echo hello", NULL, 0, out, sizeof(out));
+
     return 0;
 }
 ```

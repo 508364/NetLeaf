@@ -33,10 +33,14 @@ static int check_html_has_charset(const char* html, size_t len) {
         const char* tag_start = memchr(p, '<', remaining);
         if (!tag_start) break;
         
-        if (remaining >= 5 && nl_autocomplete_strncasecmp(tag_start + 1, "meta", 4) == 0) {
+        /* 以 tag_start 为基准计算到缓冲区末尾的可用字节数，
+           避免与剩余长度 remaining 混用导致的越界读 */
+        size_t avail = remaining - (size_t)(tag_start - p);
+        if (avail >= 5 && nl_autocomplete_strncasecmp(tag_start + 1, "meta", 4) == 0) {
             const char* meta_end = tag_start + 5;
-            size_t meta_len = remaining - (size_t)(meta_end - tag_start);
-            size_t check_len = meta_len > 100 ? 100 : meta_len;
+            /* 标签名之后可匹配属性的真实长度：min(avail - 5, 100) */
+            size_t attr_len = avail - 5;
+            size_t check_len = attr_len > 100 ? 100 : attr_len;
             
             if (nl_autocomplete_strncasestr(meta_end, "charset", check_len)) return 1;
             if (nl_autocomplete_strncasestr(meta_end, "http-equiv", check_len) && 
@@ -59,10 +63,14 @@ static int check_html_has_viewport(const char* html, size_t len) {
         const char* tag_start = memchr(p, '<', remaining);
         if (!tag_start) break;
         
-        if (remaining >= 5 && nl_autocomplete_strncasecmp(tag_start + 1, "meta", 4) == 0) {
+        /* 以 tag_start 为基准计算到缓冲区末尾的可用字节数，
+           避免与剩余长度 remaining 混用导致的越界读 */
+        size_t avail = remaining - (size_t)(tag_start - p);
+        if (avail >= 5 && nl_autocomplete_strncasecmp(tag_start + 1, "meta", 4) == 0) {
             const char* meta_end = tag_start + 5;
-            size_t meta_len = remaining - (size_t)(meta_end - tag_start);
-            size_t check_len = meta_len > 100 ? 100 : meta_len;
+            /* 标签名之后可匹配属性的真实长度：min(avail - 5, 100) */
+            size_t attr_len = avail - 5;
+            size_t check_len = attr_len > 100 ? 100 : attr_len;
             
             if (nl_autocomplete_strncasestr(meta_end, "viewport", check_len)) return 1;
         }
@@ -114,9 +122,28 @@ char* nl_charset_complete_process(nl_charset_complete_t* ctx, const char* encodi
     char* html_tag = nl_autocomplete_strncasestr(ctx->html, "<html", ctx->html_len);
     
     if (head) {
-        inject = head + 5;
+        // <head> 可能带属性（如 <head class="x">），需定位到标签结束的 '>' 之后再注入，
+        // 否则 meta 会插到属性之前形成非法 HTML
+        char* tag_end = NULL;
+        char* html_end = ctx->html + ctx->html_len;
+        for (char* p = head; p < html_end; p++) {
+            if (*p == '>') {
+                tag_end = p;
+                break;
+            }
+        }
+        inject = tag_end ? tag_end + 1 : head + 5;
     } else if (html_tag) {
-        inject = html_tag + 6;
+        // 同理处理 <html ...> 上的属性
+        char* tag_end = NULL;
+        char* html_end = ctx->html + ctx->html_len;
+        for (char* p = html_tag; p < html_end; p++) {
+            if (*p == '>') {
+                tag_end = p;
+                break;
+            }
+        }
+        inject = tag_end ? tag_end + 1 : html_tag + 6;
     } else {
         inject = ctx->html;
     }

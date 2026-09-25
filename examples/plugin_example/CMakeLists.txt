@@ -1,46 +1,40 @@
-# NetLeaf Dynamic Extension Library Example
-# This demonstrates how third-party developers can create extension libraries
-# that follow NetLeaf's module pattern and support dynamic loading
+cmake_minimum_required(VERSION 3.16)
+project(ExamplePlugin VERSION 1.0.0 LANGUAGES C)
 
-cmake_minimum_required(VERSION 3.10)
-project(netleaf_extension_example)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# NetLeaf root
+set(NETLEAF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 include_directories(
+    ${NETLEAF_ROOT}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
-# Create the extension library
-add_library(netleaf_extension SHARED netleaf_extension_example.c)
+# Plugin sources
+set(PLUGIN_SOURCES
+    example_plugin.c
+)
 
-# Important: Link against the SHARED main library (netleaf.dll)
-# This ensures the extension and main program share the same global state
-if(WIN32)
-    target_compile_definitions(netleaf_extension PRIVATE NL_EXTENSION_EXPORTS)
-    target_link_libraries(netleaf_extension netleaf_shared ws2_32)
-else()
-    target_link_libraries(netleaf_extension netleaf_shared m dl pthread)
-endif()
+# Build as shared library
+add_library(example_plugin SHARED ${PLUGIN_SOURCES})
 
-# Set output name and remove 'lib' prefix on Windows
-set_target_properties(netleaf_extension PROPERTIES
-    OUTPUT_NAME "netleaf_extension"
+set_target_properties(example_plugin PROPERTIES
+    OUTPUT_NAME "example_plugin"
     PREFIX ""
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
-
-# Test program to verify extension loading
-add_executable(test_extension test_extension.c)
 
 if(WIN32)
-    target_link_libraries(test_extension netleaf_shared ws2_32)
-else()
-    target_link_libraries(test_extension netleaf_shared m dl pthread)
+    set_target_properties(example_plugin PROPERTIES SUFFIX ".dll")
 endif()
 
-set_target_properties(test_extension PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+# Export symbols
+target_compile_definitions(example_plugin PRIVATE
+    NL_PLUGIN_EXPORTS
 )
 
-message(STATUS "  - Extension Example v1.0.0 (dynamic loading demo)")
+# Link against NetLeaf if needed
+# target_link_libraries(example_plugin PRIVATE netleaf)
+
+message(STATUS "Building ExamplePlugin v${PROJECT_VERSION}")

@@ -4,6 +4,7 @@
 
 #include "netleaf_autoroute.h"
 #include "netleaf_module.h"
+#include "netleaf_autoroute_lang.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -90,12 +91,27 @@ int nl_autoroute_init(void) {
         g_autoroute_available = 1;
         g_autoroute_enabled = 1;
         g_global_matcher = nl_route_matcher_create();
+        NL_AUTOROUTE_REGISTER_LANG();
     }
     return g_autoroute_available;
 }
 
 const char* nl_autoroute_version(void) {
     return NL_AUTOROUTE_VERSION;
+}
+
+// =========================================
+// Extension Definition (for dynamic loading)
+// =========================================
+
+NL_EXTENSION_DEFINE(autoroute, "AutoRoute", NL_AUTOROUTE_VERSION, "508364",
+    "Automatic route suggestions and matching",
+    "Windows,Linux,MacOS",
+    NL_CAP_THREAD_SAFE,
+    nl_autoroute_init, NULL, nl_autoroute_is_available, nl_autoroute_version);
+
+nl_extension_info_t* nl_autoroute_get_extension_info(void) {
+    return &nl_extension_info_autoroute;
 }
 
 // =========================================
@@ -224,14 +240,22 @@ double nl_route_similarity(const char* path1, const char* path2) {
     
     char tmp1[256], tmp2[256];
     strncpy(tmp1, path1, sizeof(tmp1) - 1);
+    tmp1[sizeof(tmp1) - 1] = '\0';
     strncpy(tmp2, path2, sizeof(tmp2) - 1);
+    tmp2[sizeof(tmp2) - 1] = '\0';
     
     paths1[0] = tmp1;
     paths2[0] = tmp2;
     
+    // 数组可容纳的最大分段索引（保留 1 个元素用于起始段）
+    const int max_seg_idx1 = (int)(sizeof(paths1) / sizeof(paths1[0])) - 1;
+    const int max_seg_idx2 = (int)(sizeof(paths2) / sizeof(paths2[0])) - 1;
+    
     int idx1 = 0, idx2 = 0;
     for (char* p = tmp1; *p; p++) {
         if (*p == '/') {
+            // 分段数达到数组容量上限时停止切分，防止栈越界写
+            if (idx1 >= max_seg_idx1) break;
             *p = '\0';
             idx1++;
             paths1[idx1] = p + 1;
@@ -241,6 +265,8 @@ double nl_route_similarity(const char* path1, const char* path2) {
     
     for (char* p = tmp2; *p; p++) {
         if (*p == '/') {
+            // 分段数达到数组容量上限时停止切分，防止栈越界写
+            if (idx2 >= max_seg_idx2) break;
             *p = '\0';
             idx2++;
             paths2[idx2] = p + 1;
@@ -258,14 +284,18 @@ double nl_route_similarity(const char* path1, const char* path2) {
     if (seg1_count > 0 && seg2_count > 0) {
         int same_prefix = 1;
         int min_common = min_segs;
+        int non_empty_common = 0;
         for (int i = 0; i < min_common; i++) {
-            if (strcmp(paths1[i], paths2[i]) != 0) {
-                same_prefix = 0;
-                break;
+            if (strlen(paths1[i]) > 0 && strlen(paths2[i]) > 0) {
+                non_empty_common++;
+                if (strcmp(paths1[i], paths2[i]) != 0) {
+                    same_prefix = 0;
+                    break;
+                }
             }
         }
-        if (same_prefix) {
-            prefix_bonus = 0.2 * ((double)min_common / (double)max_segs);
+        if (same_prefix && non_empty_common > 0) {
+            prefix_bonus = 0.15 * ((double)non_empty_common / (double)max_segs);
         }
     }
     
@@ -304,6 +334,7 @@ static struct nl_route_node* create_node(const char* segment) {
     if (node) {
         if (segment) {
             strncpy(node->segment, segment, sizeof(node->segment) - 1);
+            node->segment[sizeof(node->segment) - 1] = '\0';
         }
     }
     return node;
@@ -324,6 +355,7 @@ static void add_segment_to_tree(struct nl_route_matcher* matcher, const char* pa
     
     char tmp[512];
     strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
     
     char* segment = tmp;
     char* next;
@@ -381,12 +413,17 @@ static void collect_all_routes(struct nl_route_node* node, char* prefix, char** 
             snprintf(new_prefix, sizeof(new_prefix), "%s/%s", prefix, node->segment);
         } else {
             strncpy(new_prefix, prefix, sizeof(new_prefix) - 1);
+            new_prefix[sizeof(new_prefix) - 1] = '\0';
         }
     }
     
     if (node->is_leaf && new_prefix[0] != '\0') {
-        routes[*count] = strdup(new_prefix);
-        (*count)++;
+        // strdup 可能因内存不足返回 NULL，判空后再写入，避免后续解引用空指针
+        char* dup = strdup(new_prefix);
+        if (dup) {
+            routes[*count] = dup;
+            (*count)++;
+        }
     }
     
     for (int i = 0; i < node->child_count; i++) {
@@ -458,6 +495,12 @@ int nl_route_matcher_get_suggestions(nl_route_matcher_t* matcher, const char* pa
     collect_all_routes(matcher->root, NULL, routes, &count, 256);
     
     for (int i = 0; i < count && i < max_count; i++) {
+        // 防御性判空：跳过无效路由项，避免 strncpy 解引用空指针
+        if (!routes[i]) {
+            suggestions[i].score = 0.0;
+            suggestions[i].path[0] = '\0';
+            continue;
+        }
         suggestions[i].score = nl_route_similarity(path, routes[i]);
         strncpy(suggestions[i].path, routes[i], sizeof(suggestions[i].path) - 1);
         suggestions[i].path[sizeof(suggestions[i].path) - 1] = '\0';

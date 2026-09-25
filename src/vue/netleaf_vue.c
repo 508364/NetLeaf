@@ -3,6 +3,7 @@
 #endif
 
 #include "netleaf_vue.h"
+#include "netleaf_module.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -11,7 +12,7 @@
 #define strdup _strdup
 #endif
 
-static char* g_default_version = "3.4.0";
+static char g_default_version[64] = "3.4.0";
 static nl_vue_cdn_type_t g_default_cdn = NL_VUE_CDN_UNPKG;
 static int g_initialized = 0;
 static char* g_local_vue_path = NULL;
@@ -66,7 +67,7 @@ static char* strcasestr_wrapper(const char* haystack, const char* needle, size_t
         for (size_t j = 0; j < needle_len; j++) {
             char h = haystack[i + j];
             char n = needle[j];
-            if ((h >= 'A' && h <= 'Z') ? h + 32 : h != (n >= 'A' && n <= 'Z') ? n + 32 : n) {
+            if (((h >= 'A' && h <= 'Z') ? h + 32 : h) != ((n >= 'A' && n <= 'Z') ? n + 32 : n)) {
                 match = 0;
                 break;
             }
@@ -104,8 +105,8 @@ const char* nl_vue_version(void) {
 
 void nl_vue_set_default_version(const char* version) {
     if (version) {
-        free(g_default_version);
-        g_default_version = strdup(version);
+        strncpy(g_default_version, version, sizeof(g_default_version) - 1);
+        g_default_version[sizeof(g_default_version) - 1] = '\0';
     }
 }
 
@@ -146,6 +147,11 @@ int nl_vue_load_from_file(const char* filepath) {
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
+    if (fsize < 0) {
+        // ftell 失败时返回 -1，直接报错避免后续 malloc(fsize+1) 越界
+        fclose(fp);
+        return -1;
+    }
     
     if (g_local_vue_content) {
         free(g_local_vue_content);
@@ -284,7 +290,8 @@ char* nl_vue_add_import(const char* html, size_t html_len,
 }
 
 static char* substitute_variables(const char* text, const char** vars, const char** values, int count) {
-    if (!text || !vars || !values || count <= 0) return strdup(text);
+    if (!text) return NULL;
+    if (!vars || !values || count <= 0) return strdup(text);
     
     size_t text_len = strlen(text);
     char* result = malloc(text_len + 1);
@@ -292,6 +299,9 @@ static char* substitute_variables(const char* text, const char** vars, const cha
     strcpy(result, text);
     
     for (int i = 0; i < count; i++) {
+        // vars[i] 为空则跳过；values[i] 为空按空字符串处理，避免解引用空指针
+        if (!vars[i]) continue;
+        const char* value = values[i] ? values[i] : "";
         char placeholder[256];
         snprintf(placeholder, sizeof(placeholder), "{{<var>%s</var>}}", vars[i]);
         
@@ -299,7 +309,7 @@ static char* substitute_variables(const char* text, const char** vars, const cha
         while (found) {
             size_t before_len = found - result;
             size_t after_len = strlen(found + strlen(placeholder));
-            size_t new_len = before_len + strlen(values[i]) + after_len + 1;
+            size_t new_len = before_len + strlen(value) + after_len + 1;
             char* new_result = malloc(new_len);
             if (!new_result) {
                 free(result);
@@ -307,8 +317,8 @@ static char* substitute_variables(const char* text, const char** vars, const cha
             }
             
             memcpy(new_result, result, before_len);
-            memcpy(new_result + before_len, values[i], strlen(values[i]));
-            memcpy(new_result + before_len + strlen(values[i]), found + strlen(placeholder), after_len);
+            memcpy(new_result + before_len, value, strlen(value));
+            memcpy(new_result + before_len + strlen(value), found + strlen(placeholder), after_len);
             new_result[new_len - 1] = '\0';
             
             free(result);
@@ -334,6 +344,11 @@ char* nl_vue_generate_page_inline(const char* vue_code, const char* title, const
         fseek(fp, 0, SEEK_END);
         long fsize = ftell(fp);
         fseek(fp, 0, SEEK_SET);
+        if (fsize < 0) {
+            // ftell 失败时返回 -1，直接报错避免后续 malloc(fsize+1) 越界
+            fclose(fp);
+            return NULL;
+        }
         
         vue_content = malloc(fsize + 1);
         if (!vue_content) {
@@ -341,8 +356,10 @@ char* nl_vue_generate_page_inline(const char* vue_code, const char* title, const
             return NULL;
         }
         
-        fread(vue_content, 1, fsize, fp);
-        vue_content[fsize] = '\0';
+        {
+            size_t _nl_rd = fread(vue_content, 1, fsize, fp);
+            vue_content[_nl_rd] = '\0';
+        }
         fclose(fp);
     } else if (g_local_vue_content) {
         vue_content = strdup(g_local_vue_content);
@@ -396,6 +413,11 @@ char* nl_vue_generate_counter_inline(const char* title, const char* vue_filepath
         fseek(fp, 0, SEEK_END);
         long fsize = ftell(fp);
         fseek(fp, 0, SEEK_SET);
+        if (fsize < 0) {
+            // ftell 失败时返回 -1，直接报错避免后续 malloc(fsize+1) 越界
+            fclose(fp);
+            return NULL;
+        }
         
         vue_content = malloc(fsize + 1);
         if (!vue_content) {
@@ -403,8 +425,10 @@ char* nl_vue_generate_counter_inline(const char* title, const char* vue_filepath
             return NULL;
         }
         
-        fread(vue_content, 1, fsize, fp);
-        vue_content[fsize] = '\0';
+        {
+            size_t _nl_rd = fread(vue_content, 1, fsize, fp);
+            vue_content[_nl_rd] = '\0';
+        }
         fclose(fp);
     } else {
         vue_content = strdup(g_local_vue_content);
@@ -461,6 +485,11 @@ char* nl_vue_generate_dashboard_inline(const char* title, const char* vue_filepa
         fseek(fp, 0, SEEK_END);
         long fsize = ftell(fp);
         fseek(fp, 0, SEEK_SET);
+        if (fsize < 0) {
+            // ftell 失败时返回 -1，直接报错避免后续 malloc(fsize+1) 越界
+            fclose(fp);
+            return NULL;
+        }
         
         vue_content = malloc(fsize + 1);
         if (!vue_content) {
@@ -468,8 +497,10 @@ char* nl_vue_generate_dashboard_inline(const char* title, const char* vue_filepa
             return NULL;
         }
         
-        fread(vue_content, 1, fsize, fp);
-        vue_content[fsize] = '\0';
+        {
+            size_t _nl_rd = fread(vue_content, 1, fsize, fp);
+            vue_content[_nl_rd] = '\0';
+        }
         fclose(fp);
     } else {
         vue_content = strdup(g_local_vue_content);
@@ -507,15 +538,15 @@ char* nl_vue_generate_dashboard_inline(const char* title, const char* vue_filepa
         "  },\n"
         "  template: '<div style=\"display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;\">' +\n"
         "    '<div style=\"background: #f5f5f5; padding: 20px; border-radius: 8px; text-align: center;\">' +\n"
-        "      '<div style=\"font-size: 32px; font-weight: bold; color: #667eea;\">{{ stats.cpu }}%</div>' +\n"
+        "      '<div style=\"font-size: 32px; font-weight: bold; color: #667eea;\">{{ stats.cpu }}%%</div>' +\n"
         "      '<div style=\"color: #666; margin-top: 10px;\">CPU Usage</div>' +\n"
         "    '</div>' +\n"
         "    '<div style=\"background: #f5f5f5; padding: 20px; border-radius: 8px; text-align: center;\">' +\n"
-        "      '<div style=\"font-size: 32px; font-weight: bold; color: #764ba2;\">{{ stats.memory }}%</div>' +\n"
+        "      '<div style=\"font-size: 32px; font-weight: bold; color: #764ba2;\">{{ stats.memory }}%%</div>' +\n"
         "      '<div style=\"color: #666; margin-top: 10px;\">Memory</div>' +\n"
         "    '</div>' +\n"
         "    '<div style=\"background: #f5f5f5; padding: 20px; border-radius: 8px; text-align: center;\">' +\n"
-        "      '<div style=\"font-size: 32px; font-weight: bold; color: #f093fb;\">{{ stats.network }}%</div>' +\n"
+        "      '<div style=\"font-size: 32px; font-weight: bold; color: #f093fb;\">{{ stats.network }}%%</div>' +\n"
         "      '<div style=\"color: #666; margin-top: 10px;\">Network</div>' +\n"
         "    '</div>' +\n"
         "  '</div>'\n"
@@ -795,6 +826,11 @@ char* nl_vue_generate_sysinfo_inline(const char* title, const char* vue_filepath
         fseek(fp, 0, SEEK_END);
         long fsize = ftell(fp);
         fseek(fp, 0, SEEK_SET);
+        if (fsize < 0) {
+            // ftell 失败时返回 -1，直接报错避免后续 malloc(fsize+1) 越界
+            fclose(fp);
+            return NULL;
+        }
         
         vue_content = malloc(fsize + 1);
         if (!vue_content) {
@@ -802,8 +838,10 @@ char* nl_vue_generate_sysinfo_inline(const char* title, const char* vue_filepath
             return NULL;
         }
         
-        fread(vue_content, 1, fsize, fp);
-        vue_content[fsize] = '\0';
+        {
+            size_t _nl_rd = fread(vue_content, 1, fsize, fp);
+            vue_content[_nl_rd] = '\0';
+        }
         fclose(fp);
     } else {
         vue_content = strdup(g_local_vue_content);
@@ -986,3 +1024,43 @@ char* nl_vue_generate_sysinfo_inline(const char* title, const char* vue_filepath
 // 删除旧的预制组件函数
 #if 0
 #endif
+
+// =========================================
+// Vue Module Info (NL Extension System)
+// =========================================
+
+static nl_module_info_t g_vue_module_info = {
+    .type = NL_MODULE_VUE,
+    .name = "vue",
+    .version = NL_VUE_VERSION,
+    .capabilities = NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_ALL | NL_CAP_EXT_SYSTEM,
+    .status = NL_MODULE_STATUS_UNINITIALIZED,
+    .platform_windows = 1,
+    .platform_linux = 1,
+    .platform_macos = 1,
+    .init = nl_vue_init,
+    .shutdown = nl_vue_shutdown,
+    .is_available = nl_vue_is_available,
+    .get_version = nl_vue_version,
+    .description = "Vue.js backend support and HTML generation",
+    .author = "508364",
+    .next = NULL
+};
+
+nl_module_info_t* nl_vue_get_module_info(void) {
+    return &g_vue_module_info;
+}
+
+// =========================================
+// Extension Definition (for dynamic loading)
+// =========================================
+
+NL_EXTENSION_DEFINE(vue, "Vue.js Support", NL_VUE_VERSION, "508364",
+    "Vue.js backend support and HTML generation",
+    "Windows,Linux,MacOS",
+    NL_CAP_THREAD_SAFE,
+    nl_vue_init, nl_vue_shutdown, nl_vue_is_available, nl_vue_version);
+
+nl_extension_info_t* nl_vue_get_extension_info(void) {
+    return &nl_extension_info_vue;
+}

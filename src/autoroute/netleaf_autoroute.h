@@ -24,7 +24,7 @@ extern "C" {
 #ifdef NL_VERSION
 #define NL_AUTOROUTE_VERSION NL_VERSION
 #else
-#define NL_AUTOROUTE_VERSION "2.2.0"
+#define NL_AUTOROUTE_VERSION "2.4.1"
 #endif
 
 // =========================================

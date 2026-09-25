@@ -2,13 +2,12 @@
 #error "This file should only be compiled on Windows"
 #endif
 
+#include "netleaf.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <winnls.h>
-
-#include "netleaf.h"
 
 // 编码模块懒加载状态
 static int g_encoding_module_loaded = 0;

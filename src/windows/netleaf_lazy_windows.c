@@ -1,11 +1,10 @@
 #ifdef _WIN32
 
+#include "netleaf.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
-
-#include "netleaf.h"
 
 static int g_lazy_enabled = 1;
 static unsigned char g_loaded_modules = 0;

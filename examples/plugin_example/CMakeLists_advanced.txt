@@ -1,0 +1,43 @@
+cmake_minimum_required(VERSION 3.16)
+project(AdvancedPluginExample VERSION 1.0.0 LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# NetLeaf root
+set(NETLEAF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+
+include_directories(
+    ${NETLEAF_ROOT}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Plugin sources
+set(PLUGIN_SOURCES
+    advanced_plugin_example.c
+)
+
+# Build as shared library
+add_library(advanced_plugin_example SHARED ${PLUGIN_SOURCES})
+
+set_target_properties(advanced_plugin_example PROPERTIES
+    OUTPUT_NAME "advanced_plugin_example"
+    PREFIX ""
+)
+
+if(WIN32)
+    set_target_properties(advanced_plugin_example PROPERTIES SUFFIX ".dll")
+endif()
+
+# Export symbols
+target_compile_definitions(advanced_plugin_example PRIVATE
+    NL_PLUGIN_EXPORTS
+)
+
+# Link against NetLeaf extensions
+target_link_libraries(advanced_plugin_example PRIVATE
+    netleaf_ipc
+    netleaf_linkagg
+)
+
+message(STATUS "Building AdvancedPluginExample v${PROJECT_VERSION}")

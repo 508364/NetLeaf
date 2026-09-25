@@ -8,14 +8,6 @@
 #include <string.h>
 
 // =========================================
-// External function declarations (implemented in platform files)
-// =========================================
-
-extern void nl_lagg_init_global_mutex(void);
-extern void nl_lagg_mutex_lock(nl_lagg_mutex_t* m);
-extern void nl_lagg_mutex_unlock(nl_lagg_mutex_t* m);
-
-// =========================================
 // Global ID Registry for Conflict Detection
 // =========================================
 
@@ -191,6 +183,20 @@ static nl_module_info_t g_linkagg_module_info = {
 
 nl_module_info_t* nl_lagg_get_module_info(void) {
     return &g_linkagg_module_info;
+}
+
+// =========================================
+// Extension Definition (for dynamic loading)
+// =========================================
+
+NL_EXTENSION_DEFINE(linkagg, "LinkAgg", NL_LINKAGG_VERSION, "508364",
+    "Same-port link aggregation and load balancing",
+    "Windows,Linux",
+    NL_CAP_SERVER | NL_CAP_THREAD_SAFE,
+    NULL, NULL, nl_lagg_is_available, nl_lagg_version);
+
+nl_extension_info_t* nl_lagg_get_extension_info(void) {
+    return &nl_extension_info_linkagg;
 }
 
 // Stub implementations - platform files override these

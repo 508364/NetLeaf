@@ -1,5 +1,6 @@
 #include "netleaf_autocomplete.h"
 #include "netleaf_module.h"
+#include "netleaf_autocomplete_lang.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -89,12 +90,27 @@ int nl_autocomplete_init(void) {
         g_autocomplete_available = 1;
         g_autocomplete_enabled = 1;
         g_feature_mask = NL_AUTOCOMPLETE_FEATURE_ALL;
+        NL_AUTOCOMPLETE_REGISTER_LANG();
     }
     return g_autocomplete_available;
 }
 
 const char* nl_autocomplete_version(void) {
     return NL_AUTOCOMPLETE_VERSION;
+}
+
+// =========================================
+// Extension Definition (for dynamic loading)
+// =========================================
+
+NL_EXTENSION_DEFINE(autocomplete, "AutoComplete", NL_AUTOCOMPLETE_VERSION, "508364",
+    "Auto-completion for charset and Vue imports",
+    "Windows,Linux,MacOS",
+    NL_CAP_THREAD_SAFE,
+    nl_autocomplete_init, NULL, nl_autocomplete_is_available, nl_autocomplete_version);
+
+nl_extension_info_t* nl_autocomplete_get_extension_info(void) {
+    return &nl_extension_info_autocomplete;
 }
 
 // =========================================
@@ -164,9 +180,14 @@ static int nl_autocomplete_tolower(int c) {
 
 int nl_autocomplete_strncasecmp(const char* s1, const char* s2, size_t n) {
     if (n == 0) return 0;
-    while (n-- > 0 && *s1 && *s2) {
-        int diff = nl_autocomplete_tolower((unsigned char)*s1) - nl_autocomplete_tolower((unsigned char)*s2);
+    // 按标准语义逐字符比较：任一方提前结束后，以字符差作为结果返回
+    while (n-- > 0) {
+        int c1 = nl_autocomplete_tolower((unsigned char)*s1);
+        int c2 = nl_autocomplete_tolower((unsigned char)*s2);
+        int diff = c1 - c2;
         if (diff != 0) return diff;
+        // 两串同时到达结束符，视为相等
+        if (c1 == '\0') return 0;
         s1++;
         s2++;
     }

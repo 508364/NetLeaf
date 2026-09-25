@@ -1,54 +1,31 @@
-# Auto-complete module CMakeLists
-# Part of NetLeaf v${PROJECT_VERSION}
-# This module was separated from the main NetLeaf library
+# AutoComplete 扩展模块构建脚本
+# 字符集补全 + Vue 自动导入
+# 目标产物：libnetleaf_autocomplete.dll/.so
 
-set(AUTOCOMPLETE_SOURCES
+message(STATUS "Building autocomplete module...")
+
+add_library(netleaf_autocomplete SHARED
     netleaf_autocomplete.c
     netleaf_charset.c
-    netleaf_vue_import.c
+    netleaf_autocomplete_vue.c
 )
-
-add_library(netleaf_autocomplete STATIC ${AUTOCOMPLETE_SOURCES})
-
-target_include_directories(netleaf_autocomplete PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_SOURCE_DIR}/include
-)
-
-target_compile_definitions(netleaf_autocomplete PUBLIC
-    NL_VERSION="${PROJECT_VERSION}"
-    NL_PLATFORM_${PLATFORM_NAME}
-    NL_AUTOCOMPLETE_STATIC
-)
-
-target_link_libraries(netleaf_autocomplete PUBLIC
-    ${LINK_LIBS}
-)
-
 set_target_properties(netleaf_autocomplete PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME "netleaf_autocomplete"
-    VERSION ${PROJECT_VERSION}
-    SOVERSION ${PROJECT_VERSION_MAJOR}
 )
-
-# Create shared version as well
-add_library(netleaf_autocomplete_shared SHARED ${AUTOCOMPLETE_SOURCES})
-target_compile_definitions(netleaf_autocomplete_shared PRIVATE 
-    NL_AUTOCOMPLETE_EXPORTS
-    NL_VERSION="${PROJECT_VERSION}"
-    NL_PLATFORM_${PLATFORM_NAME}
-)
-target_include_directories(netleaf_autocomplete_shared PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
+target_include_directories(netleaf_autocomplete PUBLIC
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(netleaf_autocomplete_shared PUBLIC ${LINK_LIBS})
-set_target_properties(netleaf_autocomplete_shared PROPERTIES
-    OUTPUT_NAME "netleaf_autocomplete"
-    VERSION ${PROJECT_VERSION}
-    SOVERSION ${PROJECT_VERSION_MAJOR}
-)
+target_compile_definitions(netleaf_autocomplete PRIVATE NL_AUTOCOMPLETE_EXPORTS)
+target_link_libraries(netleaf_autocomplete PUBLIC netleaf_core netleaf_lang netleaf_vue)
 
-message(STATUS "  - Autocomplete v${PROJECT_VERSION} (charset/Vue auto-complete)")
+# 安装规则
+install(TARGETS netleaf_autocomplete
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+install(FILES ${CMAKE_SOURCE_DIR}/include/netleaf_autocomplete.h
+    DESTINATION include
+)

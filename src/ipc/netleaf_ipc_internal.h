@@ -12,7 +12,6 @@
 #endif
 
 // IPC server structure (matches public typedef)
-typedef struct nl_ipc nl_ipc_t;
 struct nl_ipc {
 #ifdef _WIN32
     HANDLE pipe_handle;
@@ -25,7 +24,6 @@ struct nl_ipc {
 };
 
 // IPC connection structure
-typedef struct nl_ipc_conn nl_ipc_conn_t;
 struct nl_ipc_conn {
 #ifdef _WIN32
     HANDLE pipe_handle;

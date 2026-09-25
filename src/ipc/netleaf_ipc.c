@@ -1,12 +1,19 @@
 #include "netleaf_ipc.h"
 #include "netleaf_ipc_internal.h"
 #include "netleaf_module.h"
+#include "netleaf_ipc_lang.h"
 #include <string.h>
 #include <ctype.h>
 
 // Module state
 static int g_ipc_enabled = 0;
 static int g_ipc_available = 0;
+
+// Language (error code) registration for the IPC module
+static int ipc_module_init(void) {
+    NL_IPC_REGISTER_LANG();
+    return 0;
+}
 
 // Module info structure
 static nl_module_info_t g_ipc_module_info = {
@@ -18,7 +25,7 @@ static nl_module_info_t g_ipc_module_info = {
     .platform_windows = 1,
     .platform_linux = 1,
     .platform_macos = 0,
-    .init = NULL,
+    .init = ipc_module_init,
     .shutdown = NULL,
     .is_available = nl_ipc_is_available,
     .get_version = nl_ipc_version,
@@ -75,4 +82,18 @@ int nl_ipc_is_available(void) {
 
 const char* nl_ipc_version(void) {
     return NL_IPC_VERSION;
+}
+
+// =========================================
+// Extension Definition (for dynamic loading)
+// =========================================
+
+NL_EXTENSION_DEFINE(ipc, "IPC Communication", NL_IPC_VERSION, "508364",
+    "Inter-process communication (Named Pipe/Unix Socket)",
+    "Windows,Linux",
+    NL_CAP_SERVER | NL_CAP_CLIENT | NL_CAP_THREAD_SAFE,
+    NULL, NULL, nl_ipc_is_available, nl_ipc_version);
+
+nl_extension_info_t* nl_ipc_get_extension_info(void) {
+    return &nl_extension_info_ipc;
 }

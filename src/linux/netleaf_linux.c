@@ -231,9 +231,63 @@ static int set_broadcast(int fd, int enable) {
     return setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
 }
 
+static void parse_http_request(const char* data, size_t len,
+                               char* path, size_t path_size,
+                               nl_http_method_t* method,
+                               const char** body, size_t* body_size) {
+    if (!data || len == 0) return;
+
+    // Find end of headers (double CRLF)
+    const char* header_end = memmem(data, len, "\r\n\r\n", 4);
+    if (!header_end) header_end = memmem(data, len, "\n\n", 2);
+    if (!header_end) header_end = data + len;
+
+    // Parse first line: METHOD PATH VERSION
+    size_t header_len = (size_t)(header_end - data);
+    char* line = (char*)malloc(header_len + 1);
+    if (!line) return;
+    memcpy(line, data, header_len);
+    line[header_len] = '\0';
+
+    char* space1 = strchr(line, ' ');
+    char* space2 = space1 ? strchr(space1 + 1, ' ') : NULL;
+
+    if (space1 && space2) {
+        *space1 = '\0';
+        *space2 = '\0';
+
+        // Parse method
+        if (strncmp(line, "GET", 3) == 0) *method = NL_METHOD_GET;
+        else if (strncmp(line, "POST", 4) == 0) *method = NL_METHOD_POST;
+        else if (strncmp(line, "PUT", 3) == 0) *method = NL_METHOD_PUT;
+        else if (strncmp(line, "DELETE", 6) == 0) *method = NL_METHOD_DELETE;
+        else *method = NL_METHOD_GET;
+
+        // Parse path
+        strncpy(path, space1 + 1, path_size - 1);
+        path[path_size - 1] = '\0';
+
+        // Body starts after headers
+        size_t body_start = (size_t)(header_end - data) + 4; // skip \r\n\r\n
+        if (body_start < len) {
+            *body_size = len - body_start;
+            *body = data + body_start;
+        } else {
+            *body_size = 0;
+            *body = NULL;
+        }
+    } else {
+        *method = NL_METHOD_GET;
+        *body_size = 0;
+        *body = NULL;
+    }
+
+    free(line);
+}
+
 static void* server_thread(void* arg) {
     nl_server_t* server = (nl_server_t*)arg;
-    
+
     while (server->running) {
         int nfds = epoll_wait(server->epoll_fd, server->events, MAX_EVENTS, 100);
         if (nfds == -1) {
@@ -256,8 +310,7 @@ static void* server_thread(void* arg) {
                         if (len > 0) {
                             char addr_str[INET_ADDRSTRLEN];
                             inet_ntop(AF_INET, &addr.sin_addr, addr_str, sizeof(addr_str));
-                            server->udp_handler(buf, (size_t)len, addr_str, 
-                                              ntohs(addr.sin_port), server->user_data);
+                            server->udp_handler(buf, (size_t)len, server->user_data);
                         }
                     }
                 } else {
@@ -304,10 +357,22 @@ static void* server_thread(void* arg) {
                     
                     // Process request if we got data
                     if (nl_buffer_size(req) > 0) {
-                        server->handler(req, resp, server->user_data);
+                        char path[1024] = {0};
+                        nl_http_method_t method = NL_METHOD_GET;
+                        const char* body = NULL;
+                        size_t body_size = 0;
                         
-                        if (nl_buffer_size(resp) > 0) {
-                            (void)write(fd, resp->data, nl_buffer_size(resp));
+                        parse_http_request(req->data, nl_buffer_size(req),
+                                          path, sizeof(path), &method, &body, &body_size);
+                        
+                        char* response = NULL;
+                        size_t response_len = 0;
+                        
+                        server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
+                        
+                        if (response && response_len > 0) {
+                            if (write(fd, response, response_len) < 0) { /* best-effort */ }
+                            free(response);
                         }
                     }
                     
@@ -1010,7 +1075,11 @@ static int is_path_safe(const char* base_dir, const char* filepath) {
     if (realpath(base_dir, normalized_base) == NULL) return 0;
     if (realpath(filepath, normalized_file) == NULL) return 0;
     
-    return strncmp(normalized_file, normalized_base, strlen(normalized_base)) == 0;
+    // 目录边界校验：前缀相同还需下一字符为路径结束或 '/'，避免 /base 误匹配 /baseXXX
+    size_t base_len = strlen(normalized_base);
+    if (strncmp(normalized_file, normalized_base, base_len) != 0) return 0;
+    if (base_len > 0 && normalized_base[base_len - 1] == '/') return 1;
+    return normalized_file[base_len] == '\0' || normalized_file[base_len] == '/';
 }
 
 static int send_http_response(int client, const char* content_type, const char* content, size_t content_len) {
@@ -1243,8 +1312,6 @@ int nl_file_server_start(nl_file_server_t* server) {
     
     server->running = 1;
     pthread_create(&server->thread, NULL, file_server_thread, server);
-    
-    printf("File server started on port %d, serving %s\n", server->port, server->directory);
     return 0;
 }
 
@@ -1259,8 +1326,6 @@ void nl_file_server_stop(nl_file_server_t* server) {
         close(server->sock);
         server->sock = -1;
     }
-    
-    printf("File server stopped\n");
 }
 
 void nl_file_server_set_index(nl_file_server_t* server, const char* index_file) {
@@ -1529,7 +1594,6 @@ int nl_router_serve(nl_router_t* router, int port) {
     pthread_create(&rs->thread, NULL, router_server_thread, rs);
     
     g_router_server = rs;
-    printf("Router server started on port %d\n", port);
     return 0;
 }
 
@@ -1544,7 +1608,7 @@ static void default_server_handler(const char* path, nl_http_method_t method,
     if (g_default_handler) {
         g_default_handler(path, method, body, body_size, response, response_size, g_default_handler_data);
     } else {
-        const char* default_resp = "{\"message\":\"NetLeaf v2.0.0\"}";
+        const char* default_resp = "{\"message\":\"NetLeaf v2.4.0\"}";
         *response_size = strlen(default_resp);
         *response = (char*)malloc(*response_size + 1);
         if (*response) {
@@ -1679,7 +1743,7 @@ static void* web_server_thread(void* arg) {
                         "Connection: close\r\n"
                         "\r\n",
                         route->redirect_url);
-                    (void)write(client, redirect_response, strlen(redirect_response));
+                    if (write(client, redirect_response, strlen(redirect_response)) < 0) { /* best-effort */ }
                     close(client);
                     goto next_conn;
                 }
@@ -1843,8 +1907,6 @@ int nl_web_start(nl_web_server_t* server) {
     
     server->running = 1;
     pthread_create(&server->thread, NULL, web_server_thread, server);
-    
-    printf("Web server started on port %d\n", server->port);
     return 0;
 }
 
@@ -1861,12 +1923,12 @@ void nl_web_stop(nl_web_server_t* server) {
         close(server->sock);
         server->sock = -1;
     }
-    
-    printf("Web server stopped\n");
 }
 
 static void add_web_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type) {
     if (!server || !path || !content) return;
+    // content_type 为空时给出默认类型，避免后续 strncpy 解引用空指针
+    const char* ctype = content_type ? content_type : "application/octet-stream";
     
     pthread_mutex_lock(&server->mutex);
     nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
@@ -1878,7 +1940,7 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
         if (route->content) {
             strcpy(route->content, content);
         }
-        strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
+        strncpy(route->content_type, ctype, sizeof(route->content_type) - 1);
         route->content_type[sizeof(route->content_type) - 1] = '\0';
         route->type = NL_ROUTE_TYPE_CONTENT;  // Default: static content
         route->file_path[0] = '\0';
@@ -1923,20 +1985,57 @@ void nl_web_set_encoding(nl_web_server_t* server, const char* encoding) {
 }
 
 static char* substitute_variables(const char* template, const char** vars, const char** values, int count) {
-    if (!template || !vars || !values || count <= 0) {
+    if (!template) {
+        // template 为空指针时直接返回空字符串，避免 strlen(NULL)
+        char* result = (char*)malloc(1);
+        if (result) result[0] = '\0';
+        return result;
+    }
+    if (!vars || !values || count <= 0) {
         char* result = (char*)malloc(strlen(template) + 1);
         if (result) strcpy(result, template);
         return result;
     }
     
-    size_t result_size = strlen(template) * 2;
-    char* result = (char*)malloc(result_size);
+    // 第一遍：完整扫描模板，精确计算替换后所需总长度。
+    // 旧实现仅保证“当前替换点”装得下，未给替换点之后的字面量预留空间，
+    // 且逐字符拷贝分支无边界检查，故改为先扫描计算总长再一次性分配。
+    size_t total_len = 0;
+    const char* scan = template;
+    while (*scan) {
+        if (strncmp(scan, "{{<var>", 7) == 0) {
+            const char* var_start = scan + 7;
+            const char* var_end = strstr(var_start, "</var>}}");
+            if (var_end) {
+                size_t var_len = var_end - var_start;
+                char var_name[256];
+                if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
+                strncpy(var_name, var_start, var_len);
+                var_name[var_len] = '\0';
+                const char* replacement = "";
+                for (int i = 0; i < count; i++) {
+                    if (strcmp(vars[i], var_name) == 0) {
+                        replacement = values[i] ? values[i] : "";
+                        break;
+                    }
+                }
+                total_len += strlen(replacement);
+                scan = var_end + 8;
+                continue;
+            }
+        }
+        total_len++;
+        scan++;
+    }
+    
+    // 一次性分配精确容量（+1 存放结尾 '\0'），从根本上杜绝堆越界
+    char* result = (char*)malloc(total_len + 1);
     if (!result) return NULL;
     
+    // 第二遍：按同样规则拷贝，逐字符分支同样受剩余容量约束
     char* ptr = result;
     const char* src = template;
-    *ptr = '\0';
-    
+    size_t remaining = total_len;
     while (*src) {
         if (strncmp(src, "{{<var>", 7) == 0) {
             const char* var_start = src + 7;
@@ -1947,41 +2046,29 @@ static char* substitute_variables(const char* template, const char** vars, const
                 if (var_len >= sizeof(var_name)) var_len = sizeof(var_name) - 1;
                 strncpy(var_name, var_start, var_len);
                 var_name[var_len] = '\0';
-                
-                const char* replacement = NULL;
+                const char* replacement = "";
                 for (int i = 0; i < count; i++) {
                     if (strcmp(vars[i], var_name) == 0) {
-                        replacement = values[i];
+                        replacement = values[i] ? values[i] : "";
                         break;
                     }
                 }
-                
-                if (replacement) {
-                    size_t rep_len = strlen(replacement);
-                    size_t current_len = strlen(result);
-                    if (current_len + rep_len + 1 > result_size) {
-                        result_size *= 2;
-                        char* new_result = (char*)realloc(result, result_size);
-                        if (!new_result) {
-                            free(result);
-                            return NULL;
-                        }
-                        result = new_result;
-                        ptr = result + current_len;
-                    }
-                    strcpy(ptr, replacement);
+                size_t rep_len = strlen(replacement);
+                if (rep_len > remaining) rep_len = remaining;
+                if (rep_len > 0) {
+                    memcpy(ptr, replacement, rep_len);
                     ptr += rep_len;
+                    remaining -= rep_len;
                 }
-                
                 src = var_end + 8;
                 continue;
             }
         }
-        
+        if (remaining == 0) break;
         *ptr++ = *src++;
-        *ptr = '\0';
+        remaining--;
     }
-    
+    *ptr = '\0';
     return result;
 }
 
@@ -2351,405 +2438,6 @@ void nl_web_set_auto_cleanup(int enable) {
     g_auto_cleanup_enabled = enable;
 }
 
-void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* title) {
-    char html[32768];
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html>\n"
-        "<html><head><title>%s</title>\n"
-        "%s"
-        "%s"
-        "</head><body>\n"
-        "<div class=\"container\" id=\"app\">\n"
-        "  <h1>{{ title }}</h1>\n"
-        "  <div class=\"counter\">{{ count }}</div>\n"
-        "  <div style=\"text-align:center;\">\n"
-        "    <button class=\"btn\" @click=\"count++\">+ Increment</button>\n"
-        "    <button class=\"btn\" @click=\"count--\">- Decrement</button>\n"
-        "    <button class=\"btn\" @click=\"count = 0\">Reset</button>\n"
-        "  </div>\n"
-        "</div>\n"
-        "<script>\n"
-        "const { createApp, ref } = Vue;\n"
-        "createApp({\n"
-        "  setup() {\n"
-        "    const count = ref(0);\n"
-        "    const title = ref('%s');\n"
-        "    return { count, title };\n"
-        "  }\n"
-        "}).mount('#app');\n"
-        "</script>\n"
-        "</body></html>",
-        title, nl_responsive_css, nl_vue_cdn, title);
-    add_web_route(server, path, html, "text/html");
-}
-
-void nl_web_add_dashboard(nl_web_server_t* server, const char* path, const char* title) {
-    char html[65536];
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html>\n"
-        "<html><head><title>%s</title>\n"
-        "%s"
-        "%s"
-        "</head><body>\n"
-        "<div class=\"container\" id=\"app\">\n"
-        "  <h1>{{ title }}</h1>\n"
-        "  <div class=\"grid\">\n"
-        "    <div class=\"stat\">\n"
-        "      <div class=\"stat-value\">{{ stats.users }}</div>\n"
-        "      <div class=\"stat-label\">Active Users</div>\n"
-        "    </div>\n"
-        "    <div class=\"stat\">\n"
-        "      <div class=\"stat-value\">{{ stats.orders }}</div>\n"
-        "      <div class=\"stat-label\">Orders</div>\n"
-        "    </div>\n"
-        "    <div class=\"stat\">\n"
-        "      <div class=\"stat-value\">{{ stats.revenue }}</div>\n"
-        "      <div class=\"stat-label\">Revenue</div>\n"
-        "    </div>\n"
-        "    <div class=\"stat\">\n"
-        "      <div class=\"stat-value\">{{ stats.uptime }}h</div>\n"
-        "      <div class=\"stat-label\">Uptime</div>\n"
-        "    </div>\n"
-        "  </div>\n"
-        "  <div class=\"card\">\n"
-        "    <h3 style=\"margin-bottom:16px;color:#2d3748;\">Recent Activity</h3>\n"
-        "    <div v-for=\"(item, i) in activities\" :key=\"i\" class=\"card\" style=\"margin:8px 0;background:white;\">\n"
-        "      <div style=\"color:#667eea;font-weight:600;\">{{ item.name }}</div>\n"
-        "      <div style=\"color:#718096;font-size:0.9rem;\">{{ item.time }}</div>\n"
-        "    </div>\n"
-        "  </div>\n"
-        "  <div style=\"text-align:center;margin-top:24px;\">\n"
-        "    <button class=\"btn\" @click=\"refresh\">🔄 Refresh</button>\n"
-        "  </div>\n"
-        "</div>\n"
-        "<script>\n"
-        "const { createApp, reactive, onMounted } = Vue;\n"
-        "createApp({\n"
-        "  setup() {\n"
-        "    const title = ref('%s');\n"
-        "    const stats = reactive({ users: 0, orders: 0, revenue: '$0', uptime: 0 });\n"
-        "    const activities = reactive([]);\n"
-        "    \n"
-        "    const refresh = () => {\n"
-        "      stats.users = Math.floor(Math.random() * 1000) + 100;\n"
-        "      stats.orders = Math.floor(Math.random() * 500) + 50;\n"
-        "      stats.revenue = '$' + (Math.random() * 10000).toFixed(0);\n"
-        "      stats.uptime = (stats.uptime || 0) + 1;\n"
-        "      \n"
-        "      const names = ['User login', 'Order placed', 'Payment received', 'New signup'];\n"
-        "      const times = ['Just now', '1 min ago', '2 min ago', '5 min ago'];\n"
-        "      activities.splice(0, activities.length);\n"
-        "      for (let i = 0; i < 4; i++) {\n"
-        "        activities.push({ name: names[i], time: times[i] });\n"
-        "      }\n"
-        "    };\n"
-        "    \n"
-        "    onMounted(refresh);\n"
-        "    return { title, stats, activities, refresh };\n"
-        "  }\n"
-        "}).mount('#app');\n"
-        "</script>\n"
-        "</body></html>",
-        title, nl_responsive_css, nl_vue_cdn, title);
-    add_web_route(server, path, html, "text/html");
-}
-
-void nl_web_add_form(nl_web_server_t* server, const char* path, const char* title, const char** fields, int field_count) {
-    char html[32768];
-    char fields_html[4096] = "";
-    
-    for (int i = 0; i < field_count && i < 10; i++) {
-        char field[512];
-        snprintf(field, sizeof(field),
-            "<div>\n"
-            "  <label style=\"display:block;margin:8px 0 4px;color:#4a5568;font-weight:600;\">%s</label>\n"
-            "  <input v-model=\"form.%s\" />\n"
-            "</div>\n",
-            fields[i], fields[i]);
-        strncat(fields_html, field, sizeof(fields_html) - strlen(fields_html) - 1);
-    }
-    
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html>\n"
-        "<html><head><title>%s</title>\n"
-        "%s"
-        "%s"
-        "</head><body>\n"
-        "<div class=\"container\" id=\"app\">\n"
-        "  <h1>{{ title }}</h1>\n"
-        "  <div class=\"card\">\n"
-        "    <form @submit.prevent=\"submit\">\n"
-        "%s"
-        "      <button class=\"btn\" type=\"submit\" style=\"width:100%%;margin-top:16px;\">Submit</button>\n"
-        "    </form>\n"
-        "  </div>\n"
-        "  <div v-if=\"submitted\" class=\"card\" style=\"background:#c6f6d5;border-left-color:#48bb78;\">\n"
-        "    <h3 style=\"color:#22543d;\">✓ Submitted!</h3>\n"
-        "    <pre style=\"margin-top:12px;background:white;padding:12px;border-radius:8px;\">{{ JSON.stringify(form, null, 2) }}</pre>\n"
-        "  </div>\n"
-        "</div>\n"
-        "<script>\n"
-        "const { createApp, reactive, ref } = Vue;\n"
-        "createApp({\n"
-        "  setup() {\n"
-        "    const title = ref('%s');\n"
-        "    const submitted = ref(false);\n"
-        "    const form = reactive({});\n"
-        "    \n"
-        "    const submit = () => {\n"
-        "      submitted.value = true;\n"
-        "      console.log('Form submitted:', form);\n"
-        "    };\n"
-        "    \n"
-        "    return { title, form, submitted, submit };\n"
-        "  }\n"
-        "}).mount('#app');\n"
-        "</script>\n"
-        "</body></html>",
-        title, nl_responsive_css, nl_vue_cdn, fields_html, title);
-    add_web_route(server, path, html, "text/html");
-}
-
-int nl_serve_html(int port, const char* html) {
-    nl_web_server_t* server = nl_web_create(port);
-    if (!server) return -1;
-    nl_web_add_html(server, "/", html);
-    return nl_web_start(server);
-}
-
-int nl_serve_vue(int port, const char* vue_code) {
-    nl_web_server_t* server = nl_web_create(port);
-    if (!server) return -1;
-    nl_web_add_vue(server, "/", vue_code);
-    return nl_web_start(server);
-}
-
-int nl_serve_dashboard(int port, const char* title) {
-    nl_web_server_t* server = nl_web_create(port);
-    if (!server) return -1;
-    nl_web_add_dashboard(server, "/", title);
-    return nl_web_start(server);
-}
-
-void nl_web_add_todo(nl_web_server_t* server, const char* path, const char* title) {
-    char html[65536];
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html>\n"
-        "<html>\n"
-        "<head>\n"
-        "  <title>%s</title>\n"
-        "%s"
-        "%s"
-        "</head>\n"
-        "<body>\n"
-        "  <div class=\"container\" id=\"app\">\n"
-        "    <h1>{{ title }}</h1>\n"
-        "    <div style=\"display:flex;gap:8px;margin:24px 0;\">\n"
-        "      <input v-model=\"newTodo\" @keyup.enter=\"addTodo\" placeholder=\"添加新任务...\" style=\"flex:1;\" />\n"
-        "      <button class=\"btn\" @click=\"addTodo\">添加</button>\n"
-        "    </div>\n"
-        "    <div v-if=\"todos.length === 0\" style=\"text-align:center;padding:40px;color:#888;\">\n"
-        "      暂无任务，添加第一个吧！\n"
-        "    </div>\n"
-        "    <div class=\"card\" v-for=\"(todo, index) in todos\" :key=\"index\" style=\"display:flex;justify-content:space-between;align-items:center;\">\n"
-        "      <span :style=\"{textDecoration: todo.done ? 'line-through' : 'none', color: todo.done ? '#888' : 'inherit'}\">\n"
-        "        {{ todo.text }}\n"
-        "      </span>\n"
-        "      <div>\n"
-        "        <button @click=\"toggleTodo(index)\" style=\"padding:8px 16px;border:none;background:transparent;cursor:pointer;font-size:18px;\">\n"
-        "          {{ todo.done ? '↩️' : '✅' }}\n"
-        "        </button>\n"
-        "        <button @click=\"deleteTodo(index)\" style=\"padding:8px 16px;border:none;background:transparent;cursor:pointer;font-size:18px;\">\n"
-        "          🗑️\n"
-        "        </button>\n"
-        "      </div>\n"
-        "    </div>\n"
-        "    <div style=\"margin-top:24px;text-align:center;color:#667eea;font-weight:600;\">\n"
-        "      已完成: {{ doneCount }} / {{ todos.length }}\n"
-        "    </div>\n"
-        "  </div>\n"
-        "  <script>\n"
-        "  const { createApp, ref, computed } = Vue;\n"
-        "  createApp({\n"
-        "    setup() {\n"
-        "      const title = ref('%s');\n"
-        "      const newTodo = ref('');\n"
-        "      const todos = ref([\n"
-        "        { text: '学习NetLeaf', done: false },\n"
-        "        { text: '创建Web服务器', done: true },\n"
-        "        { text: '部署应用', done: false }\n"
-        "      ]);\n"
-        "      const doneCount = computed(() => todos.value.filter(t => t.done).length);\n"
-        "      \n"
-        "      const addTodo = () => {\n"
-        "        if (newTodo.value.trim()) {\n"
-        "          todos.value.push({ text: newTodo.value.trim(), done: false });\n"
-        "          newTodo.value = '';\n"
-        "        }\n"
-        "      };\n"
-        "      \n"
-        "      const toggleTodo = (index) => {\n"
-        "        todos.value[index].done = !todos.value[index].done;\n"
-        "      };\n"
-        "      \n"
-        "      const deleteTodo = (index) => {\n"
-        "        todos.value.splice(index, 1);\n"
-        "      };\n"
-        "      \n"
-        "      return { title, newTodo, todos, doneCount, addTodo, toggleTodo, deleteTodo };\n"
-        "    }\n"
-        "  }).mount('#app');\n"
-        "  </script>\n"
-        "</body>\n"
-        "</html>",
-        title, nl_responsive_css, nl_vue_cdn, title);
-    add_web_route(server, path, html, "text/html");
-}
-
-void nl_web_add_chat(nl_web_server_t* server, const char* path, const char* title) {
-    char html[65536];
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html>\n"
-        "<html>\n"
-        "<head>\n"
-        "  <title>%s</title>\n"
-        "%s"
-        "%s"
-        "<style>\n"
-        "  .message { padding:12px 16px;border-radius:16px;margin:8px 0;max-width:70%%; }\n"
-        "  .user { background:#667eea;color:white;margin-left:auto; }\n"
-        "  .bot { background:#f0f0f0;color:#333;margin-right:auto; }\n"
-        "  .chat-container { height:400px;overflow-y:auto;border:2px solid #f0f0f0;border-radius:12px;padding:16px;margin:16px 0; }\n"
-        "</style>\n"
-        "</head>\n"
-        "<body>\n"
-        "  <div class=\"container\" id=\"app\">\n"
-        "    <h1>{{ title }}</h1>\n"
-        "    <div class=\"chat-container\">\n"
-        "      <div v-for=\"(msg, index) in messages\" :key=\"index\" class=\"message\" :class=\"msg.sender\">\n"
-        "        {{ msg.text }}\n"
-        "      </div>\n"
-        "    </div>\n"
-        "    <div style=\"display:flex;gap:8px;\">\n"
-        "      <input v-model=\"newMessage\" @keyup.enter=\"sendMessage\" placeholder=\"输入消息...\" style=\"flex:1;\" />\n"
-        "      <button class=\"btn\" @click=\"sendMessage\">发送</button>\n"
-        "    </div>\n"
-        "  </div>\n"
-        "  <script>\n"
-        "  const { createApp, ref } = Vue;\n"
-        "  createApp({\n"
-        "    setup() {\n"
-        "      const title = ref('%s');\n"
-        "      const newMessage = ref('');\n"
-        "      const messages = ref([\n"
-        "        { sender: 'bot', text: '你好！我是NetLeaf聊天助手，有什么可以帮你的吗？' },\n"
-        "        { sender: 'user', text: '你好！NetLeaf是什么？' },\n"
-        "        { sender: 'bot', text: 'NetLeaf是一个高性能的网络库，支持TCP/UDP/HTTP和Web服务器！' }\n"
-        "      ]);\n"
-        "      \n"
-        "      const botReplies = [\n"
-        "        '好的，明白了！', '很有意思！', '继续说...', '太棒了！', '我同意！',\n"
-        "        '让我想想...', '这个问题很棒！', '没问题！', '好的，我明白了。', '继续！'\n"
-        "      ];\n"
-        "      \n"
-        "      const sendMessage = () => {\n"
-        "        if (newMessage.value.trim()) {\n"
-        "          messages.value.push({ sender: 'user', text: newMessage.value });\n"
-        "          const userText = newMessage.value;\n"
-        "          newMessage.value = '';\n"
-        "          \n"
-        "          setTimeout(() => {\n"
-        "            const reply = botReplies[Math.floor(Math.random() * botReplies.length)];\n"
-        "            messages.value.push({ sender: 'bot', text: reply });\n"
-        "          }, 500);\n"
-        "        }\n"
-        "      };\n"
-        "      \n"
-        "      return { title, newMessage, messages, sendMessage };\n"
-        "    }\n"
-        "  }).mount('#app');\n"
-        "  </script>\n"
-        "</body>\n"
-        "</html>",
-        title, nl_responsive_css, nl_vue_cdn, title);
-    add_web_route(server, path, html, "text/html");
-}
-
-void nl_web_add_gallery(nl_web_server_t* server, const char* path, const char* title, const char** image_urls, int count) {
-    char html[65536];
-    char images_str[32768] = "";
-    
-    for (int i = 0; i < count && i < 10; i++) {
-        char img[512];
-        snprintf(img, sizeof(img),
-            "'%s',", image_urls[i]);
-        strncat(images_str, img, sizeof(images_str) - strlen(images_str) - 1);
-    }
-    
-    snprintf(html, sizeof(html),
-        "<!DOCTYPE html>\n"
-        "<html>\n"
-        "<head>\n"
-        "  <title>%s</title>\n"
-        "%s"
-        "%s"
-        "<style>\n"
-        "  .gallery { display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin:24px 0; }\n"
-        "  .gallery-item { border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.1);cursor:pointer;transition:transform 0.2s; }\n"
-        "  .gallery-item:hover { transform:scale(1.05); }\n"
-        "  .gallery-item img { width:100%%;height:200px;object-fit:cover; }\n"
-        "  .lightbox { position:fixed;top:0;left:0;width:100%%;height:100%%;background:rgba(0,0,0,0.9);display:flex;align-items:center;justify-content:center;z-index:1000;cursor:pointer; }\n"
-        "  .lightbox img { max-width:90%%;max-height:90%%;border-radius:8px; }\n"
-        "</style>\n"
-        "</head>\n"
-        "<body>\n"
-        "  <div class=\"container\" id=\"app\">\n"
-        "    <h1>{{ title }}</h1>\n"
-        "    <div class=\"gallery\">\n"
-        "      <div v-for=\"(img, index) in images\" :key=\"index\" class=\"gallery-item\" @click=\"showLightbox(index)\">\n"
-        "        <img :src=\"img\" />\n"
-        "      </div>\n"
-        "    </div>\n"
-        "    <div v-if=\"lightboxIndex !== null\" class=\"lightbox\" @click=\"lightboxIndex = null\">\n"
-        "      <img :src=\"images[lightboxIndex]\" />\n"
-        "    </div>\n"
-        "  </div>\n"
-        "  <script>\n"
-        "  const { createApp, ref } = Vue;\n"
-        "  createApp({\n"
-        "    setup() {\n"
-        "      const title = ref('%s');\n"
-        "      const lightboxIndex = ref(null);\n"
-        "      const images = ref([%s]);\n"
-        "      \n"
-        "      const showLightbox = (index) => {\n"
-        "        lightboxIndex.value = index;\n"
-        "      };\n"
-        "      \n"
-        "      return { title, images, lightboxIndex, showLightbox };\n"
-        "    }\n"
-        "  }).mount('#app');\n"
-        "  </script>\n"
-        "</body>\n"
-        "</html>",
-        title, nl_responsive_css, nl_vue_cdn, title, images_str);
-    add_web_route(server, path, html, "text/html");
-}
-
-int nl_serve_todo(int port, const char* title) {
-    nl_web_server_t* server = nl_web_create(port);
-    if (!server) return -1;
-    nl_web_add_todo(server, "/", title);
-    return nl_web_start(server);
-}
-
-int nl_serve_chat(int port, const char* title) {
-    nl_web_server_t* server = nl_web_create(port);
-    if (!server) return -1;
-    nl_web_add_chat(server, "/", title);
-    return nl_web_start(server);
-}
-
 // =========================================
 // JSON Parser Implementation
 // =========================================
@@ -2995,6 +2683,7 @@ static void stringify_node(nl_json_node* node, char** out, size_t* cap, size_t* 
             }
             (*out)[(*len)++] = '}';
             break;
+        default: break;
     }
 }
 
@@ -3028,7 +2717,7 @@ void* nl_json_parse_file(const char* file_path, nl_status_t* error_code) {
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
     char* buf = (char*)malloc(sz + 1);
     if (!buf) { fclose(fp); if (error_code) *error_code = NL_ENOMEM; return NULL; }
-    (void)fread(buf, 1, sz, fp); buf[sz] = '\0'; fclose(fp);
+    { size_t _nl_rd = fread(buf, 1, sz, fp); buf[_nl_rd] = '\0'; } fclose(fp);
     int el = 0, ec = 0;
     void* json = nl_json_parse(buf, error_code, &el, &ec);
     free(buf);
@@ -3046,7 +2735,7 @@ void* nl_json_array_get(void* json, size_t index) { nl_json_t* j = (nl_json_t*)j
 void* nl_json_object_get(void* json, const char* key) { nl_json_t* j = (nl_json_t*)json; if (!j || !j->root || j->root->type != 6 || !key) return NULL; for (size_t i = 0; i < j->root->data.object_val.count; i++) if (strcmp(j->root->data.object_val.keys[i], key) == 0) { nl_json_t* r = (nl_json_t*)calloc(1, sizeof(nl_json_t)); if (r) r->root = j->root->data.object_val.values[i]; return r; } return NULL; }
 int nl_json_has_key(void* json, const char* key) { nl_json_t* j = (nl_json_t*)json; if (!j || !j->root || j->root->type != 6 || !key) return 0; for (size_t i = 0; i < j->root->data.object_val.count; i++) if (strcmp(j->root->data.object_val.keys[i], key) == 0) return 1; return 0; }
 char* nl_json_stringify(void* json, int pretty) { nl_json_t* j = (nl_json_t*)json; if (!j || !j->root) return (char*)""; size_t cap = 256, len = 0; char* out = (char*)malloc(cap); if (!out) return NULL; stringify_node(j->root, &out, &cap, &len, pretty, 0); out = (char*)realloc(out, len + 1); out[len] = '\0'; return out; }
-int nl_json_save_file(void* json, const char* file_path, int pretty) { if (!json || !file_path) return NL_EINVAL; char* s = nl_json_stringify(json, pretty); if (!s) return NL_ENOMEM; FILE* fp = fopen(file_path, "w"); if (!fp) { free(s); return NL_EFILE; } fwrite(s, 1, strlen(s), fp); fclose(fp); free(s); return NL_OK; }
+int nl_json_save_file(void* json, const char* file_path, int pretty) { if (!json || !file_path) return NL_EINVAL; char* s = nl_json_stringify(json, pretty); if (!s) return NL_ENOMEM; FILE* fp = fopen(file_path, "w"); if (!fp) { free(s); return NL_EFILE; } (void)fwrite(s, 1, strlen(s), fp); fclose(fp); free(s); return NL_OK; }
 
 const char* nl_json_error_message(nl_status_t error_code) {
     switch (error_code) {
@@ -3248,6 +2937,7 @@ static nl_toml_node* toml_parse_value(const char** s, int* line, int* col, nl_st
 static void toml_free_node(nl_toml_node* node) {
     if (!node) return;
     switch (node->type) {
+        case NL_TOML_NULL: break;
         case NL_TOML_STRING: free(node->data.string_val); break;
         case NL_TOML_INT: /* scalar, no allocation */ break;
         case NL_TOML_FLOAT: /* scalar, no allocation */ break;
@@ -3462,7 +3152,7 @@ void* nl_toml_parse_file(const char* file_path, nl_status_t* error_code) {
     fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
     char* buf = (char*)malloc(sz + 1);
     if (!buf) { fclose(fp); if (error_code) *error_code = NL_ENOMEM; return NULL; }
-    (void)fread(buf, 1, sz, fp); buf[sz] = '\0'; fclose(fp);
+    { size_t _nl_rd = fread(buf, 1, sz, fp); buf[_nl_rd] = '\0'; } fclose(fp);
     int el = 0, ec = 0;
     void* toml = nl_toml_parse(buf, error_code, &el, &ec);
     free(buf);
@@ -3524,7 +3214,7 @@ int nl_toml_save_file(void* toml, const char* file_path) {
     if (!s) return NL_ENOMEM;
     FILE* fp = fopen(file_path, "w");
     if (!fp) { free(s); return NL_EFILE; }
-    fwrite(s, 1, strlen(s), fp);
+    (void)fwrite(s, 1, strlen(s), fp);
     fclose(fp);
     free(s);
     return NL_OK;
@@ -3625,7 +3315,7 @@ NL_API char* nl_render_error_page(const char* template_content, nl_error_page_va
         vars->status_code, vars->error_message ? vars->error_message : get_error_code_string(vars->status_code),
         vars->requested_path ? vars->requested_path : "/",
         vars->suggestion ? vars->suggestion : "",
-        vars->server_version ? vars->server_version : "NetLeaf v2.2.0");
+        vars->server_version ? vars->server_version : "NetLeaf v2.4.0");
     
     return result;
 }
@@ -3637,7 +3327,7 @@ NL_API char* nl_make_error_response(int status_code, const char* error_message, 
     vars.error_message = error_message ? error_message : get_error_code_string(status_code);
     vars.requested_path = requested_path;
     vars.suggestion = suggestion;
-    vars.server_version = "NetLeaf v2.2.0";
+    vars.server_version = "NetLeaf v2.4.0";
     
     time_t now = time(NULL);
     struct tm tm_buf;
