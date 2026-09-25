@@ -126,6 +126,3 @@ site/
 /build
 nul
 
-# Advanced build scripts
-build_all-Clang.bat
-build_all-MSVC.bat
