@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://github.com/508364/NetLeaf/blob/main/Logo.svg" width="72" height="72" alt="NetLeaf Logo">
+  <img src="https://raw.githubusercontent.com/508364/NetLeaf/refs/heads/main/Logo.svg" width="72" height="72" alt="NetLeaf Logo">
   <h1>NetLeaf</h1>
   <p><b>NetLeaf</b> 是一个现代化的、高性能的网络库，采用 <b>NL扩展系统</b> 架构，支持跨平台运行（Windows/Linux/macOS）。提供 TCP/UDP、HTTP、WebSocket 和 MQTT 协议支持，内置智能路由、自动补全、多语言等扩展模块。</p>
   <img src="https://img.shields.io/badge/NetLeaf-v2.4.1-blue?style=for-the-badge" alt="NetLeaf Version">
