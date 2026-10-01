@@ -9,12 +9,12 @@ REM        or use "x64 Native Tools Command Prompt for VS 2022"
 REM        build_all-MSVC.bat [x64^|x86^|arm64^|all]
 REM   amd64 is an alias of x64. Default: all
 
-set VERSION=2.4.1
+set VERSION=2.4.2
 set SRC_DIR=%~dp0
 REM Remove trailing backslash
 set SRC_DIR=%SRC_DIR:~0,-1%
 
-REM ?????????(???? if/goto, ???????): x64 / x86 / arm64 / all
+REM Parse architecture argument (pure cmd/if/goto, no parentheses)
 set "ARCH=%~1"
 if not defined ARCH set "ARCH=all"
 if /i "%ARCH%"=="amd64" set "ARCH=x64"
@@ -84,7 +84,7 @@ echo x64 build completed!
 
 REM Package x64
 echo Creating x64 package...
-powershell.exe -Command "Compress-Archive -Path 'build_x64\bin\Release\*.dll','include\netleaf*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
+powershell.exe -Command "Compress-Archive -Path 'build_x64\bin\Release\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
 echo x64 package created!
 echo.
 
@@ -105,7 +105,7 @@ echo x86 build completed!
 
 REM Package x86
 echo Creating x86 package...
-powershell.exe -Command "Compress-Archive -Path 'build_x86\bin\Release\*.dll','include\netleaf*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
+powershell.exe -Command "Compress-Archive -Path 'build_x86\bin\Release\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
 echo x86 package created!
 echo.
 
@@ -126,7 +126,7 @@ echo ARM64 build completed!
 
 REM Package ARM64
 echo Creating ARM64 package...
-powershell.exe -Command "Compress-Archive -Path 'build_arm64\bin\Release\*.dll','include\netleaf*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
+powershell.exe -Command "Compress-Archive -Path 'build_arm64\bin\Release\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
 echo ARM64 package created!
 echo.
 
@@ -142,4 +142,6 @@ if "%BUILD_X86%"=="1" echo   - NetLeaf-%VERSION%-windows-x86.zip
 if "%BUILD_ARM64%"=="1" echo   - NetLeaf-%VERSION%-windows-arm64.zip
 echo.
 echo Note: For cross-compilation without MSVC, use build_all-Clang.bat
-echo
+echo.
+
+endlocal

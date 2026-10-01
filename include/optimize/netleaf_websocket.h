@@ -34,6 +34,32 @@ typedef void (*nl_ws_connect_handler)(void* user_data);
 typedef void (*nl_ws_message_handler)(const char* data, size_t len, nl_ws_opcode_t opcode, void* user_data);
 typedef void (*nl_ws_close_handler)(void* user_data);
 
+/**
+ * WebSocket 消息回调签名说明（重要）。
+ *
+ * `nl_ws_message_handler` 是 4 参数回调，**不是** 3 参数：
+ *   void handler(const char* data, size_t len, nl_ws_opcode_t opcode, void* user_data);
+ *
+ * 第 3 个参数 `opcode` 标识消息类型：
+ *   - NL_WS_TEXT / NL_WS_BINARY ：文本 / 二进制载荷，`data` 指向消息体，`len` 为长度
+ *   - NL_WS_CLOSE               ：关闭帧，`data` 可能含关闭码+原因（2+ 字节）
+ *   - NL_WS_PING / NL_WS_PONG   ：控制帧，通常 `len == 0` 或为 echo 数据
+ *
+ * 用户常误写成 3 参数（漏掉 `opcode`），编译器会报
+ * "incompatible pointer to 'nl_ws_message_handler'"。请按 4 参数签名注册：
+ *
+ * @code
+ *   void on_msg(const char* data, size_t len, nl_ws_opcode_t opcode, void* user_data) {
+ *       if (opcode == NL_WS_TEXT) {
+ *           printf("recv %.*s\n", (int)len, data);
+ *       } else if (opcode == NL_WS_CLOSE) {
+ *           // 处理关闭帧
+ *       }
+ *   }
+ *   nl_ws_server_set_on_message(server, on_msg, my_userdata);
+ * @endcode
+ */
+
 NL_API nl_websocket_server_t* nl_ws_server_create(int port);
 NL_API void nl_ws_server_destroy(nl_websocket_server_t* server);
 NL_API int nl_ws_server_start(nl_websocket_server_t* server);

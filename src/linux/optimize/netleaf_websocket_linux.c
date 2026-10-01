@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #include "netleaf_websocket.h"
+#include "nl_util.h"
 
 #define MAX_CLIENTS 256
 #define BUFFER_SIZE 16384
@@ -42,80 +43,11 @@ struct nl_websocket_server {
 };
 
 static void simple_sha1(const char* input, size_t len, unsigned char* output) {
-    uint32_t h0 = 0x67452301;
-    uint32_t h1 = 0xEFCDAB89;
-    uint32_t h2 = 0x98BADCFE;
-    uint32_t h3 = 0x10325476;
-    uint32_t h4 = 0xC3D2E1F0;
-    
-    size_t original_len = len;
-    size_t padded_len = ((len + 8) / 64 + 1) * 64;
-    unsigned char* padded = calloc(padded_len, 1);
-    if (!padded) return;
-    
-    memcpy(padded, input, len);
-    padded[len] = 0x80;
-    *(uint64_t*)(padded + padded_len - 8) = original_len * 8;
-    
-    for (size_t i = 0; i < padded_len; i += 64) {
-        uint32_t w[80];
-        for (int j = 0; j < 16; j++) {
-            w[j] = (padded[i + j * 4] << 24) | (padded[i + j * 4 + 1] << 16) |
-                   (padded[i + j * 4 + 2] << 8) | padded[i + j * 4 + 3];
-        }
-        for (int j = 16; j < 80; j++) {
-            w[j] = ((w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16]) << 1) | ((w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16]) >> 31);
-        }
-        
-        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
-        
-        for (int j = 0; j < 80; j++) {
-            uint32_t f, k;
-            if (j < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
-            else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-            else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
-            
-            uint32_t temp = ((a << 5) | (a >> 27)) + f + e + k + w[j];
-            e = d; d = c; c = ((b << 30) | (b >> 2)); b = a; a = temp;
-        }
-        
-        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
-    }
-    
-    free(padded);
-    
-    for (int i = 0; i < 4; i++) {
-        output[i] = (h0 >> (24 - i * 8)) & 0xFF;
-        output[i + 4] = (h1 >> (24 - i * 8)) & 0xFF;
-        output[i + 8] = (h2 >> (24 - i * 8)) & 0xFF;
-        output[i + 12] = (h3 >> (24 - i * 8)) & 0xFF;
-        output[i + 16] = (h4 >> (24 - i * 8)) & 0xFF;
-    }
+    nl_sha1(input, len, output);
 }
 
 static void base64_encode(const char* input, size_t len, char* output) {
-    static const char* base64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    
-    size_t i = 0;
-    int padding = 0;
-    
-    while (i < len) {
-        uint32_t n = ((uint32_t)(unsigned char)input[i]) << 16;
-        if (i + 1 < len) n |= ((uint32_t)(unsigned char)input[i + 1]) << 8;
-        else padding++;
-        if (i + 2 < len) n |= ((uint32_t)(unsigned char)input[i + 2]);
-        else padding++;
-        
-        output[0] = base64_table[(n >> 18) & 0x3F];
-        output[1] = base64_table[(n >> 12) & 0x3F];
-        output[2] = padding >= 2 ? '=' : base64_table[(n >> 6) & 0x3F];
-        output[3] = padding >= 1 ? '=' : base64_table[n & 0x3F];
-        
-        output += 4;
-        i += 3;
-    }
-    *output = '\0';
+    nl_base64_encode_into(input, len, output);
 }
 
 static void generate_sec_websocket_key(char* key) __attribute__((unused));

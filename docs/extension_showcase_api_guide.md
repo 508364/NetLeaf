@@ -1,6 +1,6 @@
 # 扩展示例 API 使用指南（extension_showcase）
 
-> 适用范围：NetLeaf `2.4.1` / NL 扩展系统 `NL_MODULE_VERSION = 2.4.1`
+> 适用范围：NetLeaf `2.4.2` / NL 扩展系统 `NL_MODULE_VERSION = 2.4.2`
 > 配套示例：[examples/extension_showcase/](../examples/extension_showcase/)
 > 相关文档：[扩展系统开发教程](extension_tutorial.md) · [插件开发指南](plugin_development.md)
 
@@ -112,7 +112,8 @@ NL_EXT_API nl_extension_info_t* nl_showcase_engine_get_extension_info(void) {
 ```c
 int32_t codec_value = -1;
 
-/* 注册：成功返回 0；对同一 id 重复注册返回 0（幂等） */
+/* 注册：成功 0；对同一 id 重复注册返回 0（幂等）；
+   若声明了必需依赖且该依赖尚未注册，返回 -2（拒绝加载） */
 nl_extension_register(nl_showcase_codec_get_extension_info());
 
 /* 编号：注册时自动分配 library_value（从 1 开始，0 保留） */
@@ -209,6 +210,9 @@ nl_extension_get_metadata("showcase_engine", "homepage", buf, sizeof(buf));
 /* 清空某个 key 的值：把 value 传 NULL（key 仍保留，读取时得到空串） */
 nl_extension_set_metadata("showcase_engine", "homepage", NULL);
 nl_extension_get_metadata("showcase_engine", "homepage", buf, sizeof(buf)); // buf = ""
+
+/* 释放全部元数据链表（关机或主动清理时调用） */
+nl_extension_clear_metadata();
 ```
 
 > 注意：`library_id` / `key` 为 NULL 时 `set` 直接返回 -1；`get` 对不存在的 key 返回 -1。
@@ -227,8 +231,19 @@ int n1 = nl_extension_auto_load();                       // 从默认目录加�
 int n2 = nl_extension_auto_load_from_dir("./plugins");   // 从指定目录加载
 ```
 
-自动加载会按约定的导出符号名（如 `nl_lang_get_extension_info`）识别扩展库；
-目录不存在时返回 0（正常情况，不报错）。
+自动加载会按约定的导出符号名识别扩展库；目录不存在时返回 0（正常情况，不报错）。
+
+**符号发现约定**（与 [src/netleaf_module.c](../src/netleaf_module.c) 中 `g_ext_symbol_patterns` 一致）：
+
+1. **已知符号表**：优先尝试内置扩展的标准导出符号——
+   `nl_lang_get_extension_info`、`nl_ipc_get_extension_info`、`nl_autoroute_get_extension_info`、
+   `nl_autocomplete_get_extension_info`、`nl_errorpage_get_extension_info`、`nl_vue_get_extension_info`、
+   `nl_lagg_get_extension_info`、`nl_https_get_extension_info`；旧示例为 `nl_example_get_extension_info`；
+   另有通用入口 `nl_get_extension_info`（新扩展可只导出该符号即可被自动发现）。
+2. **文件名推导规则**：若上述符号均未命中，则按扩展库文件名推导模块名——
+   文件名以 `libnetleaf_` / `libnetleaf-` / `netleaf_` / `netleaf-` 前缀开头时，
+   去掉前缀与扩展名得到模块名 `<mod>`，依次探测 `nl_<mod>_get_extension_info` 与
+   `nl_<mod>_get_module_info`。例如 `libnetleaf_foo.dll` → 探测 `nl_foo_get_extension_info`。
 
 ---
 
@@ -372,6 +387,9 @@ nl_module_set_enabled(NL_MODULE_CUSTOM, 0);   // 禁用
 nl_module_get_name / _version / _description(NL_MODULE_CUSTOM);
 nl_module_has_capability(NL_MODULE_CUSTOM, NL_CAP_THREAD_SAFE);
 nl_module_get_capabilities(NL_MODULE_CUSTOM);
+/* 平台展示串：返回 malloc 字符串（"Windows,Linux,MacOS" / "all"），调用方负责 free() */
+char* plats = nl_module_get_platforms(NL_MODULE_CUSTOM);
+free(plats);
 
 /* 模块依赖 */
 nl_module_add_dependency(NL_MODULE_CUSTOM, NL_MODULE_CORE);

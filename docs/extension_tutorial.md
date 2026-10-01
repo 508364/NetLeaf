@@ -1,6 +1,6 @@
 # NetLeaf NL 扩展系统开发教程
 
-> 版本：对应 NetLeaf `2.4.1` / NL 扩展系统 `NL_MODULE_VERSION = 2.4.1`
+> 版本：对应 NetLeaf `2.4.2` / NL 扩展系统 `NL_MODULE_VERSION = 2.4.2`
 > 头文件：[include/netleaf_module.h](../include/netleaf_module.h)、[include/netleaf_lang.h](../include/netleaf_lang.h)
 > 配套示例：[examples/extension_showcase/](../examples/extension_showcase/)
 > 示例 API 使用指南：[docs/extension_showcase_api_guide.md](extension_showcase_api_guide.md)
@@ -260,7 +260,7 @@ NL_CAP_REMOVE(caps, cap)  // 清位
 ## 5. 注册与注销
 
 ```c
-int nl_extension_register(nl_extension_info_t* info);   // 成功返回 0；重复注册返回 0（幂等）
+int nl_extension_register(nl_extension_info_t* info);   // 成功 0；重复注册 0（幂等）；必需依赖未注册 -2
 int nl_extension_unregister(const char* library_id);    // 成功 0；不存在 -1
 int nl_extension_get_count(void);                       // 已注册扩展数量
 nl_extension_info_t** nl_extension_get_all(int* count); // 返回 malloc 的数组，用完需 free()
@@ -271,7 +271,9 @@ int nl_extension_validate_description(const char* desc); // 合法 1，超长 0
 
 1. 依据 `library_id` 去重；
 2. **自动分配** `library_value`（从 `1` 开始，`0` 保留）；
-3. 解析 `platforms` 字符串，回填三个平台字段。
+3. 解析 `platforms` 字符串，回填三个平台字段；
+4. **加载前自动依赖检查**：若声明了“必需”（`NL_EXT_DEP_REQUIRED`）依赖且任一必需库尚未注册，
+   则拒绝加载并返回 `-2`；可选依赖缺失不阻断。
 
 按编号反查：
 
@@ -481,6 +483,7 @@ nl_module_lazy_unload(NL_MODULE_CUSTOM);     // 触发 lazy_unload
 ```c
 int nl_extension_set_metadata(const char* library_id, const char* key, const char* value);
 int nl_extension_get_metadata(const char* library_id, const char* key, char* value, size_t val_size);
+int nl_extension_clear_metadata(void);   // 释放全部扩展元数据链表（关机或主动清理时调用）
 ```
 
 行为约定：
@@ -499,6 +502,8 @@ nl_extension_get_metadata("showcase_engine", "no_such_key", buf, sizeof(buf));  
 
 nl_extension_set_metadata("showcase_engine", "homepage", NULL);                    // 清空该值
 nl_extension_get_metadata("showcase_engine", "homepage", buf, sizeof(buf));        // 0，buf=""
+
+nl_extension_clear_metadata();                                                     // 释放全部元数据链表
 ```
 
 ---
@@ -562,8 +567,20 @@ void        nl_extension_set_auto_load_dir(const char* directory);
 const char* nl_extension_get_auto_load_dir(void);
 ```
 
-自动加载会尝试若干标准导出符号名（如 `nl_lang_get_extension_info`、`nl_ipc_get_extension_info`
-等）。目录不存在时返回 `0`（正常情况，不报错）。
+自动加载会按约定的导出符号名识别扩展库。与 [src/netleaf_module.c](../src/netleaf_module.c) 中
+`g_ext_symbol_patterns` 的符号发现约定一致：
+
+1. **已知符号表**：优先尝试内置扩展的标准导出符号——
+   `nl_lang_get_extension_info`、`nl_ipc_get_extension_info`、`nl_autoroute_get_extension_info`、
+   `nl_autocomplete_get_extension_info`、`nl_errorpage_get_extension_info`、`nl_vue_get_extension_info`、
+   `nl_lagg_get_extension_info`、`nl_https_get_extension_info`；旧示例为 `nl_example_get_extension_info`；
+   另有通用入口 `nl_get_extension_info`（新扩展可只导出该符号即可被自动发现）。
+2. **文件名推导规则**：若上述符号均未命中，则按扩展库文件名推导模块名——
+   文件名以 `libnetleaf_` / `libnetleaf-` / `netleaf_` / `netleaf-` 前缀开头时，
+   去掉前缀与扩展名得到模块名 `<mod>`，依次探测 `nl_<mod>_get_extension_info` 与
+   `nl_<mod>_get_module_info`。
+
+目录不存在时返回 `0`（正常情况，不报错）。
 
 ---
 
@@ -587,6 +604,8 @@ const char* nl_module_get_version(nl_module_type_t type);
 const char* nl_module_get_description(nl_module_type_t type);
 int nl_module_has_capability(nl_module_type_t type, int cap);
 int nl_module_get_capabilities(nl_module_type_t type);
+/* 模块平台展示串：返回 malloc 字符串（"Windows,Linux,MacOS" / "all"），调用方负责 free() */
+char* nl_module_get_platforms(nl_module_type_t type);
 int nl_module_register(nl_module_info_t* info);
 int nl_module_unregister(nl_module_type_t type);
 int nl_module_available(const char* module_name);
@@ -735,7 +754,7 @@ nl_lang_get_error_with_vars(SHOWCASE_LIB_ID, -3, buf, sizeof(buf)); // 例："Co
 | 依赖 | `nl_extension_add_dependency`、`nl_extension_remove_dependency`、`nl_extension_clear_dependencies`、`nl_extension_get_dependency_count`、`nl_extension_get_dependencies`、`nl_extension_get_dependency_by_id`、`nl_extension_has_dependency`、`nl_extension_get_required_deps`、`nl_extension_get_optional_deps`、`nl_extension_check_dependencies`、`nl_extension_resolve_dependencies`、`nl_extension_are_dependencies_met` |
 | 自动加载 | `nl_extension_auto_load`、`nl_extension_auto_load_from_dir`、`nl_extension_set_auto_load_dir`、`nl_extension_get_auto_load_dir` |
 | 扩展级懒加载 | `nl_extension_lazy_load`、`nl_extension_lazy_unload`、`nl_extension_lazy_get_status`、`nl_extension_lazy_is_loaded` |
-| 模块查询/依赖 | `nl_module_register`、`nl_module_unregister`、`nl_module_get_info`、`nl_module_get_info_by_name`、`nl_module_get_all`、`nl_module_get_count`、`nl_module_get_name/version/description`、`nl_module_has_capability`、`nl_module_get_capabilities`、`nl_module_is_platform_supported`、`nl_module_get_status`、`nl_module_set_enabled`、`nl_module_available`、`nl_get_module`、`nl_get_module_count`、`nl_get_modules`、`nl_module_add_dependency`、`nl_module_remove_dependency`、`nl_module_check_dependencies`、`nl_module_get_dependencies`、`nl_print_modules` |
+| 模块查询/依赖 | `nl_module_register`、`nl_module_unregister`、`nl_module_get_info`、`nl_module_get_info_by_name`、`nl_module_get_all`、`nl_module_get_count`、`nl_module_get_name/version/description`、`nl_module_get_platforms`、`nl_module_has_capability`、`nl_module_get_capabilities`、`nl_module_is_platform_supported`、`nl_module_get_status`、`nl_module_set_enabled`、`nl_module_available`、`nl_get_module`、`nl_get_module_count`、`nl_get_modules`、`nl_module_add_dependency`、`nl_module_remove_dependency`、`nl_module_check_dependencies`、`nl_module_get_dependencies`、`nl_print_modules` |
 | 模块级懒加载 | `nl_module_lazy_enable`、`nl_module_lazy_enable_module`、`nl_module_lazy_disable_module`、`nl_module_lazy_is_enabled`、`nl_module_lazy_load`、`nl_module_lazy_unload`、`nl_module_lazy_get_status`、`nl_module_lazy_is_loaded`、`nl_module_lazy_preload_all`、`nl_module_lazy_unload_all`、`nl_module_lazy_clear_cache` |
 | Lang 错误码 | `NL_ERROR_BEGIN`/`NL_ERROR`/`NL_ERROR_END`、`nl_lang_register_errors`、`nl_lang_get_error`、`nl_lang_get_error_for`、`nl_lang_set`、`nl_lang_is_registered`、`nl_lang_has_language`、`nl_lang_has_error`、`nl_lang_get_error_codes`、`nl_lang_register_lib_name`、`nl_lang_get_lib_name`、`nl_error_is_success`、`nl_lang_get_error_category` |
 | Lang 变量 | `nl_lang_var_set/get/set_int/get_int/set_float/get_float/set_bool/get_bool`、`nl_lang_var_exists`、`nl_lang_var_remove`、`nl_lang_var_clear_all`、`nl_lang_var_set_provider`、`nl_lang_var_is_dynamic`、`nl_lang_var_bind_env`、`nl_lang_var_load_env`、`nl_lang_var_replace`、`nl_lang_var_replace_html`、`nl_lang_var_condition_eval`、`nl_lang_get_error_with_vars` |
@@ -792,9 +811,36 @@ gcc -fsyntax-only -std=c99 -Wall -Wextra -Wpedantic \
   以及 `NL_ERROR_BEGIN` / `NL_ERROR_END` 的写法需按文档补齐（扩展/模块宏结尾无分号，
   调用后补 `;`；`NL_ERROR_END` 自身已含 `;`，**不要**再补）。
 - 扩展级懒加载请使用 `nl_extension_lazy_*`；模块级批量懒加载使用 `nl_module_lazy_*`，两者互不相同。
-- 元数据已实现：`set` 写入/覆盖，`get` 命中返回 0、未命中返回 -1，值传 `NULL` 即清空。
+- 元数据已实现：`set` 写入/覆盖，`get` 命中返回 0、未命中返回 -1，值传 `NULL` 即清空；
+  `nl_extension_clear_metadata()` 可释放全部元数据链表。
 - 函数指针与 `void*` 互转（`nl_extension_get_func*` 用法）在 `-Wpedantic` 下会告警，属预期。
 - 示例中的环境变量演示使用运行期写入的**假数据**（如 `env-value-1`），不含任何真实密钥/令牌。
+
+**线程安全说明**：
+
+- **注册表**：扩展/模块注册表由 `registry_mutex` 保护——Windows 使用
+  `CRITICAL_SECTION`（惰性初始化），POSIX 使用静态初始化的 `pthread_mutex_t`。
+- **元数据**：扩展元数据链表由 `metadata_mutex` 保护。POSIX 分支直接用
+  `PTHREAD_MUTEX_INITIALIZER` 静态初始化；Windows 分支使用
+  `InitOnceExecuteOnce` 做一次性初始化，保证多线程首调时锁只初始化一次。
+- 因此 `nl_extension_set_metadata` / `nl_extension_get_metadata` / `nl_extension_clear_metadata`
+  以及 `nl_module_register` / `nl_module_unregister` 等均可在多线程环境下安全调用。
+
+**`NL_PLUGIN_EXPORT` 宏说明**：
+
+头文件提供了 `NL_PLUGIN_EXPORT` 宏，供插件导出符号使用：
+
+```c
+#ifdef __cplusplus
+#define NL_PLUGIN_EXPORT extern "C" __declspec(dllexport)
+#else
+#define NL_PLUGIN_EXPORT __declspec(dllexport)
+#endif
+```
+
+- C++ 插件需附加 `extern "C"`，避免符号 mangling；
+- 非 Windows 平台（`_WIN32` 未定义时）应自行定义对应导出方式（如
+  `__attribute__((visibility("default")))`）。
 
 ---
 
@@ -807,4 +853,4 @@ gcc -fsyntax-only -std=c99 -Wall -Wextra -Wpedantic \
 - 示例 README：[examples/extension_showcase/README.md](../examples/extension_showcase/README.md)
 - 示例 API 使用指南：[docs/extension_showcase_api_guide.md](extension_showcase_api_guide.md)
 - 插件开发指南：[docs/plugin_development.md](plugin_development.md)
-- 插件模板：[examples/plugin_template/](../examples/plugin_template/)
+- 插件示例：[examples/plugin_example/](../examples/plugin_example/)

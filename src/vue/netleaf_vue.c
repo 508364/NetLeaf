@@ -4,13 +4,10 @@
 
 #include "netleaf_vue.h"
 #include "netleaf_module.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-
-#ifdef _WIN32
-#define strdup _strdup
-#endif
 
 static char g_default_version[64] = "3.4.0";
 static nl_vue_cdn_type_t g_default_cdn = NL_VUE_CDN_UNPKG;
@@ -59,22 +56,7 @@ static const char* nl_responsive_css =
 
 static char* strcasestr_wrapper(const char* haystack, const char* needle, size_t haystack_len) {
     if (!haystack || !needle) return NULL;
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0 || needle_len > haystack_len) return NULL;
-    
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        int match = 1;
-        for (size_t j = 0; j < needle_len; j++) {
-            char h = haystack[i + j];
-            char n = needle[j];
-            if (((h >= 'A' && h <= 'Z') ? h + 32 : h) != ((n >= 'A' && n <= 'Z') ? n + 32 : n)) {
-                match = 0;
-                break;
-            }
-        }
-        if (match) return (char*)&haystack[i];
-    }
-    return NULL;
+    return nl_strncasestr(haystack, needle, haystack_len);
 }
 
 int nl_vue_init(void) {
@@ -133,7 +115,7 @@ void nl_vue_set_local_path(const char* path) {
         g_local_vue_content = NULL;
     }
     if (path) {
-        g_local_vue_path = strdup(path);
+        g_local_vue_path = nl_strdup(path);
     }
 }
 
@@ -170,7 +152,7 @@ int nl_vue_load_from_file(const char* filepath) {
     if (g_local_vue_path) {
         free(g_local_vue_path);
     }
-    g_local_vue_path = strdup(filepath);
+    g_local_vue_path = nl_strdup(filepath);
     
     return 0;
 }
@@ -230,7 +212,7 @@ char* nl_vue_get_cdn_script(nl_vue_cdn_type_t cdn_type, const char* version) {
     static char script[512];
     const char* url = nl_vue_get_cdn_url(cdn_type, version);
     snprintf(script, sizeof(script), "<script src=\"%s\"></script>\n", url);
-    return strdup(script);
+    return nl_strdup(script);
 }
 
 int nl_vue_detect_import(const char* html, size_t html_len) {
@@ -265,7 +247,7 @@ char* nl_vue_add_import(const char* html, size_t html_len,
     int has_vue_import = nl_vue_detect_import(html, html_len);
     
     if (!has_vue_code || has_vue_import) {
-        return strdup(html);
+        return nl_strdup(html);
     }
     
     const char* url = nl_vue_get_cdn_url(cdn_type, version);
@@ -291,7 +273,7 @@ char* nl_vue_add_import(const char* html, size_t html_len,
 
 static char* substitute_variables(const char* text, const char** vars, const char** values, int count) {
     if (!text) return NULL;
-    if (!vars || !values || count <= 0) return strdup(text);
+    if (!vars || !values || count <= 0) return nl_strdup(text);
     
     size_t text_len = strlen(text);
     char* result = malloc(text_len + 1);
@@ -362,7 +344,7 @@ char* nl_vue_generate_page_inline(const char* vue_code, const char* title, const
         }
         fclose(fp);
     } else if (g_local_vue_content) {
-        vue_content = strdup(g_local_vue_content);
+        vue_content = nl_strdup(g_local_vue_content);
     }
     
     if (!vue_content) return NULL;
@@ -431,7 +413,7 @@ char* nl_vue_generate_counter_inline(const char* title, const char* vue_filepath
         }
         fclose(fp);
     } else {
-        vue_content = strdup(g_local_vue_content);
+        vue_content = nl_strdup(g_local_vue_content);
     }
     
     size_t html_size = strlen(vue_content) + 8192;
@@ -503,7 +485,7 @@ char* nl_vue_generate_dashboard_inline(const char* title, const char* vue_filepa
         }
         fclose(fp);
     } else {
-        vue_content = strdup(g_local_vue_content);
+        vue_content = nl_strdup(g_local_vue_content);
     }
     
     size_t html_size = strlen(vue_content) + 16384;
@@ -565,7 +547,7 @@ char* nl_vue_get_local_script(const char* vue_filepath) {
     static char script[512];
     const char* path = vue_filepath ? vue_filepath : (g_local_vue_path ? g_local_vue_path : "./vue.global.js");
     snprintf(script, sizeof(script), "<script src=\"%s\"></script>\n", path);
-    return strdup(script);
+    return nl_strdup(script);
 }
 
 char* nl_vue_generate_page(const char* vue_code, const char* title, 
@@ -844,7 +826,7 @@ char* nl_vue_generate_sysinfo_inline(const char* title, const char* vue_filepath
         }
         fclose(fp);
     } else {
-        vue_content = strdup(g_local_vue_content);
+        vue_content = nl_strdup(g_local_vue_content);
     }
     
     size_t html_size = strlen(vue_content) + 70000;

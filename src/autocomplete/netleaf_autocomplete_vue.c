@@ -3,13 +3,12 @@
 #endif
 
 #include "netleaf_autocomplete.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-#ifdef _WIN32
-#define strdup _strdup
-#endif
+/* strdup 收敛至公共工具层 nl_util：本文件统一调用 nl_strdup() */
 
 // =========================================
 // Vue Import Implementation
@@ -121,7 +120,7 @@ char* nl_vue_import_process_version(nl_vue_import_t* ctx, nl_vue_cdn_type_t cdn_
     
     // Only add Vue import if there's Vue code but no import
     if (!ctx->has_vue_code || ctx->has_vue_import) {
-        return strdup(ctx->html);
+        return nl_strdup(ctx->html);
     }
     
     const char* url = get_vue_cdn_url(cdn_type, version);

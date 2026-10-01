@@ -45,7 +45,8 @@ typedef enum {
     NL_MQTT_TLS_HANDSHAKE     = -6,
     NL_MQTT_TLS_READ          = -7,
     NL_MQTT_TLS_WRITE         = -8,
-    NL_MQTT_TLS_NOT_INIT      = -9
+    NL_MQTT_TLS_NOT_INIT      = -9,
+    NL_MQTT_TLS_TIMEOUT       = -10
 } nl_mqtt_tls_result_t;
 
 typedef struct nl_mqtt_tls_config {
@@ -72,6 +73,10 @@ NL_MQTT_TLS_API int nl_mqtt_tls_set_hostname(nl_mqtt_tls_ctx_t* ctx,
                                              const char* hostname);
 
 NL_MQTT_TLS_API int nl_mqtt_tls_handshake(nl_mqtt_tls_ctx_t* ctx, int sock);
+/* 带超时的握手：timeout_ms < 0 表示无限等待；> 0 毫秒超时后返回 NL_MQTT_TLS_TIMEOUT。
+ * 阻塞/非阻塞 socket 均适用；WANT_READ/WANT_WRITE 在 select 上等待就绪而非忙等。 */
+NL_MQTT_TLS_API int nl_mqtt_tls_handshake_ex(nl_mqtt_tls_ctx_t* ctx, int sock,
+                                              int timeout_ms);
 NL_MQTT_TLS_API int nl_mqtt_tls_send(nl_mqtt_tls_ctx_t* ctx,
                                       const void* buf, size_t len);
 NL_MQTT_TLS_API int nl_mqtt_tls_recv(nl_mqtt_tls_ctx_t* ctx,

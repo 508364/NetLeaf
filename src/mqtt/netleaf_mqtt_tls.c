@@ -26,6 +26,28 @@
 #include <mbedtls/error.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <sys/timeb.h>
+#else
+#  include <sys/select.h>
+#  include <sys/time.h>
+#endif
+
+/* 单调毫秒计时器：select 循环中用于判定整体握手是否超时 */
+static long long nl_now_ms_internal(void) {
+#ifdef _WIN32
+    struct _timeb tb;
+    _ftime(&tb);
+    return ((long long)tb.time) * 1000LL + tb.millsec;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((long long)tv.tv_sec) * 1000LL + tv.tv_usec / 1000LL;
+#endif
+}
 
 struct nl_mqtt_tls_ctx {
     mbedtls_ssl_context       ssl;
@@ -43,6 +65,9 @@ struct nl_mqtt_tls_ctx {
     int                       setup_done;
     /* SNI 与证书主机名校验使用的主机名（本结构持有副本并负责释放） */
     char*                     hostname;
+    /* 最近一次握手完成时使用的目标 fd（非阻塞 BIO 超时循环在
+       WANT_READ/WANT_WRITE 间交替 select 时据此做超时判定） */
+    int                       last_fd;
 };
 
 static const char* tls_error_string(int code) {
@@ -185,7 +210,7 @@ int nl_mqtt_tls_configure(nl_mqtt_tls_ctx_t* ctx,
 
     /* 协议版本区间：TLS1.0 - TLS1.2。
      * 当前内置 mbedTLS 未编译 TLS1.3（MBEDTLS_SSL_MINOR_VERSION_4 不可用），
-     * 上限一律钳制为 TLS1.2；cfg->min_version/max_version 采用 nl_tls_protocol_t
+     * 上限一律钳制为 TLS1.2；cfg->min_version/max_version 采用 nl_tls2_protocol_t
      * 编号（1=TLS1.1, 2=TLS1.2, 3=TLS1.3），0 表示使用默认值。 */
     int min_minor = MBEDTLS_SSL_MINOR_VERSION_1; /* 默认最小 TLS1.0 */
     int max_minor = MBEDTLS_SSL_MINOR_VERSION_3; /* 默认最大 TLS1.2 */
@@ -203,46 +228,97 @@ int nl_mqtt_tls_configure(nl_mqtt_tls_ctx_t* ctx,
 }
 
 int nl_mqtt_tls_handshake(nl_mqtt_tls_ctx_t* ctx, int sock) {
+    return nl_mqtt_tls_handshake_ex(ctx, sock, 0);
+}
+
+/* 带超时的握手（timeout_ms < 0 表示无限等待；> 0 毫秒超时后返回 NL_MQTT_TLS_TIMEOUT）。
+ * 对齐通用 TLS 库 nl_tls2_handshake_ex 的语义：WANT_READ/WANT_WRITE 在 select 上等待
+ * 套接字就绪而非忙等，避免对端无响应时永久阻塞。 */
+int nl_mqtt_tls_handshake_ex(nl_mqtt_tls_ctx_t* ctx, int sock, int timeout_ms) {
     if (!ctx || !ctx->initialized) return NL_MQTT_TLS_NOT_INIT;
 
     int ret;
     if (!ctx->setup_done) {
         /* mbedtls_ssl_setup() 每个上下文只允许成功调用一次 */
         ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->conf);
-        if (ret != 0) {
-            return NL_MQTT_TLS_ERROR;
-        }
+        if (ret != 0) return NL_MQTT_TLS_ERROR;
         ctx->setup_done = 1;
     } else {
-        /* 重连场景：复用同一个 ssl 上下文，复位会话状态后重新握手 */
         ret = mbedtls_ssl_session_reset(&ctx->ssl);
-        if (ret != 0) {
-            return NL_MQTT_TLS_ERROR;
-        }
+        if (ret != 0) return NL_MQTT_TLS_ERROR;
     }
 
-    /* 设置 SNI 与证书主机名（服务器证书校验依赖该主机名） */
     if (ctx->hostname) {
         ret = mbedtls_ssl_set_hostname(&ctx->ssl, ctx->hostname);
-        if (ret != 0) {
-            return NL_MQTT_TLS_ERROR;
-        }
+        if (ret != 0) return NL_MQTT_TLS_ERROR;
     }
 
     ctx->server_fd.fd = sock;
+    ctx->last_fd = sock;
     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd,
                         mbedtls_net_send, mbedtls_net_recv, NULL);
 
-    ret = mbedtls_ssl_handshake(&ctx->ssl);
-    if (ret != 0) {
+    /* 若指定超时，设置 mbedTLS 读超时，使握手卡死时能返回 MBEDTLS_ERR_SSL_TIMEOUT */
+    if (timeout_ms > 0) {
+        mbedtls_ssl_conf_read_timeout(&ctx->conf, (uint32_t)timeout_ms);
+    }
+
+    long long deadline = 0;
+    /* 记录起始时刻（仅 timeout_ms > 0 时有效） */
+    if (timeout_ms > 0) {
+        deadline = nl_now_ms_internal();
+    }
+
+    for (int spins = 0; ; spins++) {
+        ret = mbedtls_ssl_handshake(&ctx->ssl);
+        if (ret == 0) break;
+
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            int remain = -1;
+            if (timeout_ms > 0) {
+                long long now = nl_now_ms_internal();
+                remain = (int)(deadline - now);
+                if (remain <= 0) return NL_MQTT_TLS_TIMEOUT;
+            } else if (spins > 1000000) {
+                /* 兜底：非阻塞 socket 上防止无限自旋 */
+                return NL_MQTT_TLS_HANDSHAKE;
+            }
+            /* 等待套接字就绪，避免忙等 */
+            int wait_r = -1, wait_w = -1;
+            {
+                fd_set rfds, wfds;
+                FD_ZERO(&rfds); FD_ZERO(&wfds);
+                int is_read = (ret == MBEDTLS_ERR_SSL_WANT_READ);
+                if (is_read) FD_SET((int)sock, &rfds);
+                else          FD_SET((int)sock, &wfds);
+                struct timeval tv;
+                if (timeout_ms > 0) {
+                    tv.tv_sec  = remain / 1000;
+                    tv.tv_usec = (remain % 1000) * 1000;
+                }
+                int sel = select((int)sock + 1,
+                                 is_read ? &rfds : NULL,
+                                 is_read ? NULL : &wfds,
+                                 NULL,
+                                 timeout_ms > 0 ? &tv : NULL);
+                if (sel < 0) {
+                    /* select 出错视为连接错误 */
+                    return NL_MQTT_TLS_HANDSHAKE;
+                }
+            }
+            if (timeout_ms > 0 && nl_now_ms_internal() >= deadline) {
+                return NL_MQTT_TLS_TIMEOUT;
+            }
+            continue;
+        }
+
+        if (ret == MBEDTLS_ERR_SSL_TIMEOUT) return NL_MQTT_TLS_TIMEOUT;
         return NL_MQTT_TLS_HANDSHAKE;
     }
 
     if (ctx->verify_peer) {
         uint32_t flags = mbedtls_ssl_get_verify_result(&ctx->ssl);
-        if (flags != 0) {
-            return NL_MQTT_TLS_BAD_CERT;
-        }
+        if (flags != 0) return NL_MQTT_TLS_BAD_CERT;
     }
 
     return NL_MQTT_TLS_OK;
@@ -311,6 +387,9 @@ int nl_mqtt_tls_set_hostname(nl_mqtt_tls_ctx_t* ctx, const char* hostname) {
 }
 int nl_mqtt_tls_handshake(nl_mqtt_tls_ctx_t* ctx, int sock) {
     (void)ctx; (void)sock; return NL_MQTT_TLS_NOT_INIT;
+}
+int nl_mqtt_tls_handshake_ex(nl_mqtt_tls_ctx_t* ctx, int sock, int timeout_ms) {
+    (void)ctx; (void)sock; (void)timeout_ms; return NL_MQTT_TLS_NOT_INIT;
 }
 int nl_mqtt_tls_send(nl_mqtt_tls_ctx_t* ctx, const void* buf, size_t len) {
     (void)ctx; (void)buf; (void)len; return NL_MQTT_TLS_NOT_INIT;

@@ -5,14 +5,11 @@
 #include "netleaf_autoroute.h"
 #include "netleaf_module.h"
 #include "netleaf_autoroute_lang.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
-
-#ifdef _WIN32
-#define strdup _strdup
-#endif
 
 // =========================================
 // Module State
@@ -50,32 +47,10 @@ nl_module_info_t* nl_autoroute_get_module_info(void) {
 
 // =========================================
 // Flexible Enable/Disable Helper
+// （收敛至公共工具层 nl_util，避免各扩展重复拷贝）
 // =========================================
-
 static int parse_enable_value(const char* value) {
-    if (!value) return 0;
-    
-    if (strcmp(value, "1") == 0 || strcmp(value, "0") == 0) {
-        return atoi(value);
-    }
-    
-    char lower[16];
-    size_t i;
-    for (i = 0; i < sizeof(lower) - 1 && value[i]; i++) {
-        lower[i] = tolower((unsigned char)value[i]);
-    }
-    lower[i] = '\0';
-    
-    if (strcmp(lower, "true") == 0 || strcmp(lower, "on") == 0 || 
-        strcmp(lower, "yes") == 0) {
-        return 1;
-    }
-    if (strcmp(lower, "false") == 0 || strcmp(lower, "off") == 0 || 
-        strcmp(lower, "no") == 0) {
-        return 0;
-    }
-    
-    return 0;
+    return nl_parse_enable_value(value);
 }
 
 // =========================================
@@ -418,8 +393,8 @@ static void collect_all_routes(struct nl_route_node* node, char* prefix, char** 
     }
     
     if (node->is_leaf && new_prefix[0] != '\0') {
-        // strdup 可能因内存不足返回 NULL，判空后再写入，避免后续解引用空指针
-        char* dup = strdup(new_prefix);
+        // nl_strdup 可能因内存不足返回 NULL，判空后再写入，避免后续解引用空指针
+        char* dup = nl_strdup(new_prefix);
         if (dup) {
             routes[*count] = dup;
             (*count)++;

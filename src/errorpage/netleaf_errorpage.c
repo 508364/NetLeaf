@@ -2,18 +2,14 @@
 #include "netleaf_errorpage.h"
 #include "netleaf_module.h"
 #include "netleaf_errorpage_lang.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
 
-// Cross-platform nl_strdup
-#ifdef _WIN32
-    #define nl_strdup _strdup
-#else
-    #define nl_strdup strdup
-#endif
+// Cross-platform nl_strdup 收敛至公共工具层 nl_util（本文件不再重复定义）
 
 // =========================================
 // Forward declarations
@@ -149,28 +145,10 @@ static const char g_default_500_template[] =
 
 // =========================================
 // Flexible Enable/Disable Helper
+// （收敛至公共工具层 nl_util，避免各扩展重复拷贝）
 // =========================================
-
 static int parse_enable_value(const char* value) {
-    if (!value) return 0;
-    if (strcmp(value, "1") == 0 || strcmp(value, "0") == 0) {
-        return atoi(value);
-    }
-    char lower[16];
-    size_t i;
-    for (i = 0; i < sizeof(lower) - 1 && value[i]; i++) {
-        lower[i] = tolower((unsigned char)value[i]);
-    }
-    lower[i] = '\0';
-    if (strcmp(lower, "true") == 0 || strcmp(lower, "on") == 0 || 
-        strcmp(lower, "yes") == 0) {
-        return 1;
-    }
-    if (strcmp(lower, "false") == 0 || strcmp(lower, "off") == 0 || 
-        strcmp(lower, "no") == 0) {
-        return 0;
-    }
-    return 0;
+    return nl_parse_enable_value(value);
 }
 
 // =========================================

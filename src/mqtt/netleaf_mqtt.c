@@ -5,6 +5,7 @@
 #include "netleaf_module.h"
 #include "netleaf_mqtt_tls.h"
 #include "netleaf_mqtt_lang.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -16,7 +17,6 @@
     #include <ws2tcpip.h>
     #include <errno.h>
     #define snprintf _snprintf
-    #define strdup _strdup
     #define closesocket_close closesocket
     typedef int fd_t;
     #ifndef EAGAIN
@@ -25,16 +25,6 @@
     #ifndef EWOULDBLOCK
         #define EWOULDBLOCK EAGAIN
     #endif
-    static inline char* nl_strndup(const char* s, size_t n) {
-        size_t len = strlen(s);
-        if (len > n) len = n;
-        char* result = (char*)malloc(len + 1);
-        if (!result) return NULL;
-        memcpy(result, s, len);
-        result[len] = '\0';
-        return result;
-    }
-    #define strndup nl_strndup
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -485,7 +475,7 @@ nl_mqtt_property_t* nl_mqtt_property_create(int type, int int_val,
     prop->type = type;
     prop->int_value = int_val;
     if (str_val) {
-        prop->str_value = strdup(str_val);
+        prop->str_value = nl_strdup(str_val);
         prop->str_len = strlen(str_val);
     }
     return prop;
@@ -1242,7 +1232,7 @@ int nl_mqtt_connect(nl_mqtt_client_t* client,
 
     nl_mqtt_disconnect(client);
 
-    client->host = strdup(host);
+    client->host = nl_strdup(host);
     if (!client->host) return -1;
     client->port = port;
     client->on_connect = on_connect;
@@ -1251,22 +1241,22 @@ int nl_mqtt_connect(nl_mqtt_client_t* client,
     // Copy options
     if (opts) {
         if (opts->client_id) {
-            client->client_id = strdup(opts->client_id);
+            client->client_id = nl_strdup(opts->client_id);
             if (!client->client_id) { free(client->host); client->host = NULL; client->status = NL_MQTT_DISCONNECTED; return -1; }
         }
         if (opts->username) {
-            client->username = strdup(opts->username);
+            client->username = nl_strdup(opts->username);
             if (!client->username) { free(client->host); client->host = NULL; free(client->client_id); client->client_id = NULL; client->status = NL_MQTT_DISCONNECTED; return -1; }
         }
         if (opts->password) {
-            client->password = strdup(opts->password);
+            client->password = nl_strdup(opts->password);
             if (!client->password) { free(client->host); client->host = NULL; free(client->client_id); client->client_id = NULL; free(client->username); client->username = NULL; client->status = NL_MQTT_DISCONNECTED; return -1; }
         }
         if (opts->will_enabled && opts->will_topic) {
             client->will_enabled = 1;
-            client->will_topic = strdup(opts->will_topic);
+            client->will_topic = nl_strdup(opts->will_topic);
             if (opts->will_msg) {
-                client->will_msg = strndup(opts->will_msg, opts->will_msg_len ? opts->will_msg_len : strlen(opts->will_msg));
+                client->will_msg = nl_strndup(opts->will_msg, opts->will_msg_len ? opts->will_msg_len : strlen(opts->will_msg));
                 client->will_msg_len = client->will_msg ? strlen(client->will_msg) : 0;
             }
             client->will_qos = opts->will_qos;
@@ -1306,7 +1296,11 @@ int nl_mqtt_connect(nl_mqtt_client_t* client,
             client->status = NL_MQTT_DISCONNECTED;
             return -1;
         }
-        int ret = nl_mqtt_tls_handshake(client->tls_ctx, sock);
+        /* 握手超时：取 keep_alive*1000（下限 30s），避免对端无响应时永久阻塞 */
+        int tls_timeout_ms = (client->keep_alive > 0)
+            ? (int)client->keep_alive * 1000 : 30000;
+        if (tls_timeout_ms < 30000) tls_timeout_ms = 30000;
+        int ret = nl_mqtt_tls_handshake_ex(client->tls_ctx, sock, tls_timeout_ms);
         if (ret != NL_MQTT_TLS_OK) {
             closesocket_close(sock);
             client->sock = -1;
@@ -1386,7 +1380,7 @@ int nl_mqtt_subscribe(nl_mqtt_client_t* client,
     // Add subscription
     nl_mqtt_subscription_t* sub = (nl_mqtt_subscription_t*)calloc(1, sizeof(*sub));
     if (!sub) return -1;
-    sub->topic = strdup(topic);
+    sub->topic = nl_strdup(topic);
     if (!sub->topic) { free(sub); return -1; }
     sub->qos = qos;
     sub->callback = on_message;

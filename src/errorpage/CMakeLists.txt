@@ -16,7 +16,11 @@ target_include_directories(netleaf_errorpage PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(netleaf_errorpage PRIVATE NL_ERRORPAGE_EXPORTS)
-target_link_libraries(netleaf_errorpage PUBLIC netleaf_core netleaf_lang)
+target_link_libraries(netleaf_errorpage PUBLIC netleaf_core)
+# Lang 为官方软依赖：BUILD_LANG=ON 时链接并定义 NL_LANG_ENABLE
+if(BUILD_LANG)
+    target_link_libraries(netleaf_errorpage PUBLIC netleaf_lang)
+endif()
 
 # 安装规则
 install(TARGETS netleaf_errorpage

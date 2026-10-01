@@ -88,6 +88,18 @@ typedef int  (*nl_mqtt_server_auth_callback_t)(const char* client_id,
                                                 const char* username,
                                                 const char* password,
                                                 void* user_data);
+// 增强认证：AUTH(0xF0) 报文往返处理回调。
+// client_id:  发起重认证的客户端 id(可能为服务端分配)
+// method:     客户端声明/沿用的认证方法名(如 "X-OAuth2")；NULL 表示沿用原方法
+// auth_data:  客户端携带的认证数据(UTF-8/二进制，已去首长度前缀)；NULL 表示无
+// 返回值:  0  = 认证成功(服务端回 AUTH reason_code=0)
+//          非0 = 需继续握手(服务端回 AUTH reason_code=0x02)，客户端可再次发 AUTH
+//         负值 = 认证失败(服务端断开 0x8C)
+typedef int  (*nl_mqtt_server_auth_reauth_callback_t)(const char* client_id,
+                                                      const char* method,
+                                                      const void* auth_data,
+                                                      size_t auth_data_len,
+                                                      void* user_data);
 
 // Server configuration
 typedef struct nl_mqtt_server_config {
@@ -101,6 +113,8 @@ typedef struct nl_mqtt_server_config {
     const char*               key_file;
     nl_mqtt_server_auth_callback_t auth_callback;
     void*                     auth_user_data;
+    // 增强认证：处理 AUTH(0xF0) 报文的重认证回调(可选；NULL 时 AUTH 一律 0x8C 断开)
+    nl_mqtt_server_auth_reauth_callback_t auth_reauth_callback;
     nl_mqtt_property_t*       properties;
 
     // 出站 QoS 未确认消息的重传与会话保留参数(<=0 表示使用内部默认值)

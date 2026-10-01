@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -27,6 +28,9 @@
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 65535
+#define DEFAULT_CONCURRENCY 4
+#define MAX_CONCURRENCY 64
+#define MAX_WORKER_QUEUE 1024
 
 struct nl_server {
     int fd;
@@ -35,10 +39,24 @@ struct nl_server {
     nl_protocol_t protocol;
     nl_request_handler handler;
     nl_udp_message_handler udp_handler;
+    nl_udp_message_handler_v2 udp_handler_v2;
     void* user_data;
     volatile int running;
     pthread_t thread_id;
     struct kevent events[MAX_EVENTS];
+    int concurrency;
+    int num_workers;
+    pthread_t* workers;
+    int* queue;
+    int queue_head;
+    int queue_tail;
+    int queue_count;
+    int queue_max;
+    pthread_mutex_t queue_lock;
+    pthread_cond_t queue_not_empty;
+    pthread_cond_t queue_not_full;
+    int queue_init;
+    int pool_used;
 };
 
 struct nl_client {
@@ -176,6 +194,12 @@ static int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+static int set_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
 static int set_reuseaddr(int fd) {
     int opt = 1;
     return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -294,7 +318,7 @@ static void parse_http_request(const char* data, size_t len,
     free(line);
 }
 
-static void* server_thread(void* arg) {
+static void* listener_thread(void* arg) {
     nl_server_t* server = (nl_server_t*)arg;
     
     while (server->running) {
@@ -314,17 +338,63 @@ static void* server_thread(void* arg) {
             
             if (fd == server->fd) {
                 if (server->protocol == NL_PROTO_UDP) {
-                    if (server->udp_handler) {
+                    if (server->udp_handler || server->udp_handler_v2) {
                         char buf[BUFFER_SIZE];
                         struct sockaddr_in addr;
                         socklen_t addr_len = sizeof(addr);
                         ssize_t len = recvfrom(fd, buf, BUFFER_SIZE, 0,
                                               (struct sockaddr*)&addr, &addr_len);
                         if (len > 0) {
-                            server->udp_handler(buf, (size_t)len, server->user_data);
+                            if (server->udp_handler_v2) {
+                                // BUG-201: expose peer address + port to v2 handler
+                                char addr_str[INET6_ADDRSTRLEN];
+                                if (inet_ntop(AF_INET, &addr.sin_addr, addr_str, sizeof(addr_str)) != NULL) {
+                                    server->udp_handler_v2(buf, (size_t)len,
+                                                           addr_str, (int)ntohs(addr.sin_port),
+                                                           server->user_data);
+                                } else {
+                                    server->udp_handler_v2(buf, (size_t)len,
+                                                           "0.0.0.0", (int)ntohs(addr.sin_port),
+                                                           server->user_data);
+                                }
+                            } else {
+                                server->udp_handler(buf, (size_t)len, server->user_data);
+                            }
                         }
                     }
+                } else if (server->pool_used) {
+                    // Dispatch to worker pool
+                    while (server->running) {
+                        struct sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
+                        if (client_fd == -1) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
+                                break;
+                            }
+                            if (errno != EINTR) {
+                                macos_log(NL_LOG_ERROR, "macOS: accept() failed: %s", strerror(errno));
+                            }
+                            break;
+                        }
+                        set_blocking(client_fd);
+                        pthread_mutex_lock(&server->queue_lock);
+                        while (server->queue_count == server->queue_max && server->running) {
+                            pthread_cond_wait(&server->queue_not_full, &server->queue_lock);
+                        }
+                        if (!server->running) {
+                            pthread_mutex_unlock(&server->queue_lock);
+                            close(client_fd);
+                            break;
+                        }
+                        server->queue[server->queue_tail] = client_fd;
+                        server->queue_tail = (server->queue_tail + 1) % server->queue_max;
+                        server->queue_count++;
+                        pthread_cond_signal(&server->queue_not_empty);
+                        pthread_mutex_unlock(&server->queue_lock);
+                    }
                 } else {
+                    // Legacy single-thread path
                     struct sockaddr_in client_addr;
                     socklen_t client_len = sizeof(client_addr);
                     int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
@@ -358,11 +428,22 @@ static void* server_thread(void* arg) {
                         server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
 
                         if (response && response_len > 0) {
-                            write(fd, response, response_len);
+                            if (write(fd, response, response_len) < 0) { /* best-effort */ }
                             free(response);
                         }
-                    } else if (n == 0) {
+
+                        // BUG-001: HTTP 请求-响应模型，写完 response 即关 fd。
+                        // kqueue 在 close 时会自动 detach EVFILT_READ，无需 EV_DELETE。
                         close(fd);
+                    } else if (n == 0) {
+                        // 对端 FIN（kqueue EVFILT_READ 在 read 返回 0 时自动 detach）
+                        close(fd);
+                    } else if (n < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // 非阻塞，下次再来
+                        } else {
+                            close(fd);
+                        }
                     }
                     
                     nl_buffer_destroy(req);
@@ -374,12 +455,139 @@ static void* server_thread(void* arg) {
     return NULL;
 }
 
+static void worker_handle_connection(nl_server_t* server, int fd) {
+    nl_buffer_t* req = nl_buffer_create(BUFFER_SIZE);
+    if (!req) {
+        close(fd);
+        return;
+    }
+
+    char buf[BUFFER_SIZE];
+    int idle_ms = 30000;
+    while (server->running) {
+        int have_data = 0;
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        int pr = poll(&pfd, 1, idle_ms);
+        if (pr == -1) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) {
+            have_data = (nl_buffer_size(req) > 0);
+        } else if (pfd.revents & (POLLIN | POLLRDNORM)) {
+            have_data = 1;
+        }
+
+        if (have_data) {
+            ssize_t n = read(fd, buf, BUFFER_SIZE);
+            if (n > 0) {
+                nl_buffer_write(req, buf, (size_t)n);
+            } else if (n == 0) {
+                break;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                break;
+            }
+        }
+
+        if (nl_buffer_size(req) > 0 && server->handler) {
+            char path[1024] = {0};
+            nl_http_method_t method = NL_METHOD_GET;
+            const char* body = NULL;
+            size_t body_size = 0;
+
+            parse_http_request(req->data, nl_buffer_size(req),
+                              path, sizeof(path), &method, &body, &body_size);
+
+            char* response = NULL;
+            size_t response_len = 0;
+            server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
+
+            if (response && response_len > 0) {
+                ssize_t total = 0;
+                while (total < (ssize_t)response_len) {
+                    ssize_t w = write(fd, response + total, response_len - total);
+                    if (w <= 0) break;
+                    total += w;
+                }
+                free(response);
+            }
+            nl_buffer_clear(req);
+        }
+
+        if (!have_data || pr == 0) break;
+    }
+
+    close(fd);
+    nl_buffer_destroy(req);
+}
+
+static void* worker_thread(void* arg) {
+    nl_server_t* server = (nl_server_t*)arg;
+
+    while (server->running) {
+        int fd = -1;
+        pthread_mutex_lock(&server->queue_lock);
+        while (server->queue_count == 0 && server->running) {
+            pthread_cond_wait(&server->queue_not_empty, &server->queue_lock);
+        }
+        if (!server->running) {
+            pthread_mutex_unlock(&server->queue_lock);
+            break;
+        }
+        fd = server->queue[server->queue_head];
+        server->queue_head = (server->queue_head + 1) % server->queue_max;
+        server->queue_count--;
+        pthread_cond_signal(&server->queue_not_full);
+        pthread_mutex_unlock(&server->queue_lock);
+        
+        worker_handle_connection(server, fd);
+    }
+    
+    return NULL;
+}
+
+static void stop_worker_pool(nl_server_t* server) {
+    if (!server->pool_used) return;
+    pthread_mutex_lock(&server->queue_lock);
+    server->running = 0;
+    for (int i = 0; i < server->queue_count; i++) {
+        int fd = server->queue[server->queue_head];
+        server->queue_head = (server->queue_head + 1) % server->queue_max;
+        if (fd > 0) close(fd);
+    }
+    server->queue_count = 0;
+    pthread_cond_broadcast(&server->queue_not_empty);
+    pthread_cond_broadcast(&server->queue_not_full);
+    pthread_mutex_unlock(&server->queue_lock);
+    for (int i = 0; i < server->num_workers; i++) {
+        pthread_join(server->workers[i], NULL);
+    }
+    pthread_cond_destroy(&server->queue_not_empty);
+    pthread_cond_destroy(&server->queue_not_full);
+    pthread_mutex_destroy(&server->queue_lock);
+    free(server->queue);
+    free(server->workers);
+    server->queue = NULL;
+    server->workers = NULL;
+    server->num_workers = 0;
+    server->pool_used = 0;
+}
+
+static void cleanup_start_failure(nl_server_t* server) {
+    stop_worker_pool(server);
+}
+
 nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
     nl_server_t* server = calloc(1, sizeof(nl_server_t));
     if (!server) return NULL;
     
     server->protocol = protocol;
     server->port = port;
+    server->concurrency = 0;
+    server->num_workers = 0;
+    server->pool_used = 0;
     server->kqueue_fd = kqueue();
     
     if (server->kqueue_fd == -1) {
@@ -428,19 +636,62 @@ nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
 
 void nl_server_destroy(nl_server_t* server) {
     if (!server) return;
+    /* Signal the listener thread to stop BEFORE touching its fds, otherwise
+     * it blocks on kevent() and we leak the thread + UAF on free(server). */
+    server->running = 0;
+    if (server->pool_used) stop_worker_pool(server);
     if (server->fd != -1) close(server->fd);
     if (server->kqueue_fd != -1) close(server->kqueue_fd);
+    /* Join the listener thread so it cannot run after free(server) below. */
+    pthread_join(server->thread_id, NULL);
     free(server);
 }
 
 int nl_server_start(nl_server_t* server) {
     if (!server) return NL_EINVAL;
     
+    int pool_created = 0;
+    
     if (server->protocol == NL_PROTO_TCP || server->protocol == NL_PROTO_HTTP || 
         server->protocol == NL_PROTO_WEBSOCKET) {
         if (listen(server->fd, SOMAXCONN) == -1) {
             macos_log(NL_LOG_ERROR, "macOS: listen() failed: %s", strerror(errno));
             return NL_ERROR;
+        }
+        
+        int use_pool = (server->protocol != NL_PROTO_UDP) ? 1 : 0;
+        int target = (server->concurrency >= 1 && server->concurrency <= MAX_CONCURRENCY)
+                     ? server->concurrency : DEFAULT_CONCURRENCY;
+        if (use_pool && !server->pool_used) {
+            server->num_workers = target;
+            server->queue_max = MAX_WORKER_QUEUE;
+            server->queue_head = 0;
+            server->queue_tail = 0;
+            server->queue_count = 0;
+            server->queue = calloc((size_t)server->queue_max, sizeof(int));
+            server->workers = calloc((size_t)server->num_workers, sizeof(pthread_t));
+            if (!server->queue || !server->workers) {
+                free(server->queue);
+                free(server->workers);
+                server->queue = NULL;
+                server->workers = NULL;
+                server->num_workers = 0;
+                macos_log(NL_LOG_ERROR, "macOS: failed to allocate worker pool");
+                return NL_ERROR;
+            }
+            pthread_mutex_init(&server->queue_lock, NULL);
+            pthread_cond_init(&server->queue_not_empty, NULL);
+            pthread_cond_init(&server->queue_not_full, NULL);
+            server->pool_used = 1;
+            pool_created = 1;
+            server->running = 1;
+            for (int i = 0; i < server->num_workers; i++) {
+                if (pthread_create(&server->workers[i], NULL, worker_thread, server) != 0) {
+                    cleanup_start_failure(server);
+                    macos_log(NL_LOG_ERROR, "macOS: failed to create worker thread %d", i);
+                    return NL_ERROR;
+                }
+            }
         }
     }
     
@@ -449,27 +700,44 @@ int nl_server_start(nl_server_t* server) {
     
     if (kevent(server->kqueue_fd, &ev, 1, NULL, 0, NULL) == -1) {
         macos_log(NL_LOG_ERROR, "macOS: kevent() failed: %s", strerror(errno));
+        if (pool_created) stop_worker_pool(server);
         return NL_ERROR;
     }
     
-    server->running = 1;
-    if (pthread_create(&server->thread_id, NULL, server_thread, server) != 0) {
+    if (pool_created) {
+        server->running = 1;
+    }
+    if (pthread_create(&server->thread_id, NULL, listener_thread, server) != 0) {
         server->running = 0;
+        if (pool_created) stop_worker_pool(server);
         return NL_ERROR;
     }
     
-    macos_log(NL_LOG_INFO, "macOS: Server started (kqueue), fd=%d", server->fd);
+    macos_log(NL_LOG_INFO, "macOS: Server started (kqueue), fd=%d, workers=%d",
+              server->fd, server->pool_used ? server->num_workers : 0);
     return NL_OK;
 }
 
 void nl_server_stop(nl_server_t* server) {
     if (!server) return;
     server->running = 0;
-    if (server->fd != -1) close(server->fd);
+    stop_worker_pool(server);
+    
+    if (server->fd != -1) {
+        close(server->fd);
+        server->fd = -1;
+    }
     if (server->thread_id) {
         pthread_join(server->thread_id, NULL);
     }
     macos_log(NL_LOG_INFO, "macOS: Server stopped");
+}
+
+int nl_server_set_concurrency(nl_server_t* server, int threads) {
+    if (!server) return NL_EINVAL;
+    if (threads <= 0 || threads > MAX_CONCURRENCY) return NL_EINVAL;
+    server->concurrency = threads;
+    return NL_OK;
 }
 
 void nl_server_set_handler(nl_server_t* server, nl_request_handler handler, void* user_data) {
@@ -481,6 +749,12 @@ void nl_server_set_handler(nl_server_t* server, nl_request_handler handler, void
 void nl_server_set_udp_handler(nl_server_t* server, nl_udp_message_handler handler, void* user_data) {
     if (!server) return;
     server->udp_handler = handler;
+    server->user_data = user_data;
+}
+
+void nl_server_set_udp_handler_v2(nl_server_t* server, nl_udp_message_handler_v2 handler, void* user_data) {
+    if (!server) return;
+    server->udp_handler_v2 = handler;
     server->user_data = user_data;
 }
 
@@ -511,6 +785,9 @@ int nl_server_set_option(nl_server_t* server, nl_socket_option_t option, int val
         case NL_OPT_SO_BROADCAST:
             result = set_broadcast(server->fd, value);
             break;
+        case NL_OPT_CONCURRENCY:
+            result = (nl_server_set_concurrency(server, value) == NL_OK) ? 0 : -1;
+            break;
         default:
             return NL_ENOTSUPPORTED;
     }
@@ -538,6 +815,10 @@ int nl_server_get_option(nl_server_t* server, nl_socket_option_t option, int* va
             if (getsockopt(server->fd, SOL_SOCKET, SO_RCVBUF, value, &len) == -1) {
                 return NL_ERROR;
             }
+            break;
+        case NL_OPT_CONCURRENCY:
+            *value = (server->concurrency >= 1 && server->concurrency <= MAX_CONCURRENCY)
+                     ? server->concurrency : DEFAULT_CONCURRENCY;
             break;
         default:
             return NL_ENOTSUPPORTED;

@@ -1,19 +1,19 @@
 # NetLeaf 插件开发指南
 
-NetLeaf v2.4.0 的 NL 扩展系统支持第三方开发者创建自定义插件，实现动态加载、热重载、事件系统等功能。
+NetLeaf v2.4.2 的 NL 扩展系统支持第三方开发者创建自定义插件，实现动态加载、热重载、事件系统等功能。
 
 ## 快速开始
 
 ### 1. 获取模板
 
 ```bash
-cp -r examples/plugin_template my_plugin
+cp -r examples/plugin_example my_plugin
 cd my_plugin
 ```
 
 ### 2. 配置插件
 
-编辑 `netleaf_plugin_template.h`：
+编辑 `netleaf_plugin_template.h`（实际项目中的插件头文件）：
 
 ```c
 #define MY_PLUGIN_ID          "my_plugin_v1"        // 唯一标识符
@@ -225,7 +225,7 @@ typedef enum {
 
 ## 完整示例
 
-参考 `examples/plugin_template/` 目录。
+参考 `examples/plugin_example/` 目录。
 
 ## 发布插件
 
@@ -258,9 +258,22 @@ A: 设置正确的 `min_nl_version`，确保与当前 NetLeaf 版本兼容。
 **Q: 线程安全问题**
 A: 如果支持多线程，使用互斥锁保护共享数据。
 
+### 插件描述符
+
+- **`nl_plugin_get_descriptor()`**：返回对应 slot 的指针。这是**线程安全的推荐用法**，避免直接读 `handle->descriptor`。
+- **`nl_plugin_get_descriptor_into()`**：将描述符拷贝到调用方提供的 `nl_plugin_descriptor_t` 中（调用方持有副本），适合需要留存描述符信息的场景，比裸指针更安全。
+- **`nl_plugin_register()`**：将插件句柄挂载到指定 slot。重复注册同一 slot 会替换旧句柄；`nl_plugin_register()` 本身不重复注册。
+- **`nl_plugin_get_all()`**：调用方需逐个 `nl_free()` 返回数组中的每个句柄。
+- **`nl_plugin_discover()`** 副作用：扫描目录中的 `.dll`/`.so` 并**自动加载**到空闲 slot。扫描即加载。
+- **`nl_plugin_discover_all()`**：传入 `NULL` 时返回 0，不会自动列出插件；列出已加载插件请用 `nl_plugin_get_all()`。
+- **`nl_plugin_search()`**：使用 `strstr` 匹配插件 name 或 id，不支持通配符。例如 `nl_plugin_search("auth")` 会匹配名为 `nl_auth` 的插件。
+- **事件订阅上限 16**：每个插件最多 16 个事件订阅。
+- **`nl_plugin_enable_sandbox()` / `nl_plugin_is_sandboxed()`**：占位实现，当前未生效。
+- **`nl_plugin_validate()`**：校验 name/id/version 非空。
+
 ## 相关文档
 
 - [NL 扩展系统头文件](../include/netleaf_module.h)
 - [主库头文件](../include/netleaf.h)
 - [扩展库开发指南](Extension.md)
-- [示例插件](../examples/plugin_template/)
+- [示例插件](../examples/plugin_example/)

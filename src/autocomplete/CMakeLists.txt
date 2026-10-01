@@ -18,7 +18,11 @@ target_include_directories(netleaf_autocomplete PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(netleaf_autocomplete PRIVATE NL_AUTOCOMPLETE_EXPORTS)
-target_link_libraries(netleaf_autocomplete PUBLIC netleaf_core netleaf_lang netleaf_vue)
+target_link_libraries(netleaf_autocomplete PUBLIC netleaf_core netleaf_vue)
+# Lang 为官方软依赖：BUILD_LANG=ON 时链接并定义 NL_LANG_ENABLE
+if(BUILD_LANG)
+    target_link_libraries(netleaf_autocomplete PUBLIC netleaf_lang)
+endif()
 
 # 安装规则
 install(TARGETS netleaf_autocomplete

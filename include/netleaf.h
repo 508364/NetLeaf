@@ -13,10 +13,10 @@
 #include "netleaf_module.h"
 
 // Version macros
-#define NETLEAF_VERSION "2.4.1"
+#define NETLEAF_VERSION "2.4.2"
 #define NETLEAF_VERSION_MAJOR 2
 #define NETLEAF_VERSION_MINOR 4
-#define NETLEAF_VERSION_PATCH 1
+#define NETLEAF_VERSION_PATCH 2
 
 // Network types
 typedef enum {
@@ -48,6 +48,27 @@ typedef enum {
 } nl_http_method_t;
 
 // HTTP handler type
+//
+// IMPORTANT: *response ownership contract
+// ---------------------------------------------------------------
+// After the handler returns, netleaf will call free() on *response
+// when *response != NULL.  This means:
+//
+//   - *response MUST point to heap memory obtained via malloc /
+//     calloc / realloc (or equivalent NL-owned allocator).
+//   - Passing a string literal, static/global char array, or any
+//     non-heap pointer will cause netleaf to call free() on an
+//     invalid pointer, which is undefined behaviour (typically
+//     "free(): invalid pointer" and process crash).
+//   - To return no response, set *response = NULL and *response_len = 0.
+//
+// Example:
+//     char* html = malloc(256);
+//     int n = snprintf(html, 256, "OK path=%s", path);
+//     *response = html;
+//     *response_len = (size_t)n;
+//
+//     // or simply: *response = NULL; *response_len = 0;
 typedef void (*nl_http_handler_t)(const char* path, nl_http_method_t method, const char* body, size_t body_size, char** response, size_t* response_len, void* userdata);
 
 // Request handler type (legacy alias)
@@ -55,6 +76,14 @@ typedef nl_http_handler_t nl_request_handler;
 
 // UDP message handler type
 typedef void (*nl_udp_message_handler)(const char* data, size_t len, void* userdata);
+
+// UDP v2 message handler type (BUG-201)
+//   - peer_addr  : 对端 IPv4 地址字符串（"192.168.1.1"）
+//   - peer_port  : 对端端口（网络字节序已转换为 host 序）
+// 该扩展 API 允许 echo/ack 服务器根据 peer 信息回复数据。
+typedef void (*nl_udp_message_handler_v2)(const char* data, size_t len,
+                                          const char* peer_addr, int peer_port,
+                                          void* userdata);
 
 // Socket descriptor
 #ifdef _WIN32
@@ -132,7 +161,8 @@ typedef enum {
     NL_OPT_SO_RCVBUF,
     NL_OPT_SO_REUSEADDR,
     NL_OPT_SO_REUSEPORT,
-    NL_OPT_SO_BROADCAST
+    NL_OPT_SO_BROADCAST,
+    NL_OPT_CONCURRENCY      /**< Worker pool size (1..64), default 4; TCP only */
 } nl_socket_option_t;
 
 // Server handle
@@ -255,9 +285,26 @@ NL_API void nl_server_set_handler(nl_server_t* server, nl_request_handler handle
 NL_API void nl_server_set_udp_handler(nl_server_t* server, nl_udp_message_handler handler, void* user_data);
 
 /**
+ * @brief Set UDP v2 message handler for server (BUG-201)
+ *
+ * 与 nl_server_set_udp_handler 的区别：v2 回调会附带对端
+ * IPv4 地址字符串（host-序 int port）作为入参，允许
+ * echo / ack 类 UDP 服务器回包到正确的 peer。
+ *
+ * 与 nl_server_set_udp_handler 互斥：后设的会覆盖先设的。
+ * 同时设置了 v1 和 v2 时，v2 优先级更高。
+ */
+NL_API void nl_server_set_udp_handler_v2(nl_server_t* server, nl_udp_message_handler_v2 handler, void* user_data);
+
+/**
  * @brief Set socket option for server
  */
 NL_API int nl_server_set_option(nl_server_t* server, nl_socket_option_t option, int value);
+
+/**
+ * @brief Set concurrency level for server (worker pool size)
+ */
+NL_API int nl_server_set_concurrency(nl_server_t* server, int concurrency);
 
 /**
  * @brief Get socket option for server

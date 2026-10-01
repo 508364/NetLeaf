@@ -57,8 +57,16 @@ static void load_sys_info(void) {
         total_ram = 0;
     }
     
-    snprintf(runtime_version, sizeof(runtime_version), "glibc %d.%d", 
+#if defined(__ANDROID__)
+    /* Bionic (Android libc) has no GLIBC version macros. The NDK tag is
+     * sufficient to identify the runtime on Android. */
+    snprintf(runtime_version, sizeof(runtime_version), "Bionic (NDK)");
+#elif defined(__GLIBC__)
+    snprintf(runtime_version, sizeof(runtime_version), "glibc %d.%d",
              __GLIBC__, __GLIBC_MINOR__);
+#else
+    snprintf(runtime_version, sizeof(runtime_version), "unknown C library");
+#endif
     
     sys_info_loaded = 1;
 }

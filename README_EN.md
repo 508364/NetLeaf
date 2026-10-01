@@ -2,7 +2,7 @@
   <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
   <h1>NetLeaf</h1>
   <p>High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.</p>
-  <img src="https://img.shields.io/badge/NetLeaf-v2.4.1-blue?style=for-the-badge" alt="NetLeaf Version">
+  <img src="https://img.shields.io/badge/NetLeaf-v2.4.2-blue?style=for-the-badge" alt="NetLeaf Version">
   <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
   <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28.10-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
   <a href="https://mqttt.com"><img src="https://img.shields.io/badge/MQTT-5.0/3.1.1-yellow?style=for-the-badge" alt="MQTT v5.0/3.1.1"></a>
@@ -14,10 +14,11 @@
 - ✅ Windows (IOCP) - Full support
 - ✅ Linux (epoll) - Full support
 - ✅ macOS (kqueue) - Full support
+- ✅ Android (Bionic) - Core library cross-compilation (arm64-v8a/armeabi-v7a/x86_64); extension system not yet supported (code retained, follow-up planned)
 
 ## Features
 
-- ✅ **Cross-platform**: Windows / Linux / macOS
+- ✅ **Cross-platform**: Windows / Linux / macOS / Android (core library; extensions pending)
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
 - ✅ **Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, TCP, UDP
 - ✅ **TLS/SSL**: Built-in mbedTLS 2.28.10 (LTS), supports TLS 1.0-1.3
@@ -26,7 +27,7 @@
 - ✅ **Data Parsing**: JSON + TOML
 - ✅ **Lazy Loading**: All components support lazy loading
 - ✅ **System Info**: OS/Architecture/CPU/RAM/Runtime information
-- ✅ **Multi-threading**: Configurable thread pool (1-256 threads)
+- ✅ **Multi-threading**: Configurable thread pool for the H1 core server (1-64 worker threads, default 4)
 - ✅ **Dynamic Encoding**: Auto encoding negotiation and transcoding (UTF-8, GBK, Big5, etc.)
 - ✅ **Auto-complete**: Automatic charset/Vue import
 - ✅ **Auto-route**: Route suggestions for 404 pages
@@ -46,15 +47,16 @@
 #include "netleaf.h"
 
 int main() {
-    // Enable auto cleanup on exit (recommended)
-    nl_web_set_auto_cleanup(1);
-    
-    // Create and start web server in one step
+    // Create and start web server
     nl_web_server_t* server = nl_web_create(8080);
-    
+    if (!server) {
+        return 1;
+    }
+    nl_web_start(server);
+
     // Add HTML page
     nl_web_add_html(server, "/", "<h1>Hello NetLeaf!</h1>");
-    
+
     // Keep server running
     while (1) {
 #ifdef _WIN32
@@ -63,7 +65,9 @@ int main() {
         sleep(1);
 #endif
     }
-    
+
+    nl_web_stop(server);
+    nl_web_destroy(server);
     return 0;
 }
 ```
@@ -87,23 +91,65 @@ chmod +x build_all.sh
 ./build_all.sh
 ```
 
+### Android (cross-compilation)
+
+```bash
+# Linux / WSL / macOS
+chmod +x build_android.sh
+./build_android.sh            # build all three ABIs
+./build_android.sh aarch64    # arm64-v8a only
+
+# Windows
+build_android.bat
+```
+
+Supports `arm64-v8a` (recommended) / `armeabi-v7a` / `x86_64`, `minSdkVersion` 21.
+Requires Android NDK r25+; the script auto-detects the NDK path.
+
+> **Scope**: Android covers the **core library** (`netleaf_core`). The **extension
+> system (NL Extension) is not yet supported on the Android runtime**; its source
+> code and build configuration are retained and will be followed up per extension.
+> Extension shared libraries are still built under Linux semantics for Android targets.
+
+See `docs/android_build.md` for the full guide.
+
 ## API Reference
 
 ### Core Functions
 
 ```c
-// Create and start web server
+// Create web server
 nl_web_server_t* nl_web_create(int port);
+
+// Start / stop web server
+int  nl_web_start(nl_web_server_t* server);
+void nl_web_stop(nl_web_server_t* server);
 
 // Destroy web server
 void nl_web_destroy(nl_web_server_t* server);
 
-// Stop server by port
-void nl_web_stop_by_port(int port);
-
-// Set auto cleanup on exit
-void nl_web_set_auto_cleanup(int enable);
+// Add content routes
+void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html);
+void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
+void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
 ```
+
+### Core H1 Server Thread Pool
+
+```c
+// Set the worker pool size of a core nl_server_t (1..64, default 4; TCP only)
+int nl_server_set_concurrency(nl_server_t* server, int concurrency);
+
+// Same option via nl_socket_option_t: NL_OPT_CONCURRENCY (via
+// nl_server_set_option / nl_server_get_option)
+```
+
+- Upgrades the core `nl_server_*` TCP/HTTP/WebSocket service from a single-thread
+  event loop to a **configurable thread-pool working model** (listener thread + N
+  worker threads) for concurrent multi-user requests; the UDP path stays
+  single-threaded.
+- POSIX (Linux/macOS): `pthread_t*` + `pthread_mutex_t` + two `pthread_cond_t`;
+  Windows: `HANDLE*` (`CreateThread`) + `CRITICAL_SECTION` + two auto-reset events.
 
 ### System Information (Lazy Loading)
 
@@ -158,7 +204,7 @@ MIT License
 
 ## Version
 
-2.4.1
+2.4.2
 
 ## Open Source Projects Sources
 
@@ -174,14 +220,16 @@ This project references and integrates the following open source projects:
 
 This project includes mbedTLS 2.28.10 LTS source code (located in `third-party/mbedtls/`) to provide TLS 1.0 - TLS 1.3 encryption support. mbedTLS 2.28 is the last LTS series that still implements TLS 1.0/1.1 in addition to TLS 1.2/1.3 (mbedTLS 3.x removed TLS 1.0/1.1). The mbedTLS library is built as static libraries as part of the NetLeaf build process and linked against the TLS extension module.
 
+As of v2.4.2, the TLS extension is split into two backends: `netleaf_tls2` (mbedTLS 2.28.10, `third-party/mbedtls/`, TLS 1.0-1.3) and `netleaf_tls3` (mbedTLS 3.6.x, `third-party/mbedtls3/`, TLS 1.2/1.3, enabled by default via `-DBUILD_TLS3=ON`, mutually exclusive with `BUILD_TLS`).
+
 > ⚠️ **Security note (TLS 1.0 / 1.1 are NOT recommended)**
 > TLS 1.0 and TLS 1.1 are deprecated by [RFC 8996](https://www.rfc-editor.org/rfc/rfc8996) and have known weaknesses; **they should not be used in new projects or production**.
-> TLS in NetLeaf is provided by the **separate TLS extension module** (`netleaf_tls`, bundling mbedTLS). TLS 1.0/1.1 are kept only for interoperability with legacy peers —
-> always set `nl_tls_config_t::min_proto` to `NL_TLS_PROTO_TLS1_2` or higher.
+> TLS in NetLeaf is provided by the **separate TLS extension modules** (`netleaf_tls2`, bundling mbedTLS 2.28.10, or `netleaf_tls3`, bundling mbedTLS 3.6.x). TLS 1.0/1.1 are kept only for interoperability with legacy peers (tls2 backend) —
+> always set `nl_tls2_config_t::min_proto` to `NL_TLS2_PROTO_TLS1_2` or higher.
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v2.4.1) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v2.4.2) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 

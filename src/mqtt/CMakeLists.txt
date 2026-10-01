@@ -40,10 +40,14 @@ if(BUILD_MQTT)
         target_compile_definitions(netleaf_mqtt PRIVATE NL_MQTT_TLS_ENABLE)
     endif()
 
-    # 链接核心库、语言扩展，以及可选的 TLS 扩展
-    target_link_libraries(netleaf_mqtt PUBLIC netleaf_core netleaf_lang)
+    # 链接核心库与可选的 TLS 扩展
+    target_link_libraries(netleaf_mqtt PUBLIC netleaf_core)
+    # Lang 为官方软依赖：BUILD_LANG=ON 时链接并定义 NL_LANG_ENABLE
+    if(BUILD_LANG)
+        target_link_libraries(netleaf_mqtt PUBLIC netleaf_lang)
+    endif()
     if(BUILD_TLS)
-        target_link_libraries(netleaf_mqtt PRIVATE netleaf_tls mbedtls mbedx509 mbedcrypto)
+        target_link_libraries(netleaf_mqtt PRIVATE netleaf_tls2 mbedtls mbedx509 mbedcrypto)
     endif()
 
     # 平台相关链接
@@ -90,13 +94,17 @@ if(BUILD_MQTT_SERVER)
         NL_MQTT_SERVER_EXPORTS
     )
 
-    # 链接核心库、语言扩展与 MQTT 客户端
-    target_link_libraries(netleaf_mqtt_server PUBLIC netleaf_core netleaf_lang netleaf_mqtt)
+    # 链接核心库与 MQTT 客户端
+    target_link_libraries(netleaf_mqtt_server PUBLIC netleaf_core netleaf_mqtt)
+    # Lang 为官方软依赖：BUILD_LANG=ON 时链接并定义 NL_LANG_ENABLE
+    if(BUILD_LANG)
+        target_link_libraries(netleaf_mqtt_server PUBLIC netleaf_lang)
+    endif()
 
-    # 启用 TLS 时：服务端 TLS 复用共享 netleaf_tls 扩展(其内部使用 mbedTLS)
+    # 启用 TLS 时：服务端 TLS 复用共享 netleaf_tls2 扩展(其内部使用 mbedTLS)
     if(BUILD_TLS)
         target_compile_definitions(netleaf_mqtt_server PRIVATE NL_MQTT_SERVER_TLS_ENABLE)
-        target_link_libraries(netleaf_mqtt_server PRIVATE netleaf_tls mbedtls mbedx509 mbedcrypto)
+        target_link_libraries(netleaf_mqtt_server PRIVATE netleaf_tls2 mbedtls mbedx509 mbedcrypto)
     endif()
 
     # 平台相关链接

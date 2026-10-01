@@ -7,7 +7,7 @@
 #   On Windows: wsl bash build_all.sh
 #   On Linux: ./build_all.sh
 
-VERSION="2.4.1"
+VERSION="2.4.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -132,7 +132,7 @@ build_arch() {
     cmake_args+=("-DWIDE_LIB=ON")
     cmake_args+=("-DBUILD_SHARED_LIBS=ON")
     cmake_args+=("-DBUILD_EXAMPLES=ON")
-    cmake_args+=("-DBUILD_TLS=ON")
+    cmake_args+=("-DBUILD_TLS3=ON")
     cmake_args+=("-DBUILD_MQTT=ON")
     cmake_args+=("-DBUILD_MQTT_SERVER=ON")
 
@@ -199,8 +199,8 @@ package_arch() {
         fi
     done
 
-    # Copy header files
-    for h in ../../include/netleaf*.h; do
+    # Copy header files (all public headers in include/, incl. nl_util.h)
+    for h in ../../include/*.h; do
         if [ -e "${h}" ]; then
             cp -r "${h}" "${PKG_TMP}/" 2>/dev/null || true
         fi

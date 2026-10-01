@@ -3,13 +3,12 @@
 #endif
 
 #include "netleaf_autocomplete.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-#ifdef _WIN32
-#define strdup _strdup
-#endif
+/* strdup 收敛至公共工具层 nl_util：本文件统一调用 nl_strdup() */
 
 // =========================================
 // Charset Complete Implementation
@@ -113,7 +112,7 @@ char* nl_charset_complete_process(nl_charset_complete_t* ctx, const char* encodi
     
     // If charset already exists and viewport exists, return copy
     if (ctx->has_charset && ctx->has_viewport) {
-        return strdup(ctx->html);
+        return nl_strdup(ctx->html);
     }
     
     // Find injection point - prefer after <head>, then <html>
@@ -162,7 +161,7 @@ char* nl_charset_complete_process(nl_charset_complete_t* ctx, const char* encodi
     }
     
     if (meta_len == 0) {
-        return strdup(ctx->html);
+        return nl_strdup(ctx->html);
     }
     
     size_t prefix = (size_t)(inject - ctx->html);

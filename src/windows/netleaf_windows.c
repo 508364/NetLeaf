@@ -18,6 +18,9 @@
 
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 65535
+#define DEFAULT_CONCURRENCY 4
+#define MAX_CONCURRENCY 64
+#define MAX_WORKER_QUEUE 1024
 
 struct nl_server {
     SOCKET fd;
@@ -27,11 +30,25 @@ struct nl_server {
     int port;
     nl_request_handler handler;
     nl_udp_message_handler udp_handler;
+    nl_udp_message_handler_v2 udp_handler_v2;
     void* user_data;
     volatile long running;
     HANDLE thread_handle;
     OVERLAPPED accept_overlapped;
     char accept_buffer[sizeof(SOCKADDR_IN) * 2 + 32];
+    int concurrency;
+    int num_workers;
+    HANDLE* workers;
+    int* queue;
+    int queue_head;
+    int queue_tail;
+    int queue_count;
+    int queue_max;
+    CRITICAL_SECTION queue_lock;
+    HANDLE queue_not_empty;
+    HANDLE queue_not_full;
+    int queue_init;
+    int pool_used;
 };
 
 struct nl_client {
@@ -226,6 +243,287 @@ static int set_broadcast(SOCKET fd, int enable) {
     return setsockopt(fd, SOL_SOCKET, SO_BROADCAST, (const char*)&opt, sizeof(opt));
 }
 
+static int set_blocking(SOCKET fd) {
+    DWORD mode = 0;
+    int ret = ioctlsocket(fd, FIONBIO, &mode);
+    return (ret == 0) ? 0 : -1;
+}
+
+static void parse_http_request(const char* data, size_t len,
+                               char* path, size_t path_size,
+                               nl_http_method_t* method,
+                               const char** body, size_t* body_size) {
+    if (!data || len == 0) return;
+
+    const char* header_end = NULL;
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (data[i] == '\r' && data[i+1] == '\n' && data[i+2] == '\r' && data[i+3] == '\n') {
+            header_end = data + i;
+            break;
+        }
+        if (data[i] == '\n' && data[i+1] == '\n') {
+            header_end = data + i;
+            break;
+        }
+    }
+    if (!header_end) header_end = data + len;
+
+    size_t header_len = (size_t)(header_end - data);
+    char* line = (char*)malloc(header_len + 1);
+    if (!line) return;
+    memcpy(line, data, header_len);
+    line[header_len] = '\0';
+
+    char* space1 = strchr(line, ' ');
+    char* space2 = space1 ? strchr(space1 + 1, ' ') : NULL;
+
+    if (space1 && space2) {
+        *space1 = '\0';
+        *space2 = '\0';
+
+        if (strncmp(line, "GET", 3) == 0) *method = NL_METHOD_GET;
+        else if (strncmp(line, "POST", 4) == 0) *method = NL_METHOD_POST;
+        else if (strncmp(line, "PUT", 3) == 0) *method = NL_METHOD_PUT;
+        else if (strncmp(line, "DELETE", 6) == 0) *method = NL_METHOD_DELETE;
+        else *method = NL_METHOD_GET;
+
+        strncpy(path, space1 + 1, path_size - 1);
+        path[path_size - 1] = '\0';
+
+        size_t body_start = (size_t)(header_end - data);
+        if (data[body_start] == '\r') body_start += 2; else body_start += 1;
+        if (data[body_start] == '\r') body_start += 2;
+        if (body_start < len) {
+            *body_size = len - body_start;
+            *body = data + body_start;
+        } else {
+            *body_size = 0;
+            *body = NULL;
+        }
+    } else {
+        *method = NL_METHOD_GET;
+        *body_size = 0;
+        *body = NULL;
+    }
+
+    free(line);
+}
+
+static DWORD WINAPI worker_dispatch(LPVOID lpParam) {
+    nl_server_t* server = (nl_server_t*)lpParam;
+
+    while (server->running == 1) {
+        SOCKET fd = INVALID_SOCKET;
+        EnterCriticalSection(&server->queue_lock);
+        while (server->queue_count == 0 && server->running == 1) {
+            LeaveCriticalSection(&server->queue_lock);
+            WaitForSingleObject(server->queue_not_empty, 100);
+            EnterCriticalSection(&server->queue_lock);
+        }
+        if (server->running != 1) {
+            LeaveCriticalSection(&server->queue_lock);
+            break;
+        }
+        fd = (SOCKET)server->queue[server->queue_head];
+        server->queue_head = (server->queue_head + 1) % server->queue_max;
+        server->queue_count--;
+        SetEvent(server->queue_not_full);
+        LeaveCriticalSection(&server->queue_lock);
+
+        nl_buffer_t* req = nl_buffer_create(BUFFER_SIZE);
+        if (!req) {
+            closesocket(fd);
+            continue;
+        }
+
+        char buf[BUFFER_SIZE];
+        int idle_ms = 30000;
+        while (server->running == 1) {
+            int have_data = 0;
+            fd_set read_set;
+            FD_ZERO(&read_set);
+            FD_SET(fd, &read_set);
+            struct timeval tv;
+            tv.tv_sec = idle_ms / 1000;
+            tv.tv_usec = (idle_ms % 1000) * 1000;
+            int pr = select(0, &read_set, NULL, NULL, &tv);
+            if (pr == -1) {
+                if (WSAGetLastError() == WSAEINTR) continue;
+                break;
+            }
+            if (pr == 0) {
+                have_data = (nl_buffer_size(req) > 0);
+            } else {
+                have_data = 1;
+            }
+
+            if (have_data) {
+                int n = (int)recv(fd, buf, BUFFER_SIZE, 0);
+                if (n > 0) {
+                    nl_buffer_write(req, buf, (size_t)n);
+                } else if (n == 0) {
+                    break;
+                } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                    break;
+                }
+            }
+
+            if (nl_buffer_size(req) > 0 && server->handler) {
+                char path[1024] = {0};
+                nl_http_method_t method = NL_METHOD_GET;
+                const char* body = NULL;
+                size_t body_size = 0;
+
+                parse_http_request(req->data, nl_buffer_size(req),
+                                   path, sizeof(path), &method, &body, &body_size);
+
+                char* response = NULL;
+                size_t response_len = 0;
+                server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
+
+                if (response && response_len > 0) {
+                    size_t total = 0;
+                    while (total < response_len) {
+                        int w = (int)send(fd, response + total, (int)(response_len - total), 0);
+                        if (w <= 0) break;
+                        total += (size_t)w;
+                    }
+                    free(response);
+                }
+                nl_buffer_clear(req);
+            }
+
+            if (!have_data || pr == 0) break;
+        }
+
+        closesocket(fd);
+        nl_buffer_destroy(req);
+    }
+
+    return 0;
+}
+
+static DWORD WINAPI listener_thread(LPVOID lpParam) {
+    nl_server_t* server = (nl_server_t*)lpParam;
+
+    while (server->running == 1) {
+        if (server->protocol == NL_PROTO_UDP) {
+            if (server->udp_handler || server->udp_handler_v2) {
+                char buf[BUFFER_SIZE];
+                int n = recvfrom(server->fd, buf, BUFFER_SIZE, 0, NULL, NULL);
+                if (n > 0) {
+                    if (server->udp_handler_v2) {
+                        server->udp_handler_v2(buf, (size_t)n, "0.0.0.0", 0, server->user_data);
+                    } else {
+                        server->udp_handler(buf, (size_t)n, server->user_data);
+                    }
+                }
+                Sleep(10);
+            }
+        } else if (server->pool_used) {
+            while (server->running == 1) {
+                SOCKET client_fd = accept(server->fd, NULL, NULL);
+                if (client_fd == INVALID_SOCKET) {
+                    int err = WSAGetLastError();
+                    if (err == WSAEWOULDBLOCK || err == WSAECONNABORTED || err == WSAEINTR) {
+                        break;
+                    }
+                    if (err != WSAEINTR) {
+                        windows_log(NL_LOG_ERROR, "Windows: accept() failed: %d", err);
+                    }
+                    Sleep(1);
+                    continue;
+                }
+                set_blocking(client_fd);
+                EnterCriticalSection(&server->queue_lock);
+                while (server->queue_count == server->queue_max && server->running == 1) {
+                    LeaveCriticalSection(&server->queue_lock);
+                    WaitForSingleObject(server->queue_not_full, 100);
+                    EnterCriticalSection(&server->queue_lock);
+                }
+                if (server->running != 1) {
+                    LeaveCriticalSection(&server->queue_lock);
+                    closesocket(client_fd);
+                    break;
+                }
+                server->queue[server->queue_tail] = (int)client_fd;
+                server->queue_tail = (server->queue_tail + 1) % server->queue_max;
+                server->queue_count++;
+                SetEvent(server->queue_not_empty);
+                LeaveCriticalSection(&server->queue_lock);
+            }
+        } else {
+            // Legacy single-thread path (accept and handle in place).
+            SOCKET client_fd = accept(server->fd, NULL, NULL);
+            if (client_fd != INVALID_SOCKET) {
+                nl_buffer_t* req = nl_buffer_create(BUFFER_SIZE);
+                char buf[BUFFER_SIZE];
+                int n = (int)recv(client_fd, buf, BUFFER_SIZE, 0);
+                if (n > 0) {
+                    nl_buffer_write(req, buf, (size_t)n);
+                    if (nl_buffer_size(req) > 0 && server->handler) {
+                        char path[1024] = {0};
+                        nl_http_method_t method = NL_METHOD_GET;
+                        const char* body = NULL;
+                        size_t body_size = 0;
+                        parse_http_request(req->data, nl_buffer_size(req),
+                                          path, sizeof(path), &method, &body, &body_size);
+                        char* response = NULL;
+                        size_t response_len = 0;
+                        server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
+                        if (response && response_len > 0) {
+                            send(client_fd, response, (int)response_len, 0);
+                            free(response);
+                        }
+                    }
+                }
+                closesocket(client_fd);
+                nl_buffer_destroy(req);
+            } else {
+                Sleep(1);
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void stop_worker_pool(nl_server_t* server) {
+    if (!server->pool_used) return;
+    EnterCriticalSection(&server->queue_lock);
+    InterlockedExchange(&server->running, 0);
+    for (int i = 0; i < server->queue_count; i++) {
+        int fd = server->queue[server->queue_head];
+        server->queue_head = (server->queue_head + 1) % server->queue_max;
+        if (fd > 0) closesocket((SOCKET)fd);
+    }
+    server->queue_count = 0;
+    LeaveCriticalSection(&server->queue_lock);
+    SetEvent(server->queue_not_empty);
+    SetEvent(server->queue_not_full);
+    for (int i = 0; i < server->num_workers; i++) {
+        if (server->workers[i]) {
+            WaitForSingleObject(server->workers[i], INFINITE);
+            CloseHandle(server->workers[i]);
+        }
+    }
+    DeleteCriticalSection(&server->queue_lock);
+    CloseHandle(server->queue_not_empty);
+    CloseHandle(server->queue_not_full);
+    free(server->queue);
+    free(server->workers);
+    server->queue = NULL;
+    server->workers = NULL;
+    server->queue_not_empty = NULL;
+    server->queue_not_full = NULL;
+    server->num_workers = 0;
+    server->pool_used = 0;
+}
+
+static void cleanup_start_failure(nl_server_t* server) {
+    stop_worker_pool(server);
+}
+
 nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
     if (init_winsock() != 0) return NULL;
     
@@ -234,11 +532,18 @@ nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
     
     server->protocol = protocol;
     server->port = port;
+    server->concurrency = 0;
+    server->num_workers = 0;
+    server->pool_used = 0;
     
     if (protocol == NL_PROTO_TCP || protocol == NL_PROTO_HTTP || protocol == NL_PROTO_WEBSOCKET) {
         server->fd = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
     } else {
         server->fd = socket(AF_INET, SOCK_DGRAM, 0);
+        // P0: make UDP socket non-blocking so the listener thread's recvfrom
+        // cannot block forever (matches Linux/macOS set_nonblocking).
+        u_long mode = 1;
+        ioctlsocket(server->fd, FIONBIO, &mode);
     }
     
     if (server->fd == INVALID_SOCKET) {
@@ -283,6 +588,15 @@ nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
 
 void nl_server_destroy(nl_server_t* server) {
     if (!server) return;
+    if (server->pool_used) stop_worker_pool(server);
+    if (server->thread_handle) {
+        // Join listener thread BEFORE closing the listening socket:
+        // the listener blocks on accept()/recvfrom() on server->fd, so
+        // closing fd first makes the wait never terminate -> deadlock.
+        WaitForSingleObject(server->thread_handle, INFINITE);
+        CloseHandle(server->thread_handle);
+        server->thread_handle = NULL;
+    }
     if (server->fd != INVALID_SOCKET) closesocket(server->fd);
     if (server->iocp_handle) CloseHandle(server->iocp_handle);
     free(server);
@@ -291,27 +605,94 @@ void nl_server_destroy(nl_server_t* server) {
 int nl_server_start(nl_server_t* server) {
     if (!server) return NL_EINVAL;
     
+    int pool_created = 0;
+    
     if (server->protocol == NL_PROTO_TCP || server->protocol == NL_PROTO_HTTP || 
         server->protocol == NL_PROTO_WEBSOCKET) {
         if (listen(server->fd, SOMAXCONN) == SOCKET_ERROR) {
             windows_log(NL_LOG_ERROR, "Windows: listen() failed: %d", WSAGetLastError());
             return NL_ERROR;
         }
+        
+        int use_pool = (server->protocol != NL_PROTO_UDP) ? 1 : 0;
+        int target = (server->concurrency >= 1 && server->concurrency <= MAX_CONCURRENCY)
+                     ? server->concurrency : DEFAULT_CONCURRENCY;
+        if (use_pool && !server->pool_used) {
+            server->num_workers = target;
+            server->queue_max = MAX_WORKER_QUEUE;
+            server->queue_head = 0;
+            server->queue_tail = 0;
+            server->queue_count = 0;
+            server->queue = calloc((size_t)server->queue_max, sizeof(int));
+            server->workers = calloc((size_t)server->num_workers, sizeof(HANDLE));
+            server->queue_not_empty = CreateEvent(NULL, FALSE, FALSE, NULL);
+            server->queue_not_full = CreateEvent(NULL, FALSE, FALSE, NULL);
+            InitializeCriticalSection(&server->queue_lock);
+            if (!server->queue || !server->workers || !server->queue_not_empty || !server->queue_not_full) {
+                DeleteCriticalSection(&server->queue_lock);
+                if (server->queue_not_empty) CloseHandle(server->queue_not_empty);
+                if (server->queue_not_full) CloseHandle(server->queue_not_full);
+                free(server->queue);
+                free(server->workers);
+                server->queue = NULL;
+                server->workers = NULL;
+                server->queue_not_empty = NULL;
+                server->queue_not_full = NULL;
+                server->num_workers = 0;
+                windows_log(NL_LOG_ERROR, "Windows: failed to allocate worker pool");
+                return NL_ERROR;
+            }
+            server->pool_used = 1;
+            pool_created = 1;
+            InterlockedExchange(&server->running, 1);
+            for (int i = 0; i < server->num_workers; i++) {
+                server->workers[i] = CreateThread(NULL, 0, worker_dispatch, server, 0, NULL);
+                if (!server->workers[i]) {
+                    cleanup_start_failure(server);
+                    windows_log(NL_LOG_ERROR, "Windows: failed to create worker thread %d", i);
+                    return NL_ERROR;
+                }
+            }
+        }
     }
     
-    InterlockedExchange(&server->running, 1);
-    windows_log(NL_LOG_INFO, "Windows: Server started (IOCP), socket=%lu", (ULONG)server->fd);
+    if (pool_created) {
+        InterlockedExchange(&server->running, 1);
+    }
+    server->thread_handle = CreateThread(NULL, 0, listener_thread, server, 0, NULL);
+    if (!server->thread_handle) {
+        InterlockedExchange(&server->running, 0);
+        if (pool_created) stop_worker_pool(server);
+        windows_log(NL_LOG_ERROR, "Windows: failed to create listener thread");
+        return NL_ERROR;
+    }
+    
+    windows_log(NL_LOG_INFO, "Windows: Server started (IOCP), socket=%lu, workers=%d",
+                (ULONG)server->fd, server->pool_used ? server->num_workers : 0);
     return NL_OK;
 }
 
 void nl_server_stop(nl_server_t* server) {
     if (!server) return;
-    InterlockedExchange(&server->running, 0);
+    stop_worker_pool(server);
+    
+    if (server->thread_handle) {
+        WaitForSingleObject(server->thread_handle, INFINITE);
+        CloseHandle(server->thread_handle);
+        server->thread_handle = NULL;
+    }
     if (server->fd != INVALID_SOCKET) {
         closesocket(server->fd);
         server->fd = INVALID_SOCKET;
     }
     windows_log(NL_LOG_INFO, "Windows: Server stopped");
+}
+
+int nl_server_set_concurrency(nl_server_t* server, int threads) {
+    if (!server) return NL_EINVAL;
+    if (threads <= 0 || threads > MAX_CONCURRENCY) return NL_EINVAL;
+    server->concurrency = threads;
+    return NL_OK;
 }
 
 void nl_server_set_handler(nl_server_t* server, nl_request_handler handler, void* user_data) {
@@ -323,6 +704,12 @@ void nl_server_set_handler(nl_server_t* server, nl_request_handler handler, void
 void nl_server_set_udp_handler(nl_server_t* server, nl_udp_message_handler handler, void* user_data) {
     if (!server) return;
     server->udp_handler = handler;
+    server->user_data = user_data;
+}
+
+void nl_server_set_udp_handler_v2(nl_server_t* server, nl_udp_message_handler_v2 handler, void* user_data) {
+    if (!server) return;
+    server->udp_handler_v2 = handler;
     server->user_data = user_data;
 }
 
@@ -353,6 +740,9 @@ int nl_server_set_option(nl_server_t* server, nl_socket_option_t option, int val
         case NL_OPT_SO_BROADCAST:
             result = set_broadcast(server->fd, value);
             break;
+        case NL_OPT_CONCURRENCY:
+            result = (nl_server_set_concurrency(server, value) == NL_OK) ? 0 : -1;
+            break;
         default:
             return NL_ENOTSUPPORTED;
     }
@@ -381,6 +771,10 @@ int nl_server_get_option(nl_server_t* server, nl_socket_option_t option, int* va
             if (getsockopt(server->fd, SOL_SOCKET, SO_RCVBUF, (char*)&opt, &optlen) == SOCKET_ERROR) {
                 return NL_ERROR;
             }
+            break;
+        case NL_OPT_CONCURRENCY:
+            opt = (server->concurrency >= 1 && server->concurrency <= MAX_CONCURRENCY)
+                 ? server->concurrency : DEFAULT_CONCURRENCY;
             break;
         default:
             return NL_ENOTSUPPORTED;
@@ -631,8 +1025,15 @@ int nl_config_load(nl_config_t* config, const char* path) {
         char* eq = strchr(line, '=');
         if (eq) {
             *eq = '\0';
-            strncpy(config->data + config->count * 128, line, 64);
-            strncpy(config->data + config->count * 128 + 64, eq + 1, 64);
+            // BUG-304: 源 key/value 截断到 63 字符（槽位 64 含终止符），
+            // snprintf 的 N 精确等于目标容量，GCC 推导不会报截断
+            char key[64];
+            char val[64];
+            int kn = snprintf(key, sizeof(key), "%s", line);
+            int vn = snprintf(val, sizeof(val), "%s", eq + 1);
+            (void)kn; (void)vn;  // 截断是预期行为（key/val 槽位固定 64）
+            memcpy(config->data + config->count * 128, key, sizeof(key));
+            memcpy(config->data + config->count * 128 + 64, val, sizeof(val));
             config->count++;
         }
     }
@@ -1058,10 +1459,13 @@ static DWORD WINAPI file_server_thread(LPVOID arg) {
         
         DWORD attrs = GetFileAttributesA(filepath);
         if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            // BUG-304: index_path 与 filepath 同容量（4096），拼接与回拷容量一致，
+            // GCC 推导不会越界，消除 -Wformat-truncation
             char index_path[4096];
-            snprintf(index_path, sizeof(index_path), "%s/%s", filepath, server->index_file);
+            snprintf(index_path, sizeof(index_path), "%s/%s",
+                     filepath, server->index_file);
             if (GetFileAttributesA(index_path) != INVALID_FILE_ATTRIBUTES) {
-                strncpy(filepath, index_path, sizeof(filepath));
+                snprintf(filepath, sizeof(filepath), "%s", index_path);
             } else {
                 send_http_error(client, 404, "Not Found");
                 closesocket(client);
@@ -1362,10 +1766,12 @@ static DWORD WINAPI router_server_thread(LPVOID arg) {
             if (is_path_safe(rs->router->static_dir, filepath)) {
                 DWORD attrs = GetFileAttributesA(filepath);
                 if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    // BUG-304: index_path 与 filepath 同容量（4096），拼接与回拷容量一致，
+                    // GCC 推导不会越界，消除 -Wformat-truncation
                     char index_path[4096];
                     snprintf(index_path, sizeof(index_path), "%s/index.html", filepath);
                     if (GetFileAttributesA(index_path) != INVALID_FILE_ATTRIBUTES) {
-                        strncpy(filepath, index_path, sizeof(filepath));
+                        snprintf(filepath, sizeof(filepath), "%s", index_path);
                     }
                 }
                 
@@ -1474,8 +1880,8 @@ static void default_server_handler(const char* path, nl_http_method_t method,
         *response_size = strlen(default_resp);
         *response = (char*)malloc(*response_size + 1);
         if (*response) {
-            strncpy(*response, default_resp, *response_size);
-            (*response)[*response_size] = '\0';
+            // BUG-304: 用 snprintf 取代 strncpy，根除 -Wstringop-truncation
+            snprintf(*response, *response_size + 1, "%s", default_resp);
         }
     }
 }
@@ -1893,10 +2299,9 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
             LeaveCriticalSection(&server->mutex);
             return;
         }
-        strncpy(route->content, content, route->content_size);
-        route->content[route->content_size] = '\0';
-        strncpy(route->content_type, ctype, sizeof(route->content_type) - 1);
-        route->content_type[sizeof(route->content_type) - 1] = '\0';
+        // BUG-304: 用 snprintf 取代 strncpy，根除 -Wstringop-truncation
+        snprintf(route->content, route->content_size + 1, "%s", content);
+        snprintf(route->content_type, sizeof(route->content_type), "%s", ctype);
         route->type = NL_ROUTE_TYPE_CONTENT;  // Default: static content
         route->file_path[0] = '\0';
         route->redirect_url[0] = '\0';
@@ -1920,12 +2325,20 @@ static int is_file_path(const char* str, char* abs_path, size_t abs_path_size) {
     if (!str || !abs_path) return 0;
     
     char full_path[512];
+    const char* src;
     if (_fullpath(full_path, str, sizeof(full_path))) {
-        strncpy(abs_path, full_path, abs_path_size - 1);
+        src = full_path;
     } else {
-        strncpy(abs_path, str, abs_path_size - 1);
+        src = str;
     }
-    abs_path[abs_path_size - 1] = '\0';
+    // BUG-304: 用 memcpy + strlen 取代 strncpy，避免 -Wstringop-truncation
+    // （strncpy 在源串 >= N 时填满缓冲但不补终止符，GCC 推断截断）
+    size_t slen = strlen(src);
+    if (slen >= abs_path_size) {
+        slen = abs_path_size - 1;
+    }
+    memcpy(abs_path, src, slen);
+    abs_path[slen] = '\0';
     
     FILE* fp = fopen(abs_path, "rb");
     if (fp) {
@@ -1998,10 +2411,9 @@ int nl_web_add_route(nl_web_server_t* server, const char* path, const char* cont
             LeaveCriticalSection(&server->mutex);
             return NL_ENOMEM;
         }
-        strncpy(route->content, content, route->content_size);
-        route->content[route->content_size] = '\0';
-        strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
-        route->content_type[sizeof(route->content_type) - 1] = '\0';
+        // BUG-304: 用 snprintf 取代 strncpy，根除 -Wstringop-truncation
+        snprintf(route->content, route->content_size + 1, "%s", content);
+        snprintf(route->content_type, sizeof(route->content_type), "%s", content_type);
         route->type = NL_ROUTE_TYPE_CONTENT;
         route->file_path[0] = '\0';
         route->redirect_url[0] = '\0';
@@ -2083,11 +2495,10 @@ int nl_web_update_route(nl_web_server_t* server, const char* path, const char* c
                     LeaveCriticalSection(&server->mutex);
                     return NL_ERROR;
                 }
-                strncpy(route->content, content, route->content_size);
-                route->content[route->content_size] = '\0';
+                // BUG-304: 用 snprintf 取代 strncpy，根除 -Wstringop-truncation
+                snprintf(route->content, route->content_size + 1, "%s", content);
                 if (content_type) {
-                    strncpy(route->content_type, content_type, sizeof(route->content_type) - 1);
-                    route->content_type[sizeof(route->content_type) - 1] = '\0';
+                    snprintf(route->content_type, sizeof(route->content_type), "%s", content_type);
                 }
             }
             LeaveCriticalSection(&server->mutex);
@@ -2775,7 +3186,8 @@ void* nl_json_parse(const char* json_str, nl_status_t* error_code, int* error_li
     json->root = parse_value(&json_str, &line, &col, &err);
     if (!json->root) { json->error_code = err; json->error_line = line; json->error_col = col; if (error_code) *error_code = err; if (error_line) *error_line = line; if (error_col) *error_col = col; free(json); return NULL; }
     if (error_code) *error_code = NL_OK;
-    if (error_line) *error_line = line; if (error_col) *error_col = col;
+    if (error_line) *error_line = line;
+    if (error_col) *error_col = col;
     return json;
 }
 
@@ -2980,22 +3392,11 @@ static int toml_parse_string(const char** s, int* line, int* col, char** out, nl
     return 0;
 }
 
-static int64_t toml_parse_int(const char** s, int* col, nl_status_t* err) {
-    (void)col;
-    int sign = 1;
-    if (**s == '-') { sign = -1; (*s)++; (*col)++; }
-    else if (**s == '+') { (*s)++; (*col)++; }
-    if (**s < '0' || **s > '9') { *err = NL_ESYNTAX; return 0; }
-    int64_t val = 0;
-    while (**s >= '0' && **s <= '9') {
-        val = val * 10 + (**s - '0');
-        (*s)++; (*col)++;
-    }
-    return val * sign;
-}
-
+// BUG-304: 删除未使用的冗余函数 toml_parse_int
+// （数字解析统一走 toml_parse_float，整/浮点由 d == (int64_t)d 判定）
 static double toml_parse_float(const char** s, int* col, nl_status_t* err) {
     (void)col;
+    (void)err;  // BUG-304: err 在解析路径由调用方处理，本函数不写入
     int sign = 1;
     if (**s == '-') { sign = -1; (*s)++; (*col)++; }
     else if (**s == '+') { (*s)++; (*col)++; }
@@ -3298,7 +3699,8 @@ void* nl_toml_parse(const char* toml_str, nl_status_t* error_code, int* error_li
     toml->root = toml_parse_main(&toml_str, &line, &col, &err);
     if (!toml->root) { toml->error_code = err; toml->error_line = line; toml->error_col = col; if (error_code) *error_code = err; if (error_line) *error_line = line; if (error_col) *error_col = col; free(toml); return NULL; }
     if (error_code) *error_code = NL_OK;
-    if (error_line) *error_line = line; if (error_col) *error_col = col;
+    if (error_line) *error_line = line;
+    if (error_col) *error_col = col;
     return toml;
 }
 

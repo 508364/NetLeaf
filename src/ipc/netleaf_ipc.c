@@ -2,6 +2,7 @@
 #include "netleaf_ipc_internal.h"
 #include "netleaf_module.h"
 #include "netleaf_ipc_lang.h"
+#include "nl_util.h"
 #include <string.h>
 #include <ctype.h>
 
@@ -38,12 +39,9 @@ nl_module_info_t* nl_ipc_get_module_info(void) {
     return &g_ipc_module_info;
 }
 
-// Internal helper: case-insensitive string comparison
+// Internal helper: case-insensitive string comparison (收敛至公共工具层 nl_util)
 static int strncasecmp_custom(const char* s1, const char* s2, size_t n) {
-    while (n && *s1 && (*s1 == *s2 || tolower((unsigned char)*s1) == tolower((unsigned char)*s2))) {
-        s1++; s2++; n--;
-    }
-    return (n == 0) ? 0 : *(const unsigned char*)s1 - *(const unsigned char*)s2;
+    return nl_strncasecmp(s1, s2, n);
 }
 
 void nl_ipc_enable_ex(const char* enable_str) {

@@ -16,6 +16,9 @@ target_include_directories(netleaf_lang PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(netleaf_lang PRIVATE NL_LANG_EXPORTS)
+# 软依赖开关：下游扩展链接 netleaf_lang 时会自动定义 NL_LANG_ENABLE，
+# 使 netleaf_lang.h 暴露完整声明；未链接（BUILD_LANG=OFF）时退化为 no-op。
+target_compile_definitions(netleaf_lang PUBLIC NL_LANG_ENABLE)
 target_link_libraries(netleaf_lang PUBLIC netleaf_core)
 
 # POSIX 下使用 pthread(互斥量 + pthread_once)，必须链接线程库

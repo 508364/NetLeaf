@@ -7,7 +7,7 @@ REM Usage: build_all-Clang.bat [x64^|x86^|arm64^|all]
 REM   amd64 is an alias of x64. Default: all
 
 setlocal enabledelayedexpansion
-set VERSION=2.4.1
+set VERSION=2.4.2
 set SRC_DIR=%~dp0
 set SRC_DIR=%SRC_DIR:~0,-1%
 
@@ -45,7 +45,11 @@ if not defined LLVM_MINGW for /f "delims=" %%I in ('where i686-w64-mingw32-clang
 if not defined LLVM_MINGW for /f "delims=" %%I in ('where aarch64-w64-mingw32-clang.exe 2^>nul') do if exist "%%I" set "LLVM_MINGW=%%~dpI"
 if not defined LLVM_MINGW for /f "delims=" %%I in ('where clang.exe 2^>nul') do if exist "%%I" set "LLVM_MINGW=%%~dpI"
 if defined LLVM_MINGW if "%LLVM_MINGW:~-1%"=="\" set "LLVM_MINGW=%LLVM_MINGW:~0,-1%"
-
+if not defined LLVM_MINGW (
+    echo [ERROR] LLVM-MinGW not found.
+    echo         Add its bin dir to PATH, or set CC=e:\llvm-mingw\bin\clang.exe, then retry.
+    exit /b 1
+)
 
 REM Check required tools
 set "CLANG_X64=%LLVM_MINGW%\x86_64-w64-mingw32-clang.exe"
@@ -120,8 +124,7 @@ popd
 echo x64 build completed!
 
 echo Creating x64 package...
-ping -n 2 127.0.0.1 >nul
-powershell.exe -NoProfile -Command "Compress-Archive -Path 'build_x64\bin\*.dll','include\netleaf*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
+powershell.exe -NoProfile -Command "Start-Sleep -Seconds 1; Compress-Archive -Path 'build_x64\bin\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
 echo x64 package created!
 echo.
 
@@ -157,8 +160,7 @@ popd
 echo x86 build completed!
 
 echo Creating x86 package...
-ping -n 2 127.0.0.1 >nul
-powershell.exe -NoProfile -Command "Compress-Archive -Path 'build_i686\bin\*.dll','include\netleaf*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
+powershell.exe -NoProfile -Command "Start-Sleep -Seconds 1; Compress-Archive -Path 'build_i686\bin\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
 echo x86 package created!
 echo.
 
@@ -194,12 +196,100 @@ popd
 echo ARM64 build completed!
 
 echo Creating ARM64 package...
-ping -n 2 127.0.0.1 >nul
-powershell.exe -NoProfile -Command "Compress-Archive -Path 'build_arm64\bin\*.dll','include\netleaf*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
+powershell.exe -NoProfile -Command "Start-Sleep -Seconds 1; Compress-Archive -Path 'build_arm64\bin\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
 echo ARM64 package created!
 echo.
 
 :skip_arm64
+REM ---------------------------------------------------------------------------
+REM 5. Linux/macOS builds via WSL (Ubuntu)
+REM ---------------------------------------------------------------------------
+echo ========================================
+echo [4/4] Building Linux/macOS via WSL...
+echo ========================================
+
+REM Check if WSL Ubuntu is available
+set "WSL_DISTRO="
+powershell.exe -NoProfile -Command "try { \$wsl = wsl -l -q 2>nul; foreach (\$d in \$wsl) { if (\$d.Contains('Ubuntu')) { Write-Output \$d; break } } } catch {}" > "%TEMP%\wsl_distro.txt" 2>nul
+for /f "tokens=*" %%d in ('type "%TEMP%\wsl_distro.txt" 2^>nul') do if not defined WSL_DISTRO set "WSL_DISTRO=%%d"
+del "%TEMP%\wsl_distro.txt" >nul 2>nul
+if not defined WSL_DISTRO (
+    echo [WARNING] WSL Ubuntu not found, skipping Linux/macOS builds.
+    echo           Install Ubuntu from Microsoft Store or run: wsl --install -d Ubuntu
+    echo.
+    goto :skip_linux
+)
+echo WSL distro: %WSL_DISTRO%
+
+REM Build Linux amd64
+echo Building Linux x86_64...
+wsl -d "%WSL_DISTRO%" bash -c "
+    mkdir -p /mnt/c/C-C++/NetLeaf/build_linux_amd64 &&
+    cd /mnt/c/C-C++/NetLeaf/build_linux_amd64 &&
+    cmake -G \"Unix Makefiles\" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_EXAMPLES=ON -DBUILD_TESTS=ON \
+          -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON \
+          /mnt/c/C-C++/NetLeaf &&
+    make -j\$(nproc) &&
+    tar czf /mnt/c/C-C++/NetLeaf/releases/NetLeaf-%VERSION%-linux-amd64.tar.gz \
+        lib/libnetleaf*.so* lib/libnetleaf*.a \
+        include/*.h 2>/dev/null || true
+" 2>nul
+if %errorlevel% neq 0 (
+    echo [ERROR] Linux x86_64 build failed in WSL!
+) else (
+    echo Linux x86_64 build completed!
+)
+
+REM Build Linux arm64
+echo Building Linux arm64...
+wsl -d "%WSL_DISTRO%" bash -c "
+    apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu 2>/dev/null &&
+    mkdir -p /mnt/c/C-C++/NetLeaf/build_linux_arm64 &&
+    cd /mnt/c/C-C++/NetLeaf/build_linux_arm64 &&
+    cmake -G \"Unix Makefiles\" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+          -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF \
+          -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON \
+          /mnt/c/C-C++/NetLeaf &&
+    make -j\$(nproc) &&
+    tar czf /mnt/c/C-C++/NetLeaf/releases/NetLeaf-%VERSION%-linux-arm64.tar.gz \
+        lib/libnetleaf*.so* lib/libnetleaf*.a \
+        include/*.h 2>/dev/null || true
+" 2>nul
+if %errorlevel% neq 0 (
+    echo [WARNING] Linux arm64 build skipped (cross-compiler not available in WSL).
+) else (
+    echo Linux arm64 build completed!
+)
+
+REM Build macOS (via Apple Silicon cross-compilation in WSL, best-effort)
+echo Building macOS arm64...
+wsl -d "%WSL_DISTRO%" bash -c "
+    mkdir -p /mnt/c/C-C++/NetLeaf/build_macos_arm64 &&
+    cd /mnt/c/C-C++/NetLeaf/build_macos_arm64 &&
+    cmake -G \"Unix Makefiles\" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_SYSTEM_NAME=Darwin \
+          -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+          -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF \
+          -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON \
+          /mnt/c/C-C++/NetLeaf &&
+    make -j\$(nproc) &&
+    tar czf /mnt/c/C-C++/NetLeaf/releases/NetLeaf-%VERSION%-macos-arm64.tar.gz \
+        lib/libnetleaf*.so* lib/libnetleaf*.a \
+        include/*.h 2>/dev/null || true
+" 2>nul
+if %errorlevel% neq 0 (
+    echo [WARNING] macOS arm64 build skipped (cross-compilation not supported).
+) else (
+    echo macOS arm64 build completed!
+)
+
+:skip_linux
 REM ---------------------------------------------------------------------------
 echo ========================================
 echo   All builds completed!

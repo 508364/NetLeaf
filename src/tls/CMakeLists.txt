@@ -1,14 +1,16 @@
-# TLS 扩展模块构建脚本
-# 内置 mbedTLS（2.28.x LTS）集成 + TLS/SSL 加密扩展
-# 目标产物：libnetleaf_tls.dll/.so
+# TLS2 扩展模块构建脚本
+# 内置 mbedTLS（2.28.x LTS）集成 + TLS/SSL 加密扩展（TLS 1.0 - 1.3）
+# 目标产物：libnetleaf_tls2.dll/.so
+# 说明：tls2 保留旧名称 netleaf_tls 兼容层；当 tls3 (mbedTLS 3.x) 可用时，
+#       宿主通过 nl_tls3_init()/nl_tls3_is_available() 优先使用 tls3。
 
-message(STATUS "Building tls module...")
+message(STATUS "Building tls2 module...")
 
 # 使用 third-party 目录中内置的 mbedTLS（2.28.x LTS）。
 # 选择 mbedTLS 2.28 是因为它是最后一个仍实现 TLS 1.0/1.1 的 LTS 系列
 # （mbedTLS 3.x 已从协议核心中彻底移除 TLS 1.0/1.1）。
-set(MBEDTLS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third-party/mbedtls" CACHE PATH "Path to mbedTLS source directory")
-message(STATUS "TLS Extension: Using built-in mbedTLS from ${MBEDTLS_SOURCE_DIR}")
+set(MBEDTLS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third-party/mbedtls" CACHE PATH "Path to mbedTLS 2.x source directory")
+message(STATUS "TLS2 Extension: Using built-in mbedTLS from ${MBEDTLS_SOURCE_DIR}")
 
 # 将 mbedTLS 作为子目录引入
 if(EXISTS "${MBEDTLS_SOURCE_DIR}/CMakeLists.txt")
@@ -46,51 +48,54 @@ else()
     message(FATAL_ERROR "mbedTLS source not found at ${MBEDTLS_SOURCE_DIR}. Please download mbedTLS v2.28.10 and place it in third-party/mbedtls/")
 endif()
 
-# TLS 扩展源文件（纯 TLS 扩展，不依赖 MQTT）
-add_library(netleaf_tls SHARED
-    netleaf_tls.c
+# TLS2 扩展源文件（纯 TLS2 扩展，不依赖 MQTT）
+add_library(netleaf_tls2 SHARED
+    netleaf_tls2.c
 )
-set_target_properties(netleaf_tls PROPERTIES
+set_target_properties(netleaf_tls2 PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
-    OUTPUT_NAME "netleaf_tls"
+    OUTPUT_NAME "netleaf_tls2"
 )
 
-target_include_directories(netleaf_tls PUBLIC
+target_include_directories(netleaf_tls2 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/mqtt
     ${MBEDTLS_SOURCE_DIR}/include
 )
 
-target_compile_definitions(netleaf_tls PRIVATE
-    NL_TLS_EXPORTS
-    NL_TLS_ENABLE
+target_compile_definitions(netleaf_tls2 PRIVATE
+    NL_TLS2_EXPORTS
+    NL_TLS2_ENABLE
 )
 
-target_link_libraries(netleaf_tls PRIVATE
+target_link_libraries(netleaf_tls2 PRIVATE
     netleaf_core
-    netleaf_lang
     mbedtls
     mbedx509
     mbedcrypto
 )
+# Lang 为官方软依赖：BUILD_LANG=ON 时链接并定义 NL_LANG_ENABLE
+if(BUILD_LANG)
+    target_link_libraries(netleaf_tls2 PRIVATE netleaf_lang)
+endif()
 
 # 平台相关链接
 if(WIN32)
-    target_link_libraries(netleaf_tls PRIVATE ws2_32)
+    target_link_libraries(netleaf_tls2 PRIVATE ws2_32)
 elseif(UNIX AND NOT APPLE)
-    target_link_libraries(netleaf_tls PRIVATE pthread)
+    target_link_libraries(netleaf_tls2 PRIVATE pthread)
 endif()
 
 # 安装规则
-install(TARGETS netleaf_tls
+install(TARGETS netleaf_tls2
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
 install(FILES
-    ${CMAKE_SOURCE_DIR}/include/netleaf_tls.h
+    ${CMAKE_SOURCE_DIR}/include/netleaf_tls2.h
     ${CMAKE_SOURCE_DIR}/include/netleaf_mqtt_tls.h
     DESTINATION include/netleaf
 )

@@ -328,7 +328,170 @@ gcc -std=c99 -Iinclude -Iexamples\extension_showcase ^
 
 ---
 
-## 5. 相关文档
+## 5. API 接口与使用方法（NL 扩展系统）
+
+> 本目录是“扩展示例”所在位置，下面给出 **NL 扩展系统** 三大 API 族的最小可用示例与说明，
+> 与 `docs/` 中的指南保持同步（详见 [API 使用指南](../../docs/extension_showcase_api_guide.md)、
+> [插件开发指南](../../docs/plugin_development.md)）。三大族：
+>
+> - `nl_extension_*` —— 扩展（extension）：动态扩展库的注册 / 生命周期 / 依赖 / 懒加载
+> - `nl_module_*` —— 模块（module）：主库注册表里的更基础单元与模块级懒加载
+> - `nl_plugin_*` —— 插件（plugin）：第三方 `.dll/.so` 动态加载（`dlopen/LoadLibrary`）
+
+### 5.1 扩展（`nl_extension_*`）
+
+**① 在扩展库里定义一个扩展**（本目录 [`showcase_extension.c`](showcase_extension.c) 的同款写法）：
+
+```c
+#include "netleaf_module.h"
+
+int nl_my_ext_init(void)       { return 0; }
+int nl_my_ext_shutdown(void)   { return 0; }
+int nl_my_ext_is_available(void){ return 1; }
+const char* nl_my_ext_version(void){ return "1.0.0"; }
+
+/* 普通扩展：不带分号，调用后补 ';'。caps 自动补 NL_CAP_DYNAMIC|NL_CAP_LAZY_LOAD|NL_CAP_EXT_SYSTEM */
+NL_EXTENSION_DEFINE(
+    my_ext,                          /* ext_id → library_id */
+    "My Extension",                  /* 显示名 */
+    "1.0.0",                         /* 版本 */
+    "NetLeaf Team",                  /* 作者 */
+    "演示扩展",                       /* 描述，≤150 字节 */
+    "all",                           /* 平台串，或 "Windows,Linux,MacOS" */
+    NL_CAP_THREAD_SAFE,
+    nl_my_ext_init,
+    nl_my_ext_shutdown,
+    nl_my_ext_is_available,
+    nl_my_ext_version
+);
+
+/* 导出给宿主：宿主/自动加载靠此符号发现扩展 */
+NL_EXT_API nl_extension_info_t* nl_my_ext_get_extension_info(void) {
+    return NL_EXTENSION_GET_INFO(my_ext);
+}
+```
+
+**② 在宿主程序里注册 → 使用 → 注销**（对应 [`extension_showcase_demo.c`](extension_showcase_demo.c) 第 2/3/15 节）：
+
+```c
+#include "netleaf_module.h"
+
+/* 注册：成功 0；同一 id 重复注册幂等 0；缺必需依赖时返回 -2（拒绝加载） */
+nl_extension_register(NL_EXTENSION_GET_INFO(my_ext));
+
+/* 生命周期 */
+nl_extension_init("my_ext");         /* 调 ext->init()，成功 0 */
+nl_extension_shutdown("my_ext");     /* 调 ext->shutdown() */
+nl_extension_reload("my_ext");       /* shutdown + init */
+
+/* 状态查询 */
+if (nl_extension_is_loaded("my_ext")) {
+    char buf[64];
+    nl_extension_get_version_by_id("my_ext", buf, sizeof(buf));
+    printf("my_ext v%s\n", buf);
+}
+
+/* 注销：成功 0，不存在 -1 */
+nl_extension_unregister("my_ext");
+```
+
+**③ 懒加载扩展**（用 `NL_EXTENSION_DEFINE_LAZY` 多接两个回调）：
+
+```c
+void* nl_my_ext_lazy_load(void)  { /* 分配资源 */ return NULL; }
+void  nl_my_ext_lazy_unload(void){ /* 释放资源 */ }
+
+NL_EXTENSION_DEFINE_LAZY(
+    my_ext, "My Extension", "1.0.0", "NetLeaf Team",
+    "演示扩展", "all", NL_CAP_THREAD_SAFE,
+    nl_my_ext_init, nl_my_ext_shutdown, nl_my_ext_is_available, nl_my_ext_version,
+    nl_my_ext_lazy_load, nl_my_ext_lazy_unload      /* ← 懒加载回调 */
+);
+
+/* 宿主机上按需加载/卸载/查状态 */
+nl_extension_lazy_load("my_ext");                  /* 成功 0；已加载幂等 0 */
+nl_extension_lazy_get_status("my_ext");            /* UNLOADED/LOADING/LOADED/STOPPING/STOPPED */
+nl_extension_lazy_is_loaded("my_ext");             /* == LOADED */
+nl_extension_lazy_unload("my_ext");                /* 仅在 LOADED 下成功 */
+```
+
+> **依赖管理**：用 `nl_extension_add_dependency(ext, "dep_id", NL_EXT_DEP_REQUIRED, "1.0.0")`
+> 声明依赖（必需缺失则注册/校验失败），`NL_EXT_DEP_OPTIONAL` 表示可选；
+> 详见 [`extension_showcase_api_guide.md`](../../docs/extension_showcase_api_guide.md) 第 10 节。
+
+### 5.2 模块（`nl_module_*`）
+
+模块比扩展更基础；本示例第 11/12 节用 `NL_MODULE_DEFINE_LAZY` 就地定义了一个演示模块：
+
+```c
+/* 定义模块（文件作用域，注意结尾分号） */
+NL_MODULE_DEFINE_LAZY(NL_MODULE_CUSTOM, my_module, "1.0.0",
+                      NL_CAP_THREAD_SAFE, 1, 1, 1,
+                      NULL, NULL, NULL, my_module_version,
+                      "演示模块", "NetLeaf Team",
+                      my_module_lazy_load, my_module_lazy_unload);
+
+/* 注册 / 注销 */
+nl_module_register(NL_MODULE_GET_INFO(my_module));
+nl_module_unregister(NL_MODULE_CUSTOM);
+
+/* 模块级懒加载 */
+nl_module_lazy_enable_module(NL_MODULE_CUSTOM);
+nl_module_lazy_load(NL_MODULE_CUSTOM);
+nl_module_lazy_is_loaded(NL_MODULE_CUSTOM);
+nl_module_lazy_unload(NL_MODULE_CUSTOM);
+
+/* 查询 */
+nl_module_get_info(NL_MODULE_CORE);
+nl_module_get_count();
+nl_module_set_enabled(NL_MODULE_CUSTOM, 0);      /* 禁用 */
+char* plats = nl_module_get_platforms(NL_MODULE_CUSTOM); /* 返回 malloc 串，需 free */
+free(plats);
+nl_print_modules();                              /* 打印全部模块 */
+```
+
+### 5.3 插件（`nl_plugin_*`，第三方动态库）
+
+插件是“第三方 `.dll/.so` 动态加载”（`dlopen/LoadLibrary`），handle 制，与上面的扩展/模块
+（主库注册表单元）不同。最小流程（与 [examples/plugin_example/test_extension.c](../plugin_example/test_extension.c) 一致）：
+
+```c
+#include "netleaf_module.h"
+
+/* 1. 加载插件动态库（失败返回 NULL，原因用 nl_plugin_get_error() 取） */
+nl_plugin_handle_t ext = nl_plugin_load("./netleaf_extension.so");  /* Windows: netleaf_extension.dll */
+if (!ext) { printf("load failed: %s\n", nl_plugin_get_error()); }
+
+/* 2. 取扩展信息并注册进主库 */
+nl_extension_info_t* info = ...; /* 从动态库解析 nl_example_get_extension_info 后调用（GetProcAddress/dlsym） */
+nl_extension_register(info);
+
+/* 3. 查描述符 / 已加载状态 */
+nl_plugin_descriptor_t* desc = nl_plugin_get_descriptor(ext);
+nl_plugin_is_loaded(ext);
+
+/* 4. 卸载 */
+nl_plugin_unload(ext);
+```
+
+增强插件管理 API（同一族，按需使用）：
+
+```c
+nl_plugin_handle_t* found = NULL;
+int n = nl_plugin_discover("./plugins", &found, 16);   /* 扫描目录列出可用插件 */
+nl_plugin_search("com.example.%", &found, 16);         /* 按关键字搜索 */
+nl_plugin_reload(ext);                                   /* 热重载 */
+nl_plugin_check_dependencies(ext, &missing);             /* 依赖校验 */
+nl_plugin_enable_sandbox(ext, 1);                        /* 沙箱（可选） */
+```
+
+> 完整第三方插件最小模板见 [examples/plugin_template/](../plugin_template/)（1 个 C 文件即可构建为
+> 第三方插件，导出 `nl_<module>_get_extension_info` 入口 + `NL_PLUGIN_EXPORT` 宏）；
+> 详见 [插件开发指南](../../docs/plugin_development.md)。
+
+---
+
+## 6. 相关文档
 
 - 扩展系统开发教程：[docs/extension_tutorial.md](../../docs/extension_tutorial.md)
 - 本示例 API 使用指南：[docs/extension_showcase_api_guide.md](../../docs/extension_showcase_api_guide.md)
@@ -336,7 +499,7 @@ gcc -std=c99 -Iinclude -Iexamples\extension_showcase ^
 
 ---
 
-## 6. 许可证
+## 7. 许可证
 
 本示例目录（`examples/extension_showcase/`）拥有**自有许可证**，见 [LICENSE](LICENSE)（MIT）。
 NetLeaf 主工程及其它部分的许可证见源码树根目录的 [LICENSE](../../LICENSE)。

@@ -74,7 +74,14 @@
             DWORD size = sizeof(buffer);
             if (RegQueryValueEx(hKey, "ProcessorNameString", NULL, NULL, 
                                (LPBYTE)buffer, &size) == ERROR_SUCCESS) {
-                strncpy(cpu_model, buffer, sizeof(cpu_model) - 1);
+                // BUG-304: RegQueryValueEx 不保证写终止符，按实读字节数补 0
+                // （size 不能超过 buffer 容量），再用 snprintf 截断到 cpu_model 大小
+                if (size >= (DWORD)sizeof(buffer)) {
+                    buffer[sizeof(buffer) - 1] = '\0';
+                } else {
+                    buffer[size] = '\0';
+                }
+                snprintf(cpu_model, sizeof(cpu_model), "%s", buffer);
             } else {
                 snprintf(cpu_model, sizeof(cpu_model), "unknown");
             }

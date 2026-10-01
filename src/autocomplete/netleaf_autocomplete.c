@@ -1,16 +1,15 @@
 #include "netleaf_autocomplete.h"
 #include "netleaf_module.h"
 #include "netleaf_autocomplete_lang.h"
+#include "nl_util.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-// =========================================
-// Cross-platform strdup implementation
-// =========================================
-#ifdef _WIN32
-#define strdup _strdup
-#endif
+/*
+ * Cross-platform strdup / 大小写无关比较 / parse_enable 已收敛至公共工具层
+ * nl_util：本文件不再本地重复定义，改为直接调用 nl_util 中的对应实现。
+ */
 
 // =========================================
 // Module State
@@ -52,29 +51,7 @@ nl_module_info_t* nl_autocomplete_get_module_info(void) {
 // =========================================
 
 static int parse_enable_value(const char* value) {
-    if (!value) return 0;
-    
-    if (strcmp(value, "1") == 0 || strcmp(value, "0") == 0) {
-        return atoi(value);
-    }
-    
-    char lower[16];
-    size_t i;
-    for (i = 0; i < sizeof(lower) - 1 && value[i]; i++) {
-        lower[i] = tolower((unsigned char)value[i]);
-    }
-    lower[i] = '\0';
-    
-    if (strcmp(lower, "true") == 0 || strcmp(lower, "on") == 0 || 
-        strcmp(lower, "yes") == 0) {
-        return 1;
-    }
-    if (strcmp(lower, "false") == 0 || strcmp(lower, "off") == 0 || 
-        strcmp(lower, "no") == 0) {
-        return 0;
-    }
-    
-    return 0;
+    return nl_parse_enable_value(value);
 }
 
 // =========================================
@@ -170,39 +147,13 @@ const char* nl_autocomplete_get_encoding(void) {
 }
 
 // =========================================
-// Helper Functions
+// Helper Functions（收敛至公共工具层 nl_util）
 // =========================================
 
-static int nl_autocomplete_tolower(int c) {
-    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
-    return c;
-}
-
 int nl_autocomplete_strncasecmp(const char* s1, const char* s2, size_t n) {
-    if (n == 0) return 0;
-    // 按标准语义逐字符比较：任一方提前结束后，以字符差作为结果返回
-    while (n-- > 0) {
-        int c1 = nl_autocomplete_tolower((unsigned char)*s1);
-        int c2 = nl_autocomplete_tolower((unsigned char)*s2);
-        int diff = c1 - c2;
-        if (diff != 0) return diff;
-        // 两串同时到达结束符，视为相等
-        if (c1 == '\0') return 0;
-        s1++;
-        s2++;
-    }
-    return 0;
+    return nl_strncasecmp(s1, s2, n);
 }
 
 char* nl_autocomplete_strncasestr(const char* haystack, const char* needle, size_t len) {
-    if (!haystack || !needle || needle[0] == '\0') return NULL;
-    size_t needle_len = strlen(needle);
-    if (needle_len > len) return NULL;
-    const char* end = haystack + len - needle_len;
-    for (const char* p = haystack; p <= end; p++) {
-        if (nl_autocomplete_strncasecmp(p, needle, needle_len) == 0) {
-            return (char*)p;
-        }
-    }
-    return NULL;
+    return nl_strncasestr(haystack, needle, len);
 }

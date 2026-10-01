@@ -53,7 +53,7 @@ extern "C" {
 /**
  * @brief NL扩展系统版本号
  */
-#define NL_MODULE_VERSION "2.4.1"
+#define NL_MODULE_VERSION "2.4.2"
 
 /**
  * @brief NL扩展系统名称
@@ -256,6 +256,11 @@ NL_API const char* nl_module_get_version(nl_module_type_t type);
 NL_API const char* nl_module_get_description(nl_module_type_t type);
 NL_API int nl_module_has_capability(nl_module_type_t type, int cap);
 NL_API int nl_module_get_capabilities(nl_module_type_t type);
+/**
+ * @brief 返回模块支持平台的展示字符串（如 "Windows,Linux,MacOS" / "all"）。
+ * @note 调用方负责 free()；模块未注册时返回 NULL。
+ */
+NL_API char* nl_module_get_platforms(nl_module_type_t type);
 
 // =========================================
 // Lazy Loading API
@@ -801,14 +806,6 @@ NL_API nl_module_info_t* nl_module_get_dependencies(nl_module_type_t module);
                      nl_mqtt_init, NULL, nl_mqtt_is_available, nl_mqtt_version, \
                      "MQTT v3.1.1/v5.0 protocol support", \
                      "508364")
-
-#define NL_MODULE_TLS_INFO \
-    NL_MODULE_DEFINE_LAZY(NL_MODULE_TLS, tls, NL_TLS_VERSION, \
-                         NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_ALL | NL_CAP_TLS | NL_CAP_EXT_SYSTEM, \
-                         1, 1, 1, \
-                         nl_tls_init, NULL, nl_tls_is_available, nl_tls_version, \
-                         "TLS/SSL encryption support using mbedTLS", \
-                         "508364", NULL, NULL)
 
 #define NL_MODULE_CORE_INFO \
     NL_MODULE_DEFINE(NL_MODULE_CORE, netleaf, NETLEAF_VERSION, \

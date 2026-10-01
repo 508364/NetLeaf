@@ -6,9 +6,10 @@
 #include "netleaf_mqtt.h"
 #include "netleaf_mqtt_lang.h"
 #include "netleaf_mqtt_server_lang.h"
+#include "nl_util.h"
 #include "netleaf_module.h"
 #ifdef NL_MQTT_SERVER_TLS_ENABLE
-#include "netleaf_tls.h"
+#include "netleaf_tls2.h"
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +19,6 @@
 
 #ifdef _WIN32
     #define snprintf _snprintf
-    #define strdup _strdup
     #define closesocket_close closesocket
     #include <windows.h>
 #else
@@ -162,6 +162,7 @@ typedef struct nl_mqtt_will_pending {
     int      qos;
     int      retain;
     long long due_ms;        // 到期时刻(单调毫秒)
+    nl_mqtt_property_t* props;  // v5 遗嘱转发属性(Content Type / Response Topic 等)
     struct nl_mqtt_will_pending* next;
 } nl_mqtt_will_pending_t;
 
@@ -203,6 +204,7 @@ typedef struct nl_mqtt_server_client {
     int                       has_will;
     uint32_t                  will_delay_interval;   // v5 遗嘱延迟(秒)
     uint32_t                  will_message_expiry;   // v5 遗嘱消息过期(秒)
+    nl_mqtt_property_t*       will_props;            // v5 遗嘱转发属性列表(保留/释放)
     // MQTT 5.0 会话/主题别名状态
     uint32_t                  session_expiry_interval;  // CONNECT 声明(秒)
     int                       session_expiry_set;
@@ -249,6 +251,7 @@ typedef struct nl_mqtt_server {
     void*                     event_user_data;
     nl_mqtt_server_auth_callback_t auth_callback;
     void*                     auth_user_data;
+    nl_mqtt_server_auth_reauth_callback_t auth_reauth_callback;
     int                       tls_enabled;
     char*                     tls_ca_file;      // 服务端 CA 证书路径(校验客户端)
     char*                     tls_cert_file;    // 服务端证书路径
@@ -397,7 +400,7 @@ static int nl_mqtt_server_add_subscription(nl_mqtt_server_t* srv,
         existing->rap = rap ? 1 : 0;
         existing->retain_handling = retain_handling;
         free(existing->share_group);
-        existing->share_group = share_group ? strdup(share_group) : NULL;
+        existing->share_group = share_group ? nl_strdup(share_group) : NULL;
         return 0;
     }
 
@@ -405,8 +408,8 @@ static int nl_mqtt_server_add_subscription(nl_mqtt_server_t* srv,
         (nl_mqtt_server_subscription_t*)calloc(1, sizeof(*sub));
     if (!sub) return -1;
 
-    sub->topic = strdup(topic);
-    sub->owner_client_id = strdup(owner_client_id);
+    sub->topic = nl_strdup(topic);
+    sub->owner_client_id = nl_strdup(owner_client_id);
     if (!sub->topic || !sub->owner_client_id) {
         free(sub->topic);
         free(sub->owner_client_id);
@@ -420,7 +423,7 @@ static int nl_mqtt_server_add_subscription(nl_mqtt_server_t* srv,
     sub->no_local = no_local ? 1 : 0;
     sub->rap = rap ? 1 : 0;
     sub->retain_handling = retain_handling;
-    sub->share_group = share_group ? strdup(share_group) : NULL;
+    sub->share_group = share_group ? nl_strdup(share_group) : NULL;
     sub->next = srv->subscriptions;
     srv->subscriptions = sub;
     return 1;
@@ -565,7 +568,7 @@ static nl_mqtt_server_session_t* nl_mqtt_server_acquire_session(nl_mqtt_server_t
     if (!sess) {
         sess = (nl_mqtt_server_session_t*)calloc(1, sizeof(*sess));
         if (!sess) return NULL;
-        sess->client_id = strdup(client_id);
+        sess->client_id = nl_strdup(client_id);
         if (!sess->client_id) { free(sess); return NULL; }
         sess->next = srv->sessions;
         srv->sessions = sess;
@@ -695,7 +698,7 @@ static nl_mqtt_out_msg_t* nl_mqtt_server_out_msg_add(nl_mqtt_server_session_t* s
     if (!m) return NULL;
 
     if (topic) {
-        m->topic = strdup(topic);
+        m->topic = nl_strdup(topic);
         if (!m->topic) { free(m); return NULL; }
     }
 
@@ -806,7 +809,7 @@ static void nl_mqtt_server_set_retained(nl_mqtt_server_t* srv, const char* topic
 
     r = (nl_mqtt_retained_msg_t*)calloc(1, sizeof(*r));
     if (!r) return;
-    r->topic   = strdup(topic);
+    r->topic   = nl_strdup(topic);
     r->payload = malloc(payload_len);
     if (!r->topic || !r->payload) {
         free(r->topic);
@@ -855,7 +858,7 @@ static void nl_mqtt_server_note_session_deleted(nl_mqtt_server_t* srv,
         srv->deleted_session_ids = nd;
         srv->deleted_session_cap = ncap;
     }
-    char* dup = strdup(client_id);
+    char* dup = nl_strdup(client_id);
     if (!dup) return;
     srv->deleted_session_ids[srv->deleted_session_count++] = dup;
 }
@@ -888,7 +891,7 @@ static void nl_mqtt_server_note_retained_deleted(nl_mqtt_server_t* srv,
         srv->deleted_retained_topics = nd;
         srv->deleted_retained_cap = ncap;
     }
-    char* dup = strdup(topic);
+    char* dup = nl_strdup(topic);
     if (!dup) return;
     srv->deleted_retained_topics[srv->deleted_retained_count++] = dup;
 }
@@ -928,7 +931,7 @@ static void nl_mqtt_server_topic_alias_set(nl_mqtt_server_client_t* client,
                                            uint16_t alias, const char* topic) {
     if (!client || alias == 0 || alias >= 16) return;
     free(client->topic_alias[alias]);
-    client->topic_alias[alias] = topic ? strdup(topic) : NULL;
+    client->topic_alias[alias] = topic ? nl_strdup(topic) : NULL;
 }
 static const char* nl_mqtt_server_topic_alias_get(nl_mqtt_server_client_t* client,
                                                   uint16_t alias) {
@@ -1356,9 +1359,9 @@ static int nl_mqtt_server_tls_accept(nl_mqtt_server_t* srv,
     if (!srv || !srv->tls_enabled) return 0;
 #ifdef NL_MQTT_SERVER_TLS_ENABLE
     if (!srv->tls_cert_file || !srv->tls_key_file) return -1;   // 缺少服务端证书/私钥
-    nl_tls_ctx_t* tls = nl_tls_create();
+    nl_tls2_ctx_t* tls = nl_tls2_create();
     if (!tls) return -1;
-    nl_tls_config_t cfg;
+    nl_tls2_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.is_server   = 1;
     cfg.cert_file   = srv->tls_cert_file;
@@ -1366,12 +1369,12 @@ static int nl_mqtt_server_tls_accept(nl_mqtt_server_t* srv,
     cfg.ca_file     = srv->tls_ca_file;
     cfg.client_auth = srv->tls_client_auth;
     cfg.verify_peer = 0;
-    if (nl_tls_configure(tls, &cfg) != NL_TLS_OK) { nl_tls_destroy(tls); return -1; }
+    if (nl_tls2_configure(tls, &cfg) != nl_tls2_OK) { nl_tls2_destroy(tls); return -1; }
     int timeout_ms = srv->tls_handshake_timeout_sec > 0
                          ? srv->tls_handshake_timeout_sec * 1000
                          : 0;
-    if (nl_tls_handshake_ex(tls, (int)client->sock, timeout_ms) != NL_TLS_OK) {
-        nl_tls_destroy(tls); return -1;
+    if (nl_tls2_handshake_ex(tls, (int)client->sock, timeout_ms) != nl_tls2_OK) {
+        nl_tls2_destroy(tls); return -1;
     }
     client->tls_ctx = tls;
     return 0;
@@ -1387,7 +1390,7 @@ static int nl_mqtt_server_client_recv(nl_mqtt_server_client_t* client,
                                       char* buf, size_t len) {
 #ifdef NL_MQTT_SERVER_TLS_ENABLE
     if (client->tls_ctx) {
-        return nl_tls_recv((nl_tls_ctx_t*)client->tls_ctx, buf, len);
+        return nl_tls2_recv((nl_tls2_ctx_t*)client->tls_ctx, buf, len);
     }
 #endif
     return (int)recv(client->sock, buf, len, 0);
@@ -1400,7 +1403,7 @@ static int nl_mqtt_server_send_all(nl_mqtt_server_client_t* client,
     while (sent < len) {
 #ifdef NL_MQTT_SERVER_TLS_ENABLE
         if (client->tls_ctx) {
-            int n = nl_tls_send((nl_tls_ctx_t*)client->tls_ctx, buf + sent, len - sent);
+            int n = nl_tls2_send((nl_tls2_ctx_t*)client->tls_ctx, buf + sent, len - sent);
             if (n <= 0) return -1;
             sent += (size_t)n;
             continue;
@@ -1524,6 +1527,19 @@ static int nl_mqtt_server_send_disconnect(nl_mqtt_server_client_t* client,
         buf[pos++] = 0x00;   // 属性长度 0
     }
     return nl_mqtt_server_send_all(client, buf, pos);
+}
+
+// 发送 AUTH(0xF0) 报文(MQTT 5.0 增强认证)：
+//   remaining = 1(reason_code) + 1(property_length)
+//   reason_code=0 成功；0x02 继续握手(客户端可再次发 AUTH)
+static int nl_mqtt_server_send_auth(nl_mqtt_server_client_t* client, int reason_code) {
+    if (!nl_mqtt_server_is_v5(client)) return -1;   // AUTH 仅 v5
+    char buf[8];
+    int hdr = nl_mqtt_server_write_fixed_header(buf, sizeof(buf), 0xF0, 2u);
+    if (hdr < 0) return -1;
+    buf[3] = (char)(reason_code & 0xFF);
+    buf[4] = 0x00;   // 属性长度 0
+    return nl_mqtt_server_send_all(client, buf, 5);
 }
 
 // 发送 SUBACK：
@@ -1933,14 +1949,15 @@ static void nl_mqtt_server_send_retained(nl_mqtt_server_client_t* client,
 static void nl_mqtt_server_emit_will(nl_mqtt_server_t* srv, const char* topic,
                                      const void* payload, size_t payload_len,
                                      int qos, int retain, uint32_t msg_expiry,
-                                     uint32_t exclude_client_id) {
+                                     uint32_t exclude_client_id,
+                                     nl_mqtt_property_t* fwd_props) {
     if (!srv || !topic) return;
     if (retain) {
         nl_mqtt_server_set_retained(srv, topic, payload, payload_len, qos, msg_expiry);
     }
     srv->stats.total_publishes++;
     nl_mqtt_server_broadcast(srv, topic, payload, payload_len, qos,
-                             retain ? 1 : 0, exclude_client_id, msg_expiry, NULL);
+                             retain ? 1 : 0, exclude_client_id, msg_expiry, fwd_props);
 }
 
 // 立即发布某连接的遗嘱(Will Delay=0 或会话已结束的路径)
@@ -1950,7 +1967,7 @@ static void nl_mqtt_server_publish_will(nl_mqtt_server_t* srv,
     nl_mqtt_server_emit_will(srv, client->will_topic, client->will_payload,
                              client->will_payload_len, client->will_qos,
                              client->will_retain, client->will_message_expiry,
-                             client->id);
+                             client->id, client->will_props);
 }
 
 // ---- 延迟遗嘱队列(v5 Will Delay Interval) ----
@@ -1960,8 +1977,8 @@ static void nl_mqtt_server_pending_will_add(nl_mqtt_server_t* srv,
     if (!srv || !client || !client->has_will || !client->will_topic) return;
     nl_mqtt_will_pending_t* w = (nl_mqtt_will_pending_t*)calloc(1, sizeof(*w));
     if (!w) return;
-    w->client_id   = client->client_id ? strdup(client->client_id) : NULL;
-    w->topic       = strdup(client->will_topic);
+    w->client_id   = client->client_id ? nl_strdup(client->client_id) : NULL;
+    w->topic       = nl_strdup(client->will_topic);
     w->payload_len = client->will_payload_len;
     if (w->payload_len && client->will_payload) {
         w->payload = malloc(w->payload_len);
@@ -1970,6 +1987,21 @@ static void nl_mqtt_server_pending_will_add(nl_mqtt_server_t* srv,
     w->qos    = client->will_qos;
     w->retain = client->will_retain;
     w->due_ms = nl_now_ms() + delay_ms;
+    // 复制遗嘱转发属性列表(深度拷贝)
+    if (client->will_props) {
+        nl_mqtt_property_t* cp = NULL;
+        for (nl_mqtt_property_t* p = client->will_props; p; p = p->next) {
+            nl_mqtt_property_t* np = (nl_mqtt_property_t*)calloc(1, sizeof(*np));
+            if (!np) break;
+            np->type      = p->type;
+            np->int_value = p->int_value;
+            np->str_value = p->str_value ? nl_strdup(p->str_value) : NULL;
+            np->str_len   = p->str_len;
+            np->next      = cp;
+            cp = np;
+        }
+        w->props = cp;
+    }
     w->next   = srv->pending_wills;
     srv->pending_wills = w;
 }
@@ -1988,6 +2020,7 @@ static void nl_mqtt_server_pending_will_cancel(nl_mqtt_server_t* srv,
             free(cur->client_id);
             free(cur->topic);
             free(cur->payload);
+            nl_mqtt_server_props_free(cur->props);
             free(cur);
         } else {
             prev = cur;
@@ -2006,13 +2039,14 @@ static int nl_mqtt_server_pending_will_flush(nl_mqtt_server_t* srv, long long no
         nl_mqtt_will_pending_t* next = cur->next;
         if (now_ms >= cur->due_ms) {
             nl_mqtt_server_emit_will(srv, cur->topic, cur->payload, cur->payload_len,
-                                     cur->qos, cur->retain, 0, 0);
+                                     cur->qos, cur->retain, 0, 0, cur->props);
             published++;
             if (prev) prev->next = next;
             else      srv->pending_wills = next;
             free(cur->client_id);
             free(cur->topic);
             free(cur->payload);
+            nl_mqtt_server_props_free(cur->props);
             free(cur);
         } else {
             prev = cur;
@@ -2030,6 +2064,7 @@ static void nl_mqtt_server_free_pending_wills(nl_mqtt_server_t* srv) {
         free(w->client_id);
         free(w->topic);
         free(w->payload);
+        nl_mqtt_server_props_free(w->props);
         free(w);
         w = next;
     }
@@ -2106,7 +2141,7 @@ static int nl_mqtt_server_handle_connect(nl_mqtt_server_client_t* client,
         if ((p = nl_mqtt_server_prop_find(conn_props, NL_MQTT_PROP_MAX_PACKET_SIZE)))
             client->max_packet_size = (uint32_t)p->int_value;
         if ((p = nl_mqtt_server_prop_find(conn_props, NL_MQTT_PROP_AUTH_METHOD)))
-            client->auth_method = strdup(p->str_value ? p->str_value : "");
+            client->auth_method = nl_strdup(p->str_value ? p->str_value : "");
     }
 
     // 客户端标识符
@@ -2132,7 +2167,7 @@ static int nl_mqtt_server_handle_connect(nl_mqtt_server_client_t* client,
         char auto_id[40];
         snprintf(auto_id, sizeof(auto_id), "auto-%u", client->id);
         free(client->client_id);
-        client->client_id = strdup(auto_id);
+        client->client_id = nl_strdup(auto_id);
         if (!client->client_id) goto conn_fail;
         client->assigned_id = 1;
     }
@@ -2152,7 +2187,7 @@ static int nl_mqtt_server_handle_connect(nl_mqtt_server_client_t* client,
                 client->will_delay_interval = (uint32_t)wp->int_value;
             if ((wp = nl_mqtt_server_prop_find(will_props, NL_MQTT_PROP_MESSAGE_EXPIRY_INTERVAL)))
                 client->will_message_expiry = (uint32_t)wp->int_value;
-            nl_mqtt_server_props_free(will_props);
+            client->will_props = will_props;
         }
         if (offset + 2 > packet_end) goto conn_fail;
         uint16_t will_topic_len =
@@ -2334,7 +2369,7 @@ static int nl_mqtt_server_handle_publish(nl_mqtt_server_client_t* client,
         } else {
             const char* mapped = nl_mqtt_server_topic_alias_get(client, alias);
             if (!mapped) { nl_mqtt_server_props_free(props); return -1; }
-            topic = strdup(mapped);                                 // 由别名解析主题
+            topic = nl_strdup(mapped);                              // 由别名解析主题
             if (!topic) { nl_mqtt_server_props_free(props); return -1; }
         }
     }
@@ -2520,7 +2555,7 @@ static int nl_mqtt_server_handle_subscribe(nl_mqtt_server_client_t* client,
             int is_new = nl_mqtt_server_add_subscription(client->server, eff,
                                             client->client_id, client->id, granted,
                                             sub_id, no_local, rap, rh, share_group);
-            filters[grant_count] = strdup(eff);   // 供 SUBACK 后补发保留消息
+            filters[grant_count] = nl_strdup(eff); // 供 SUBACK 后补发保留消息
             is_new_arr[grant_count] = (is_new == 1);
             if (client->session) client->session->dirty = 1;   // 增量落盘
         } else {
@@ -2755,13 +2790,84 @@ static int nl_mqtt_server_handle_disconnect(nl_mqtt_server_client_t* client,
     return 1;
 }
 
-// 处理 AUTH(0xF0 = 类型 15)：增强认证。当前实现不支持重新认证，
-// 统一以 0x8C(Bad authentication method) 断开。
+// 处理 AUTH(0xF0 = 类型 15)：增强认证。
+//   - 未配置 auth_reauth_callback -> 一律 0x8C 断开
+//   - 回调返回 0    -> 回 AUTH reason_code=0(成功)
+//   - 回调返回 >0   -> 回 AUTH reason_code=0x02(继续握手)，客户端可再次发 AUTH
+//   - 回调返回 <0   -> 0x8C 断开
 static int nl_mqtt_server_handle_auth(nl_mqtt_server_client_t* client,
                                       const char* buf, size_t len) {
-    (void)buf; (void)len;
-    nl_mqtt_server_send_disconnect(client, 0x8C);
-    return -1;
+    nl_mqtt_server_t* srv = client->server;
+    if (!srv || !srv->auth_reauth_callback) {
+        nl_mqtt_server_send_disconnect(client, 0x8C);
+        return -1;
+    }
+
+    // 解析 AUTH 报文：reason_code + 属性
+    int reason_code = 0;
+    nl_mqtt_property_t* props = NULL;
+    char* method_buf = NULL;
+    size_t method_len = 0;
+    char* auth_data_buf = NULL;
+    size_t auth_data_len = 0;
+
+    if (nl_mqtt_server_is_v5(client) && len >= 2) {
+        size_t offset = 1;
+        size_t rem = 0;
+        if (nl_mqtt_server_read_varint(buf, len, &offset, &rem) == 0) {
+            size_t packet_end = offset + rem;
+            if (offset < packet_end) reason_code = (uint8_t)buf[offset++];
+            if (offset < packet_end) {
+                nl_mqtt_property_t* parsed = NULL;
+                if (nl_mqtt_server_parse_properties(buf, packet_end, &offset, &parsed) == 0) {
+                    nl_mqtt_property_t* pm =
+                        nl_mqtt_server_prop_find(parsed, NL_MQTT_PROP_AUTH_METHOD);
+                    nl_mqtt_property_t* pd =
+                        nl_mqtt_server_prop_find(parsed, NL_MQTT_PROP_AUTH_DATA);
+                    if (pm && pm->str_value) {
+                        method_len = strlen(pm->str_value);
+                        method_buf = (char*)malloc(method_len + 1);
+                        if (method_buf) memcpy(method_buf, pm->str_value, method_len + 1);
+                    }
+                    if (pd && pd->str_value) {
+                        auth_data_len = pd->str_len;
+                        auth_data_buf = (char*)malloc(auth_data_len + 1);
+                        if (auth_data_buf) {
+                            memcpy(auth_data_buf, pd->str_value, auth_data_len);
+                            auth_data_buf[auth_data_len] = '\0';
+                        }
+                    }
+                    nl_mqtt_server_props_free(parsed);
+                }
+            }
+        }
+    }
+
+    // 调用重认证回调
+    const char* method = method_buf ? method_buf
+                     : (client->auth_method ? client->auth_method : NULL);
+    int rc = srv->auth_reauth_callback(
+        client->client_id, method,
+        auth_data_buf, auth_data_len,
+        srv->auth_user_data);
+
+    if (rc < 0) {
+        // 认证失败
+        nl_mqtt_server_send_disconnect(client, 0x8C);
+    } else if (rc == 0) {
+        // 认证成功
+        nl_mqtt_server_send_auth(client, 0);
+    } else {
+        // 继续握手
+        nl_mqtt_server_send_auth(client, 0x02);
+    }
+
+    free(method_buf);
+    free(auth_data_buf);
+    (void)reason_code;
+    (void)props;
+    // AUTH 处理完成后，连接保持，等待后续报文；返回 0 表示不释放连接
+    return 0;
 }
 
 // 断开并释放一个连接。
@@ -2816,12 +2922,14 @@ static void nl_mqtt_server_disconnect_client_internal(nl_mqtt_server_t* srv,
     free(client->auth_method);
     free(client->will_topic);
     free(client->will_payload);
+    nl_mqtt_server_props_free(client->will_props);
+    client->will_props = NULL;
 
     // 关闭 TLS(发送 close_notify)并释放上下文
 #ifdef NL_MQTT_SERVER_TLS_ENABLE
     if (client->tls_ctx) {
-        nl_tls_close((nl_tls_ctx_t*)client->tls_ctx);
-        nl_tls_destroy((nl_tls_ctx_t*)client->tls_ctx);
+        nl_tls2_close((nl_tls2_ctx_t*)client->tls_ctx);
+        nl_tls2_destroy((nl_tls2_ctx_t*)client->tls_ctx);
         client->tls_ctx = NULL;
     }
 #endif
@@ -3075,8 +3183,8 @@ void nl_mqtt_server_destroy(nl_mqtt_server_t* server) {
         free(client->will_payload);
 #ifdef NL_MQTT_SERVER_TLS_ENABLE
         if (client->tls_ctx) {
-            nl_tls_close((nl_tls_ctx_t*)client->tls_ctx);
-            nl_tls_destroy((nl_tls_ctx_t*)client->tls_ctx);
+            nl_tls2_close((nl_tls2_ctx_t*)client->tls_ctx);
+            nl_tls2_destroy((nl_tls2_ctx_t*)client->tls_ctx);
             client->tls_ctx = NULL;
         }
 #endif
@@ -3153,7 +3261,7 @@ int nl_mqtt_server_start(nl_mqtt_server_t* server,
     // 提前获取可在“端口已被占用/文件被其他实例锁定”时立即失败，避免占用端口后才发现冲突。
     if (config && config->session_store_path && *config->session_store_path) {
         free(server->session_store_path);
-        server->session_store_path = strdup(config->session_store_path);
+        server->session_store_path = nl_strdup(config->session_store_path);
         if (!server->session_store_path) return -5;
     }
     if (server->session_store_path && !server->store_lock.held) {
@@ -3217,11 +3325,12 @@ int nl_mqtt_server_start(nl_mqtt_server_t* server,
         free(server->tls_ca_file);
         free(server->tls_cert_file);
         free(server->tls_key_file);
-        server->tls_ca_file   = config->ca_file   ? strdup(config->ca_file)   : NULL;
-        server->tls_cert_file = config->cert_file ? strdup(config->cert_file) : NULL;
-        server->tls_key_file  = config->key_file  ? strdup(config->key_file)  : NULL;
+        server->tls_ca_file   = config->ca_file   ? nl_strdup(config->ca_file)   : NULL;
+        server->tls_cert_file = config->cert_file ? nl_strdup(config->cert_file) : NULL;
+        server->tls_key_file  = config->key_file  ? nl_strdup(config->key_file)  : NULL;
         server->auth_callback = config->auth_callback;
         server->auth_user_data = config->auth_user_data;
+        server->auth_reauth_callback = config->auth_reauth_callback;
         // 重传/会话过期参数：>0 时覆盖默认值
         if (config->retry_timeout_sec  > 0) server->retry_timeout_sec  = config->retry_timeout_sec;
         if (config->max_retries        > 0) server->max_retries        = config->max_retries;
@@ -3235,7 +3344,7 @@ int nl_mqtt_server_start(nl_mqtt_server_t* server,
         if (config->receive_maximum     > 0) server->receive_maximum     = config->receive_maximum;
         if (config->max_packet_size     > 0) server->max_packet_size     = config->max_packet_size;
         free(server->server_reference);
-        server->server_reference = config->server_reference ? strdup(config->server_reference) : NULL;
+        server->server_reference = config->server_reference ? nl_strdup(config->server_reference) : NULL;
     }
 
     // 会话落盘：尝试加载既有会话/保留消息(须在任何客户端接入之前完成)
@@ -3535,7 +3644,7 @@ static void nl_mqtt_server_prune_sessions(nl_mqtt_server_t* srv, time_t now,
 // ============================================================
 
 #define NL_LOG_MAGIC     0x4E4C4F47u   /* "NLOG" */
-#define NL_LOG_VERSION   3u
+#define NL_LOG_VERSION   4u
 #define NL_BLOCK_SNAPSHOT 1u
 #define NL_BLOCK_DELTA    2u
 #define OP_SESSION_SET   1u
@@ -3721,6 +3830,13 @@ static void nl_store_put_session(nl_store_buf_t* b, nl_mqtt_server_t* srv,
         nl_fw_bytes(b, sub->topic, tl);
         nl_fw_u8(b, (uint8_t)sub->qos);
         nl_fw_u32(b, sub->sub_id);
+        // v5 订阅选项 + 共享组
+        nl_fw_u8(b, (uint8_t)(sub->no_local ? 1 : 0));
+        nl_fw_u8(b, (uint8_t)(sub->rap ? 1 : 0));
+        nl_fw_u8(b, (uint8_t)sub->retain_handling);
+        uint32_t sl = sub->share_group ? (uint32_t)strlen(sub->share_group) : 0;
+        nl_fw_u32(b, sl);
+        if (sl) nl_fw_bytes(b, sub->share_group, sl);
     }
 
     /* 未确认出站消息 */
@@ -3844,9 +3960,25 @@ static void nl_store_get_session(nl_mqtt_server_t* srv, nl_store_rd_t* rd) {
         topic[tl] = '\0';
         uint8_t qos = 0;
         uint32_t sid = 0;
+        uint8_t no_local = 0, rap = 0, retain_handling = 0;
         if (nl_fr_u8(rd, &qos) || nl_fr_u32(rd, &sid)) { free(topic); break; }
+        // v5 订阅选项 + 共享组
+        if (nl_fr_u8(rd, &no_local) || nl_fr_u8(rd, &rap) || nl_fr_u8(rd, &retain_handling)) {
+            free(topic); break;
+        }
+        uint32_t sl = 0;
+        char* share_group = NULL;
+        if (nl_fr_u32(rd, &sl) || sl > NL_SESSION_MAX_FIELD) { free(topic); break; }
+        if (sl) {
+            share_group = (char*)malloc(sl + 1);
+            if (!share_group) { free(topic); break; }
+            if (nl_fr_bytes(rd, share_group, sl) != 0) { free(share_group); free(topic); break; }
+            share_group[sl] = '\0';
+        }
         nl_mqtt_server_add_subscription(srv, topic, sess->client_id, 0, (int)qos, sid,
-                                        0, 0, 0, NULL);
+                                        (int)no_local, (int)rap, (int)retain_handling,
+                                        share_group);
+        free(share_group);
         free(topic);
     }
     if (!rd->ok) return;

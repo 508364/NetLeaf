@@ -26,7 +26,12 @@ target_include_directories(netleaf_ipc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(netleaf_ipc PRIVATE NL_IPC_EXPORTS)
-target_link_libraries(netleaf_ipc PUBLIC netleaf_core netleaf_lang)
+target_link_libraries(netleaf_ipc PUBLIC netleaf_core)
+# Lang 为官方软依赖：BUILD_LANG=ON 时链接并定义 NL_LANG_ENABLE；OFF 时不链接，
+# netleaf_lang.h 退化为 no-op，扩展无需改动源码。
+if(BUILD_LANG)
+    target_link_libraries(netleaf_ipc PUBLIC netleaf_lang)
+endif()
 
 # Windows 平台需要链接 Winsock
 if(WIN32)

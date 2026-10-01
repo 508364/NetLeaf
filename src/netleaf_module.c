@@ -21,6 +21,7 @@
  */
 
 #include "netleaf.h"
+#include "nl_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,13 +39,6 @@
     #include <dlfcn.h>
     #include <unistd.h>
     #include <sys/stat.h>
-#endif
-
-// Portable strdup for Windows
-#if defined(_WIN32) && !defined(__cplusplus)
-    #ifndef strdup
-        #define strdup _strdup
-    #endif
 #endif
 
 #define MAX_MODULES 64
@@ -73,6 +67,27 @@
     #define NL_META_MUTEX_LOCK(m)    pthread_mutex_lock(m)
     #define NL_META_MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
     #define NL_META_MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+#endif
+
+// 注册表级互斥量：保护 g_module_registry / g_extension_registry / g_plugin_registry
+// 等共享结构体的并发读写。
+#ifdef _WIN32
+    static CRITICAL_SECTION g_registry_mutex;
+    static BOOL g_registry_mutex_initialized = 0;
+    static void registry_mutex_lock(void) {
+        if (!g_registry_mutex_initialized) {
+            InitializeCriticalSection(&g_registry_mutex);
+            g_registry_mutex_initialized = 1;
+        }
+        EnterCriticalSection(&g_registry_mutex);
+    }
+    static void registry_mutex_unlock(void) {
+        LeaveCriticalSection(&g_registry_mutex);
+    }
+#else
+    static pthread_mutex_t g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static void registry_mutex_lock(void)  { pthread_mutex_lock(&g_registry_mutex); }
+    static void registry_mutex_unlock(void) { pthread_mutex_unlock(&g_registry_mutex); }
 #endif
 
 // ============================================================
@@ -113,7 +128,14 @@ typedef struct {
     // 取代原先 nl_plugin_get_descriptor() 的函数内 static 存储，
     // 避免多句柄/多线程调用时互相覆盖。
     nl_plugin_descriptor_t descriptor;
+    // 存储插件文件路径，支持 nl_plugin_reload
+    char* file_path;
+    // 订阅事件表
+    char** subscribed_events;
+    int subscribed_event_count;
 } nl_plugin_entry_t;
+
+#define MAX_PLUGIN_EVENTS 16
 
 static nl_plugin_entry_t g_plugin_registry[MAX_PLUGINS];
 // H8: g_plugin_count 现在表示“有效槽位数量”（装载 +1，卸载 -1），
@@ -192,7 +214,11 @@ static int is_macos(void) {
 // ============================================================
 
 static int find_module_index(nl_module_type_t type) {
-    (void)type;
+    for (int i = 0; i < g_module_count; i++) {
+        if (g_module_registry[i] && g_module_registry[i]->type == type) {
+            return i;
+        }
+    }
     return -1;
 }
 
@@ -305,11 +331,20 @@ static int parse_platforms(const char* platforms_str, int* win, int* lin, int* m
     return 1;
 }
 
-static const char* get_platform_string(int win, int lin, int mac) {
-    (void)win; (void)lin; (void)mac;
-    static char buf[64];
+// 把“平台标志位”拼成展示字符串（"Windows,Linux,MacOS" / "all"）。
+// 返回值由调用方负责 free()；失败返回 NULL。
+// 说明：原实现用 static char buf[64] 复用在多线程场景下不安全
+// （两个线程同时调用 nl_module_get_platforms() 会互相覆盖），
+// 改为每次 malloc 一个新字符串。
+static char* get_platform_string(int win, int lin, int mac) {
+    char buf[64];
+    int n = 0;
     buf[0] = '\0';
-    return buf;
+    if (win) { n += snprintf(buf + n, sizeof(buf) - n, "Windows"); }
+    if (lin) { if (n) n += snprintf(buf + n, sizeof(buf) - n, ","); n += snprintf(buf + n, sizeof(buf) - n, "Linux"); }
+    if (mac) { if (n) n += snprintf(buf + n, sizeof(buf) - n, ","); n += snprintf(buf + n, sizeof(buf) - n, "MacOS"); }
+    if (!win && !lin && !mac) n = snprintf(buf, sizeof(buf), "all");
+    return nl_strdup(buf);
 }
 
 // ============================================================
@@ -499,16 +534,22 @@ NL_API int nl_extension_register(nl_extension_info_t* info) {
     if (find_extension_index(info->library_id) >= 0) return 0;
     if (g_extension_count >= MAX_EXTENSIONS) return -1;
 
+    // 加载前自动依赖检查：若声明了“必需”依赖且任一必需库尚未注册，
+    // 则拒绝注册（不加载该扩展），返回 -2。可选依赖缺失不阻断。
+    if (nl_extension_check_dependencies(info, 1) != 0) {
+        return -2;
+    }
+
     int idx = g_extension_count;
 
     // L4: 先在栈上完成全部内存分配，任一 strdup 失败即整体回滚、不占用槽位。
     // 原实现先递增 g_extension_count 再 strdup，一旦 OOM 使 g_extension_ids[idx]=NULL，
     // find_extension_index() 会跳过该 NULL 槽位，导致同一个 library_id 被重复注册
     // （同时留下无法访问的“幽灵槽位”）。
-    char* id_copy = strdup(info->library_id);
+    char* id_copy = nl_strdup(info->library_id);
     if (!id_copy) return -1;
     const char* name_src = info->library_name ? info->library_name : info->library_id;
-    char* name_copy = strdup(name_src);
+    char* name_copy = nl_strdup(name_src);
     if (!name_copy) {
         free(id_copy);
         return -1;
@@ -630,6 +671,7 @@ static const char* g_ext_symbol_patterns[] = {
     "nl_errorpage_get_extension_info",
     "nl_vue_get_extension_info",
     "nl_lagg_get_extension_info",
+    "nl_https_get_extension_info",
     // Fallback: get_module_info (cast to extension info)
     "nl_lang_get_module_info",
     "nl_ipc_get_module_info",
@@ -640,6 +682,8 @@ static const char* g_ext_symbol_patterns[] = {
     "nl_lagg_get_module_info",
     // Legacy example pattern
     "nl_example_get_extension_info",
+    // Generic: nl_get_extension_info — 新扩展可只导出该通用入口
+    "nl_get_extension_info",
     NULL
 };
 
@@ -650,22 +694,60 @@ static int auto_load_extension_file(const char* filepath) {
 
     typedef nl_extension_info_t* (*GetExtInfoFunc)(void);
 
-    // Try standard symbol names first
+    // 1. Try known module symbol patterns
     for (int i = 0; g_ext_symbol_patterns[i] != NULL; i++) {
         GetExtInfoFunc get_info = (GetExtInfoFunc)GetProcAddress(h, g_ext_symbol_patterns[i]);
         if (get_info) {
             nl_extension_info_t* ext = get_info();
             if (ext) {
-                // L5: 注册失败（注册表已满 / 内存不足）必须视为加载失败，
-                // 不能忽略返回值继续 return 0 假装成功。
                 if (nl_extension_register(ext) != 0) {
                     FreeLibrary(h);
                     return -1;
                 }
-                // H7: 句柄交由注册表保留，不能在此 FreeLibrary，
-                // 否则 ext 指向的模块内存被释放，注册表将持有悬垂指针。
                 retain_extension_dl_handle(ext, (void*)h);
                 return 0;
+            }
+        }
+    }
+
+    // 2. Generic fallback: derive module name from filename (libnetleaf_<mod>.dll/.so)
+    //    and probe "nl_<mod>_get_extension_info" / "nl_<mod>_get_module_info".
+    //    这让新扩展无需预注册即可被自动发现。
+    {
+        const char* base = strrchr(filepath, '/');
+        base = base ? base + 1 : strrchr(filepath, '\\');
+        base = base ? base + 1 : filepath;
+        char mod[128];
+        if (sscanf(base, "libnetleaf_%127s.%*s", mod) == 1 ||
+            sscanf(base, "libnetleaf-%127s.%*s", mod) == 1 ||
+            sscanf(base, "netleaf_%127s.%*s", mod) == 1 ||
+            sscanf(base, "netleaf-%127s.%*s", mod) == 1) {
+            char sym[160];
+            snprintf(sym, sizeof(sym), "nl_%s_get_extension_info", mod);
+            GetExtInfoFunc get_info = (GetExtInfoFunc)GetProcAddress(h, sym);
+            if (get_info) {
+                nl_extension_info_t* ext = get_info();
+                if (ext) {
+                    if (nl_extension_register(ext) != 0) {
+                        FreeLibrary(h);
+                        return -1;
+                    }
+                    retain_extension_dl_handle(ext, (void*)h);
+                    return 0;
+                }
+            }
+            snprintf(sym, sizeof(sym), "nl_%s_get_module_info", mod);
+            get_info = (GetExtInfoFunc)GetProcAddress(h, sym);
+            if (get_info) {
+                nl_extension_info_t* ext = (nl_extension_info_t*)(uintptr_t)get_info();
+                if (ext) {
+                    if (nl_extension_register(ext) != 0) {
+                        FreeLibrary(h);
+                        return -1;
+                    }
+                    retain_extension_dl_handle(ext, (void*)h);
+                    return 0;
+                }
             }
         }
     }
@@ -678,22 +760,57 @@ static int auto_load_extension_file(const char* filepath) {
 
     typedef nl_extension_info_t* (*GetExtInfoFunc)(void);
 
-    // Try standard symbol names first
+    // 1. Try known module symbol patterns
     for (int i = 0; g_ext_symbol_patterns[i] != NULL; i++) {
         GetExtInfoFunc get_info = (GetExtInfoFunc)dlsym(h, g_ext_symbol_patterns[i]);
         if (get_info) {
             nl_extension_info_t* ext = get_info();
             if (ext) {
-                // L5: 注册失败（注册表已满 / 内存不足）必须视为加载失败，
-                // 此时尚未保留句柄，直接 dlclose 并返回错误。
                 if (nl_extension_register(ext) != 0) {
                     dlclose(h);
                     return -1;
                 }
-                // H7: 保留 dlopen 句柄到注册表，禁止此处 dlclose。
-                // 原实现加载成功后立即 dlclose，注册表持有悬垂指针（use-after-unload）。
                 retain_extension_dl_handle(ext, h);
                 return 0;
+            }
+        }
+    }
+
+    // 2. Generic fallback: derive module name from filename
+    {
+        const char* base = strrchr(filepath, '/');
+        base = base ? base + 1 : filepath;
+        char mod[128];
+        if (sscanf(base, "libnetleaf_%127s.%*s", mod) == 1 ||
+            sscanf(base, "libnetleaf-%127s.%*s", mod) == 1 ||
+            sscanf(base, "netleaf_%127s.%*s", mod) == 1 ||
+            sscanf(base, "netleaf-%127s.%*s", mod) == 1) {
+            char sym[160];
+            snprintf(sym, sizeof(sym), "nl_%s_get_extension_info", mod);
+            GetExtInfoFunc get_info = (GetExtInfoFunc)dlsym(h, sym);
+            if (get_info) {
+                nl_extension_info_t* ext = get_info();
+                if (ext) {
+                    if (nl_extension_register(ext) != 0) {
+                        dlclose(h);
+                        return -1;
+                    }
+                    retain_extension_dl_handle(ext, h);
+                    return 0;
+                }
+            }
+            snprintf(sym, sizeof(sym), "nl_%s_get_module_info", mod);
+            get_info = (GetExtInfoFunc)dlsym(h, sym);
+            if (get_info) {
+                nl_extension_info_t* ext = (nl_extension_info_t*)(uintptr_t)get_info();
+                if (ext) {
+                    if (nl_extension_register(ext) != 0) {
+                        dlclose(h);
+                        return -1;
+                    }
+                    retain_extension_dl_handle(ext, h);
+                    return 0;
+                }
             }
         }
     }
@@ -803,7 +920,11 @@ NL_API int nl_extension_shutdown(const char* library_id) {
 
 NL_API int nl_extension_force_shutdown(const char* library_id) {
     if (!library_id) return -1;
-    // Unregister and clean up
+    nl_extension_info_t* ext = nl_extension_access(library_id);
+    if (ext && ext->shutdown) {
+        ext->shutdown();
+    }
+    // 强制注销（含动态库句柄释放）
     return nl_extension_unregister(library_id);
 }
 
@@ -1024,7 +1145,7 @@ NL_API int nl_extension_set_metadata(const char* library_id, const char* key, co
 
     for (cur = g_extension_metadata; cur; cur = cur->next) {
         if (strcmp(cur->library_id, library_id) == 0 && strcmp(cur->key, key) == 0) {
-            char* new_value = value ? strdup(value) : NULL;
+            char* new_value = value ? nl_strdup(value) : NULL;
             if (value && !new_value) {
                 NL_META_MUTEX_UNLOCK(&g_metadata_mutex);
                 return -1;
@@ -1041,9 +1162,9 @@ NL_API int nl_extension_set_metadata(const char* library_id, const char* key, co
         NL_META_MUTEX_UNLOCK(&g_metadata_mutex);
         return -1;
     }
-    cur->library_id = strdup(library_id);
-    cur->key = strdup(key);
-    cur->value = value ? strdup(value) : NULL;
+    cur->library_id = nl_strdup(library_id);
+    cur->key = nl_strdup(key);
+    cur->value = value ? nl_strdup(value) : NULL;
     if (!cur->library_id || !cur->key || (value && !cur->value)) {
         free(cur->library_id);
         free(cur->key);
@@ -1130,20 +1251,29 @@ NL_API int nl_extension_lazy_is_loaded(const char* library_id) {
 NL_API int nl_module_register(nl_module_info_t* info) {
     if (!info || !info->name) return -1;
 
-    if (nl_module_get_info(info->type)) return 0;
-    if (g_module_count >= MAX_MODULES) return -1;
+    registry_mutex_lock();
+    int idx = find_module_index(info->type);
+    if (idx >= 0) { registry_mutex_unlock(); return 0; }
+    if (g_module_count >= MAX_MODULES) { registry_mutex_unlock(); return -1; }
 
     g_module_registry[g_module_count++] = info;
     info->status = NL_MODULE_STATUS_INITIALIZED;
+    registry_mutex_unlock();
     return 0;
 }
 
+// 调试 / 展示用：把模块的平台支持标志拼成 "Windows,Linux,MacOS" 之类的字符串
+// （全 0 时返回 "all"）。调用方负责 free()。
+NL_API char* nl_module_get_platforms(nl_module_type_t type) {
+    nl_module_info_t* mod = nl_module_get_info(type);
+    if (!mod) return NULL;
+    return get_platform_string(mod->platform_windows, mod->platform_linux, mod->platform_macos);
+}
+
 NL_API int nl_module_unregister(nl_module_type_t type) {
-    int idx = -1;
-    for (int i = 0; i < g_module_count; i++) {
-        if (g_module_registry[i] && g_module_registry[i]->type == type) { idx = i; break; }
-    }
-    if (idx < 0) return -1;
+    registry_mutex_lock();
+    int idx = find_module_index(type);
+    if (idx < 0) { registry_mutex_unlock(); return -1; }
 
     if (g_module_registry[idx]->shutdown) g_module_registry[idx]->shutdown();
     g_module_registry[idx]->status = NL_MODULE_STATUS_UNINITIALIZED;
@@ -1152,14 +1282,13 @@ NL_API int nl_module_unregister(nl_module_type_t type) {
         g_module_registry[i] = g_module_registry[i + 1];
     }
     g_module_registry[--g_module_count] = NULL;
+    registry_mutex_unlock();
     return 0;
 }
 
 NL_API nl_module_info_t* nl_module_get_info(nl_module_type_t type) {
-    for (int i = 0; i < g_module_count; i++) {
-        if (g_module_registry[i] && g_module_registry[i]->type == type) return g_module_registry[i];
-    }
-    return NULL;
+    int idx = find_module_index(type);
+    return idx >= 0 ? g_module_registry[idx] : NULL;
 }
 
 NL_API nl_module_info_t* nl_module_get_info_by_name(const char* name) {
@@ -1409,21 +1538,45 @@ NL_API int nl_module_add_dependency(nl_module_type_t module, nl_module_type_t de
     if (!mod) return -1;
     nl_module_info_t* dep = nl_module_get_info(dependency);
     if (!dep) return -1;
-    mod->dependencies = dep;
+    // 追加到 dependencies 链表末尾（保持现有语义：单依赖时直接赋值，
+    // 多依赖时串联到链表尾部）
+    if (!mod->dependencies) {
+        mod->dependencies = dep;
+        dep->next = NULL;
+    } else {
+        nl_module_info_t* tail = mod->dependencies;
+        while (tail->next) tail = tail->next;
+        tail->next = dep;
+        dep->next = NULL;
+    }
     return 0;
 }
 
 NL_API int nl_module_remove_dependency(nl_module_type_t module, nl_module_type_t dependency) {
-    (void)module;
-    (void)dependency;
+    nl_module_info_t* mod = nl_module_get_info(module);
+    if (!mod) return -1;
+    nl_module_info_t* prev = NULL;
+    nl_module_info_t* cur = mod->dependencies;
+    while (cur && cur->type != dependency) {
+        prev = cur;
+        cur = cur->next;
+    }
+    if (!cur) return -1;
+    if (prev) prev->next = cur->next;
+    else mod->dependencies = cur->next;
+    cur->next = NULL;
     return 0;
 }
 
 NL_API int nl_module_check_dependencies(nl_module_type_t module) {
     nl_module_info_t* mod = nl_module_get_info(module);
     if (!mod) return -1;
-    if (!mod->dependencies) return 0;
-    return nl_module_get_info(mod->dependencies->type) ? 0 : -1;
+    nl_module_info_t* dep = mod->dependencies;
+    while (dep) {
+        if (!nl_module_get_info(dep->type)) return -1;
+        dep = dep->next;
+    }
+    return 0;
 }
 
 NL_API nl_module_info_t* nl_module_get_dependencies(nl_module_type_t module) {
@@ -1470,6 +1623,9 @@ static int load_plugin_from_path(const char* path, nl_plugin_handle_t* out_handl
     entry->info = info;
     entry->dl_handle = (void*)h;
     entry->state = NL_PLUGIN_STATE_LOADED;
+    entry->file_path = path ? nl_strdup(path) : NULL;
+    entry->subscribed_events = NULL;
+    entry->subscribed_event_count = 0;
     // L4: 描述符随插件一起存入注册表槽位
     fill_plugin_descriptor(info, &entry->descriptor);
     if (init_fn) init_fn();
@@ -1511,6 +1667,9 @@ static int load_plugin_from_path(const char* path, nl_plugin_handle_t* out_handl
     entry->info = info;
     entry->dl_handle = h;
     entry->state = NL_PLUGIN_STATE_LOADED;
+    entry->file_path = path ? nl_strdup(path) : NULL;
+    entry->subscribed_events = NULL;
+    entry->subscribed_event_count = 0;
     // L4: 描述符随插件一起存入注册表槽位
     fill_plugin_descriptor(info, &entry->descriptor);
     if (init_fn) init_fn();
@@ -1538,6 +1697,16 @@ NL_API int nl_plugin_unload(nl_plugin_handle_t handle) {
     entry->info = NULL;
     // L4: 释放槽位内的描述符引用，避免残留已卸载插件的悬垂字符串
     fill_plugin_descriptor(NULL, &entry->descriptor);
+    // 释放路径与订阅表
+    if (entry->file_path) { free(entry->file_path); entry->file_path = NULL; }
+    if (entry->subscribed_events) {
+        for (int i = 0; i < entry->subscribed_event_count; i++) {
+            free(entry->subscribed_events[i]);
+        }
+        free(entry->subscribed_events);
+        entry->subscribed_events = NULL;
+        entry->subscribed_event_count = 0;
+    }
 
     if (entry->dl_handle) {
 #ifdef _WIN32
@@ -1824,13 +1993,48 @@ NL_API int nl_plugin_validate(nl_plugin_handle_t handle, char* error_msg, size_t
 NL_API int nl_plugin_reload(nl_plugin_handle_t handle) {
     if (!handle) return -1;
     nl_plugin_entry_t* entry = (nl_plugin_entry_t*)handle;
-    // Cannot reload without storing path - simplified
-    (void)entry;
-    return -1;
+    if (entry->state != NL_PLUGIN_STATE_LOADED) return -1;
+    if (!entry->file_path) {
+        snprintf(g_plugin_error, sizeof(g_plugin_error), "Plugin has no stored path (loaded via nl_plugin_register?)");
+        return -1;
+    }
+    // 保存旧句柄/信息，先卸载旧库
+    char* saved_path = entry->file_path;
+    void* saved_dl = entry->dl_handle;
+    nl_plugin_info_t* saved_info = entry->info;
+    // 从注册表清出槽位，重新加载
+    nl_plugin_unload(handle);
+    nl_plugin_handle_t new_handle = NULL;
+    if (load_plugin_from_path(saved_path, &new_handle) != 0) {
+        // 加载失败：恢复旧句柄（重新挂到原槽位）
+        for (int i = 0; i < MAX_PLUGINS; i++) {
+            if (!g_plugin_registry[i].handle) {
+                entry = &g_plugin_registry[i];
+                entry->handle = (nl_plugin_handle_t)entry;
+                entry->info = saved_info;
+                entry->dl_handle = saved_dl;
+                entry->state = NL_PLUGIN_STATE_LOADED;
+                entry->file_path = saved_path;
+                entry->subscribed_events = NULL;
+                entry->subscribed_event_count = 0;
+                fill_plugin_descriptor(saved_info, &entry->descriptor);
+                g_plugin_count++;
+                break;
+            }
+        }
+        return -1;
+    }
+    free(saved_path);
+    return 0;
 }
 
 NL_API int nl_plugin_reload_all(void) {
-    return -1;
+    for (int i = 0; i < MAX_PLUGINS; i++) {
+        if (g_plugin_registry[i].handle && g_plugin_registry[i].state == NL_PLUGIN_STATE_LOADED) {
+            nl_plugin_reload((nl_plugin_handle_t)&g_plugin_registry[i]);
+        }
+    }
+    return 0;
 }
 
 NL_API int nl_plugin_emit_event(const char* event_name, void* data, size_t data_size) {
@@ -1840,6 +2044,17 @@ NL_API int nl_plugin_emit_event(const char* event_name, void* data, size_t data_
         if (!g_plugin_registry[i].handle) continue;
         nl_plugin_entry_t* entry = &g_plugin_registry[i];
         if (entry->state != NL_PLUGIN_STATE_LOADED || !entry->info) continue;
+        // 如果有订阅表，只投递订阅的事件；否则广播（旧行为）
+        if (entry->subscribed_event_count > 0) {
+            int matched = 0;
+            for (int j = 0; j < entry->subscribed_event_count; j++) {
+                if (strcmp(entry->subscribed_events[j], event_name) == 0) {
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) continue;
+        }
         if (entry->info->on_event) {
             entry->info->on_event(event_name, data, entry->info->userdata);
         }
@@ -1848,15 +2063,50 @@ NL_API int nl_plugin_emit_event(const char* event_name, void* data, size_t data_
 }
 
 NL_API int nl_plugin_subscribe(nl_plugin_handle_t handle, const char* event_name) {
-    (void)handle;
-    (void)event_name;
+    if (!handle || !event_name) return -1;
+    nl_plugin_entry_t* entry = (nl_plugin_entry_t*)handle;
+    if (entry->state != NL_PLUGIN_STATE_LOADED) return -1;
+    // 已订阅则忽略
+    for (int i = 0; i < entry->subscribed_event_count; i++) {
+        if (entry->subscribed_events[i] && strcmp(entry->subscribed_events[i], event_name) == 0) return 0;
+    }
+    // 动态扩展订阅表
+    if (entry->subscribed_event_count >= MAX_PLUGIN_EVENTS) return -1;
+    char** new_events = (char**)realloc(entry->subscribed_events,
+        sizeof(char*) * (entry->subscribed_event_count + 1));
+    if (!new_events) return -1;
+    entry->subscribed_events = new_events;
+    entry->subscribed_events[entry->subscribed_event_count] = nl_strdup(event_name);
+    if (!entry->subscribed_events[entry->subscribed_event_count]) {
+        entry->subscribed_event_count--;
+        return -1;
+    }
+    entry->subscribed_event_count++;
     return 0;
 }
 
 NL_API int nl_plugin_unsubscribe(nl_plugin_handle_t handle, const char* event_name) {
-    (void)handle;
-    (void)event_name;
-    return 0;
+    if (!handle || !event_name) return -1;
+    nl_plugin_entry_t* entry = (nl_plugin_entry_t*)handle;
+    if (entry->state != NL_PLUGIN_STATE_LOADED) return -1;
+    for (int i = 0; i < entry->subscribed_event_count; i++) {
+        if (entry->subscribed_events[i] && strcmp(entry->subscribed_events[i], event_name) == 0) {
+            free(entry->subscribed_events[i]);
+            entry->subscribed_events[i] = NULL;
+            // 末尾元素则缩小计数
+            if (i == entry->subscribed_event_count - 1) {
+                entry->subscribed_event_count--;
+            } else {
+                // 把末尾的移过来
+                entry->subscribed_events[i] = entry->subscribed_events[entry->subscribed_event_count - 1];
+                entry->subscribed_events[entry->subscribed_event_count - 1] = NULL;
+                entry->subscribed_event_count--;
+            }
+            // 收缩分配（不强制，保持内存）
+            return 0;
+        }
+    }
+    return -1; // 未订阅
 }
 
 NL_API int nl_plugin_check_version_compatibility(nl_plugin_handle_t handle, const char* nl_version) {
