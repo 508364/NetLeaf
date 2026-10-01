@@ -60,7 +60,7 @@ struct nl_http_header {
 };
 
 struct nl_http_request {
-    nl_http_method_t method;
+    nlh_http_method_t method;
     nl_http_version_t version;
     char path[NL_HTTP_MAX_PATH];
     struct nl_http_header headers[MAX_HEADERS];
@@ -334,7 +334,7 @@ void h3_connection_free(struct nl_http3_connection* conn);
 
 /* HTTP/1 解析与生成 */
 long nl_http_find_terminator(const char* buf, size_t total);
-nl_http_method_t nl_http_parse_method(const char* method);
+nlh_http_method_t nl_http_parse_method(const char* method);
 int nl_http_parse_request(nl_http_request_t* req, const char* data, size_t len);
 void nl_http_generate_response_http1(nl_http_response_t* resp, char** out, size_t* out_len);
 
@@ -453,7 +453,7 @@ int quic_varint_roundtrip(const uint64_t* values, size_t count,
                           uint8_t* out, size_t out_cap, size_t* out_used);
 
 /* 请求/响应 访问器 */
-nl_http_method_t nl_http_request_get_method(const nl_http_request_t* req);
+nlh_http_method_t nl_http_request_get_method(const nl_http_request_t* req);
 nl_http_version_t nl_http_request_get_version(const nl_http_request_t* req);
 const char* nl_http_request_get_path(const nl_http_request_t* req);
 const char* nl_http_request_get_header(const nl_http_request_t* req, const char* name);

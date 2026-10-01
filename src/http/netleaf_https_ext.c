@@ -18,9 +18,10 @@
  * 设计原则：HTTP→TLS 的"中间层扩展"——纯 HTTP API 已由核心库
  * （netleaf_core）承载，本扩展只负责 TLS 握手 + 加密通道的接入。
  *
- * 注意：本文件 *不* 直接 include netleaf.h / netleaf_http.h，
- * 避免 nl_http_method_t 在两个头文件中的重复定义（一个在 netleaf.h L48，
- * 另一个在 netleaf_http.h L117），而是仅 include 扩展系统 + 后端所需的头。
+ * 注意：本文件仅 include 扩展系统与 TLS 后端所需的头，不直接依赖
+ * netleaf.h / netleaf_http.h 的 HTTP 类型定义。
+ * （v2.4.2 起 netleaf_http.h 的方法枚举更名为 nlh_http_method_t，
+ *  与 netleaf.h 的 nl_http_method_t 不再重定义，两个头可安全同包包含。）
  */
 
 #include "netleaf_module.h"

@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./Logo.svg" width="72" height="72" alt="NetLeaf Logo">
+  <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
   <h1>NetLeaf</h1>
   <p><b>NetLeaf</b> 是一个现代化的、高性能的网络库，采用 <b>NL扩展系统</b> 架构，支持跨平台运行（Windows/Linux/macOS/Android）。提供 TCP/UDP、HTTP、WebSocket 和 MQTT 协议支持，内置智能路由、自动补全、多语言等扩展模块。</p>
   <img src="https://img.shields.io/badge/NetLeaf-v2.4.2-blue?style=for-the-badge" alt="NetLeaf Version">
@@ -247,10 +247,10 @@ int main(void) {
 
 NetLeaf 的 Web 反向代理采用**数据驱动的异步并行事件引擎**：连接状态编码为
 无状态字节 + 按设备动态定容的 ring buffer，**单线程**通过 `epoll`（Linux）/
-`kqueue`（macOS）/ `select`（Windows）多路复用一次泵多个连接，非阻塞 fd +
-空闲退避，保持极低占用。`upstream` 前缀决定协议：`tcp://` 纯字节透传，
-`http://` / `https://` 重组请求头并透传。`nl_web_start` 检测到 proxy 路由
-时自动拉起单线程引擎（不分配 worker 池）。
+`kqueue`（macOS）/ `IOCP`（Windows 内核完成端口，**无 `FD_SETSIZE` 限制**）
+多路复用一次泵多个连接，非阻塞 fd + 空闲退避，保持极低占用。`upstream`
+前缀决定协议：`tcp://` 纯字节透传，`http://` / `https://` 重组请求头并透传。
+`nl_web_start` 检测到 proxy 路由时自动拉起单线程引擎（不分配 worker 池）。
 
 ```c
 #include "netleaf.h"

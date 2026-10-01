@@ -36,6 +36,7 @@ option(BUILD_MQTT "Build MQTT module" ON)
 option(BUILD_MQTT_SERVER "Build MQTT server module" ON)
 option(BUILD_TLS "Build TLS2 extension (mbedTLS 2.28, TLS 1.0-1.3)" OFF)
 option(BUILD_TLS3 "Build TLS3 extension (mbedTLS 3.x, TLS 1.2/1.3)" ON)
+option(BUILD_QUICTLS "Build QUIC-TLS extension (self-implemented RFC 9001, requires BUILD_TLS3)" OFF)
 option(BUILD_LANG "Build lang extension (official soft dependency)" ON)
 
 # ============================================================
@@ -282,6 +283,15 @@ endif()
 # 当 BUILD_TLS 与 BUILD_TLS3 同时启用时，netleaf_https 优先链接 tls3。
 if(BUILD_TLS3)
     add_subdirectory(src/tls3)
+endif()
+
+# QUIC-TLS 扩展（自研 RFC 9001 数据包保护层，复用 tls3 引入的 mbedTLS 目标）
+if(BUILD_QUICTLS)
+    if(BUILD_TLS3)
+        add_subdirectory(src/quictls)
+    else()
+        message(WARNING "BUILD_QUICTLS=ON 需要 BUILD_TLS3=ON（复用其 mbedTLS 目标），已跳过 quictls。")
+    endif()
 endif()
 
 # HTTPS 扩展库（TLS/HTTPS：HTTP→TLS 连接的中间层）：

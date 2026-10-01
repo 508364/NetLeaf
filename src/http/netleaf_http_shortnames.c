@@ -75,7 +75,7 @@ void nlh_h3_set_handler(nl_http3_server_t* server, nl_http_handler handler, void
     nl_http3_server_set_handler(server, handler, user_data);
 }
 
-nl_http_method_t nlh_req_method(const nl_http_request_t* req) {
+nlh_http_method_t nlh_req_method(const nl_http_request_t* req) {
     return nl_http_request_get_method(req);
 }
 nl_http_version_t nlh_req_version(const nl_http_request_t* req) {

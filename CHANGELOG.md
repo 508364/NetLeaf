@@ -6,6 +6,32 @@
 
 ## [2.4.2](https://github.com/508364/NetLeaf/compare/v2.4.1...v2.4.2)
 
+### 新增
+
+#### QUIC-TLS 自研扩展库 `netleaf_quictls`（实验性）— HTTP/3 基石
+
+- **新扩展库**：CMake 选项 `BUILD_QUICTLS`（默认 OFF，需 `BUILD_TLS3=ON`）；在 mbedTLS 原语之上
+  **自研** QUIC-TLS（RFC 9001），不依赖 mbedTLS 的 TLS 记录层（mbedTLS 3.6 无 QUIC API）。
+- **能力**：
+  - 密码学与包保护：HKDF / QUIC v1 Initial 密钥 / 长·短首部 AEAD 保护 + 首部保护（AES-GCM + ChaCha20）/
+    包号编解码 / 首部保护后**动态读取 pn_len**。
+  - 握手：TLS 1.3 密钥调度与握手状态机（X25519 ECDHE + transcript + Finished）、
+    **Certificate + CertificateVerify**（ECDSA P-256）与证书链校验、**ALPN `h3`**、KeyUpdate、**quic ku keystore 更新**。
+  - QUIC：变长整数、CRYPTO/STREAM 帧、Initial/Handshake/1-RTT 数据包；**可靠性**（ACK、
+    packet-threshold + 时间阈值丢包检测与重传、NewReno 拥塞、RTT/PTO、ECN、持久拥塞）；
+    连接级 + 流级**流控**。
+  - HTTP/3：SETTINGS/HEADERS/DATA 帧；**QPACK**（静态表全集 + 动态表 + 编解码器流 + 霍夫曼 +
+    动态表↔字段块联动）。
+  - **可运行 HTTP/3 服务端**：`nlh3_server_*` / `nlh3_client_request[_ex]`（UDP 回环、多连接、
+    客户端证书校验、真实丢包下 **PTO 重传**）。
+- **验证**：`test/test_quictls.c`（ctest `QuicTlsTest`）一次运行 **11 个自测，全部通过**；
+  含 **RFC 9001 A.1 / A.2 / A.3 / A.5 外部 KAT**，以及握手+证书、QUIC+H3、可靠性、流控、QPACK 端到端自测。
+- **模块接入**：新增模块类型 `NL_MODULE_QUICTLS=10` 与能力位 `NL_CAP_QUIC=1<<12`。
+- **平台**：Linux 全量构建 + ctest 通过；Windows(MinGW) 全部源文件**编译成目标文件 0 error**；macOS 为纯 POSIX（预期可用，未实编）。
+  H3 服务端/客户端经**薄可移植层**支持 Windows（Winsock2 socket + `CreateThread`）；Windows **实机运行未验证**（本环境无 Windows mbedTLS / Wine）。
+- **范围**：本扩展属 **HTTP/3**；**HTTP/2 与 HTTPS 服务端接线顺延至 2.4.3**，本版不涉及。
+- **待办（可选）**：RFC 8448（TLS 1.3 握手轨迹）KAT。
+
 ### 变更
 
 #### 反向代理升级为数据驱动异步并行事件引擎 — **Beta**
@@ -133,6 +159,23 @@
   - 保留 3 处良性 `-Wformat-truncation`（路径拼接 / key-value 截断的
     `snprintf`，安全截断无越界）；完整 `-Werror` 可用 `-Wno-format-truncation`
     抑制后启用。
+
+#### 头文件类型冲突修复：`nl_http_method_t` 重定义 (v2.4.2)
+
+- **问题**：`include/netleaf.h` 与 `include/optimize/netleaf_http.h` 各自定义了同名
+  类型 `nl_http_method_t`（前者枚举 `NL_METHOD_*`：GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS；
+  后者枚举 `NL_HTTP_*`：GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/UNKNOWN）。同一编译单元
+  同时包含两个头会触发 `error: conflicting types for 'nl_http_method_t'`；
+  README「基本 HTTP 服务器」示例（同时 include 两头）即无法编译。此前仅在
+  `netleaf_https_ext.c` 以"不同时包含两头"的方式规避。
+- **修复**：将 `include/optimize/netleaf_http.h` 的方法枚举更名为 `nlh_http_method_t`
+  （与优化层 `nl_http_*` / `nlh_*` 短名体系一致），`include/netleaf.h` 的
+  `nl_http_method_t` 保持不变。同步更新 `nl_http_request_get_method` /
+  `nlh_req_method` / `nl_http_parse_method` 的返回类型及 `struct nl_http_request::method`
+  字段（`src/http/netleaf_http_internal.h`、`netleaf_http_common.c`、`netleaf_http_shortnames.c`）。
+- **兼容性**：使用 `NL_HTTP_*` 常量的用户代码不受影响；仅在源码中显式写
+  `nl_http_method_t` 指代优化层枚举的用户需改用 `nlh_http_method_t`。修复后两个头
+  可安全同包包含，`netleaf_https_ext.c` 中原"避免重定义"的规避注释同步更正。
 
 #### HTTPS 独立成库 + 三平台公共 HTTP 逻辑去重 + LTO 选项 (v2.4.2 后续)
 

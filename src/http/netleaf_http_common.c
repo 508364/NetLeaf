@@ -99,7 +99,7 @@ long nl_http_find_terminator(const char* buf, size_t total) {
     return -1;
 }
 
-nl_http_method_t nl_http_parse_method(const char* method) {
+nlh_http_method_t nl_http_parse_method(const char* method) {
     if (strcmp(method, "GET") == 0) return NL_HTTP_GET;
     if (strcmp(method, "POST") == 0) return NL_HTTP_POST;
     if (strcmp(method, "PUT") == 0) return NL_HTTP_PUT;
@@ -1417,7 +1417,7 @@ void h3_connection_free(struct nl_http3_connection* conn) {
  * 请求 / 响应 访问器
  * ============================================================ */
 
-nl_http_method_t nl_http_request_get_method(const nl_http_request_t* req) {
+nlh_http_method_t nl_http_request_get_method(const nl_http_request_t* req) {
     if (!req) return NL_HTTP_UNKNOWN;
     return req->method;
 }
