@@ -75,6 +75,7 @@ typedef enum {
     NL_MODULE_VUE = 7,        // Vue.js backend support
     NL_MODULE_MQTT = 8,       // MQTT protocol support
     NL_MODULE_TLS = 9,        // TLS/SSL encryption support
+    NL_MODULE_QUICTLS = 10,   // QUIC-TLS (RFC 9001) packet protection for HTTP/3
     NL_MODULE_CUSTOM = 32,    // Custom/third-party modules
     NL_MODULE_MAX = 64        // Maximum modules (extended for plugins)
 } nl_module_type_t;
@@ -94,7 +95,8 @@ typedef enum {
     NL_CAP_DYNAMIC = 1 << 8,     // Can be dynamically loaded
     NL_CAP_PLUGIN = 1 << 9,      // Is a plugin module
     NL_CAP_EXT_SYSTEM = 1 << 10, // Part of NL Extension System
-    NL_CAP_TLS = 1 << 11         // TLS/SSL support
+    NL_CAP_TLS = 1 << 11,        // TLS/SSL support
+    NL_CAP_QUIC = 1 << 12        // QUIC / HTTP-3 support
 } nl_module_cap_t;
 
 // Module status

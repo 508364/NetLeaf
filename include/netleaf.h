@@ -36,7 +36,12 @@ typedef enum {
 // Protocol types (legacy alias for compatibility)
 typedef nl_proto_t nl_protocol_t;
 
-// HTTP method types
+// HTTP method types（核心 web / router API 专用，如 nl_http_handler_t 的方法入参）。
+//
+// 命名说明（v2.4.2）：优化层 HTTP 客户端/服务端的方法枚举已更名为
+// nlh_http_method_t（见 include/optimize/netleaf_http.h），与本类型区分。
+// 两个头此前各自定义同名 nl_http_method_t，同一编译单元同时包含会报
+// "conflicting types"；更名后不再重定义，可安全同包包含。
 typedef enum {
     NL_METHOD_GET = 0,
     NL_METHOD_POST,
@@ -884,7 +889,8 @@ NL_API void nl_web_add_json(nl_web_server_t* server, const char* path, const cha
 /**
  * @brief Add a data-driven reverse proxy route (http/https/tcp upstream) — **Beta**
  * @note 反向代理引擎目前处于 Beta 阶段，API 与行为可能在后续版本调整。
- *       三平台实现：Linux epoll / macOS kqueue / Windows select/IOCP。
+ *       三平台实现：Linux epoll / macOS kqueue / Windows IOCP（完成端口）。
+ *       Windows 采用 IOCP 内核完成端口，**不受 FD_SETSIZE 限制**。
  * @details New short-interface API; upstream may carry an optional scheme
  *          (e.g. "http://host:8080", "https://api.example.com", "tcp://host:6379").
  *          The matched path is transparently forwarded to the upstream.

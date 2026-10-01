@@ -131,6 +131,14 @@ NL_API NL_HTTP_DEPRECATED int nl_http_client_request(nl_http_client_t* client,
                                    char* out_buf, size_t out_buf_size,
                                    size_t* out_body_len);
 
+// HTTP 方法枚举（优化层 HTTP 客户端/服务端专用，如 nlh_req_method 的返回值）。
+//
+// 命名说明（v2.4.2）：本类型原名 nl_http_method_t，与 include/netleaf.h 中
+// 核心 web/router 的同名类型冲突（两者成员与取值均不同，同一编译单元同时
+// 包含两个头会报 "conflicting types for 'nl_http_method_t'"）。自 v2.4.2 起
+// 更名为 nlh_http_method_t，与优化层 nlh_* 短名体系保持一致，两个头可安全
+// 同包包含。旧名 nl_http_method_t 不再提供，显式书写旧名的代码请改用
+// nlh_http_method_t；使用 NL_HTTP_* 常量的代码不受影响。
 typedef enum {
     NL_HTTP_GET,
     NL_HTTP_POST,
@@ -140,7 +148,7 @@ typedef enum {
     NL_HTTP_OPTIONS,
     NL_HTTP_PATCH,
     NL_HTTP_UNKNOWN
-} nl_http_method_t;
+} nlh_http_method_t;
 
 typedef enum {
     NL_HTTP_VERSION_1_0,
@@ -302,7 +310,7 @@ NL_API NL_HTTP_DEPRECATED int nl_http3_server_start(nl_http3_server_t* server);
 NL_API NL_HTTP_DEPRECATED void nl_http3_server_stop(nl_http3_server_t* server);
 NL_API NL_HTTP_DEPRECATED void nl_http3_server_set_handler(nl_http3_server_t* server, nl_http_handler handler, void* user_data);
 
-NL_API NL_HTTP_DEPRECATED nl_http_method_t nl_http_request_get_method(const nl_http_request_t* req);
+NL_API NL_HTTP_DEPRECATED nlh_http_method_t nl_http_request_get_method(const nl_http_request_t* req);
 NL_API NL_HTTP_DEPRECATED nl_http_version_t nl_http_request_get_version(const nl_http_request_t* req);
 NL_API NL_HTTP_DEPRECATED const char* nl_http_request_get_path(const nl_http_request_t* req);
 NL_API NL_HTTP_DEPRECATED const char* nl_http_request_get_header(const nl_http_request_t* req, const char* name);
@@ -339,7 +347,7 @@ NL_API int nlh_h3_start(nl_http3_server_t* server);
 NL_API void nlh_h3_stop(nl_http3_server_t* server);
 NL_API void nlh_h3_set_handler(nl_http3_server_t* server, nl_http_handler handler, void* user_data);
 
-NL_API nl_http_method_t nlh_req_method(const nl_http_request_t* req);
+NL_API nlh_http_method_t nlh_req_method(const nl_http_request_t* req);
 NL_API nl_http_version_t nlh_req_version(const nl_http_request_t* req);
 NL_API const char* nlh_req_path(const nl_http_request_t* req);
 NL_API const char* nlh_req_header(const nl_http_request_t* req, const char* name);
