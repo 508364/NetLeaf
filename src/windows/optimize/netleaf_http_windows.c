@@ -173,25 +173,47 @@ static DWORD WINAPI http1_client_thread(LPVOID arg) {
     nl_http_server_t* server = args->server;
     free(args);
 
-    char buffer[BUFFER_SIZE];
-    int has_more = 1;
-    size_t total = 0;
-    while (has_more && total < sizeof(buffer) - 1) {
-        int bytes_read = recv(client_fd, buffer + total,
-                              (int)(sizeof(buffer) - 1 - total), 0);
-        if (bytes_read <= 0) break;
-        total += bytes_read;
-        has_more = (nl_http_find_terminator(buffer, total) == -1);
+    /* 读取单个完整 HTTP/1 请求到 buf（容量 cap）。成功返回实际读取字节数，
+     * 连接关闭/出错返回 <=0。配合 nl_http_find_terminator 做增量解析。 */
+    long nl_http_read_request_win(SOCKET fd, char* buf, size_t cap, size_t* total) {
+        *total = 0;
+        while (*total < cap - 1) {
+            int n = recv(fd, buf + *total, (int)(cap - 1 - *total), 0);
+            if (n <= 0) return (long)*total;
+            *total += (size_t)n;
+            buf[*total] = '\0';
+            if (nl_http_find_terminator(buf, *total) != -1) return (long)*total;
+        }
+        return (long)*total;
     }
-    buffer[total] = '\0';
 
-    if (total > 0) {
+    /* 取长补短：旧路径（核心库 nl_handle_client）支持 keep-alive 连接复用，
+     * 新路径原先"读完即 close"。此处改为 Connection 感知：默认 keep-alive，
+     * 请求头显式指定 close 或为 HTTP/1.0 无 keep-alive 时关闭。 */
+    int keep_alive = 1;
+    while (keep_alive) {
+        char buffer[BUFFER_SIZE];
+        size_t total = 0;
+        long got = nl_http_read_request_win(client_fd, buffer, sizeof(buffer), &total);
+        if (got <= 0 || total == 0) break;
+
         nl_http_request_t req;
         nl_http_response_t resp;
         memset(&resp, 0, sizeof(resp));
         resp.status = 200;
+        int parsed = 0;
 
         if (nl_http_parse_request(&req, buffer, total) == 0) {
+            parsed = 1;
+            const char* conn = nl_http_request_get_header(&req, "Connection");
+            if (conn && strcasecmp(conn, "close") == 0) {
+                keep_alive = 0;
+            }
+            if (req.version == NL_HTTP_VERSION_1_0) {
+                const char* ka = nl_http_request_get_header(&req, "Keep-Alive");
+                if (!ka) keep_alive = 0;
+            }
+
             if (server && server->handler) {
                 server->handler(&req, &resp, server->user_data);
             } else {
@@ -201,10 +223,11 @@ static DWORD WINAPI http1_client_thread(LPVOID arg) {
 
         char* response_data = NULL;
         size_t response_len = 0;
+        if (keep_alive && parsed) nl_http_response_set_header(&resp, "Connection", "keep-alive");
         nl_http_generate_response_http1(&resp, &response_data, &response_len);
 
         if (response_data) {
-            send(client_fd, response_data, (int)response_len, 0);
+            if (response_len > 0) send(client_fd, response_data, (int)response_len, 0);
             free(response_data);
         }
 

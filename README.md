@@ -239,6 +239,34 @@ int main(void) {
 > 调用仍可用但产生编译告警。短名随核心库 `netleaf_core` 导出，
 > 实现见 `src/http/netleaf_http_shortnames.c`，头文件 `include/optimize/netleaf_http.h`。
 
+### 反向代理（数据驱动事件引擎，**Beta**）
+
+> ⚠️ **Beta 阶段**：反向代理引擎 API 与行为可能在后续版本调整。
+> 三平台实现：Linux `epoll` / macOS `kqueue` / Windows `IOCP`（`select` 兼容回退）。
+> **混合路由**：同一 server 内 proxy + static + content + redirect + file 可共存。
+
+NetLeaf 的 Web 反向代理采用**数据驱动的异步并行事件引擎**：连接状态编码为
+无状态字节 + 按设备动态定容的 ring buffer，**单线程**通过 `epoll`（Linux）/
+`kqueue`（macOS）/ `select`（Windows）多路复用一次泵多个连接，非阻塞 fd +
+空闲退避，保持极低占用。`upstream` 前缀决定协议：`tcp://` 纯字节透传，
+`http://` / `https://` 重组请求头并透传。`nl_web_start` 检测到 proxy 路由
+时自动拉起单线程引擎（不分配 worker 池）。
+
+```c
+#include "netleaf.h"
+
+int main(void) {
+    nl_web_server_t* server = nl_web_create(8080);
+    nl_web_add_proxy(server, "/api/",  "http://127.0.0.1:9000"); // 透明转发 API
+    nl_web_add_proxy(server, "/cache/", "tcp://127.0.0.1:6379"); // TCP 透传 Redis
+    nl_web_start(server);  // 单线程引擎自动拉起
+    // ...
+    nl_web_stop(server);
+    nl_web_destroy(server);
+    return 0;
+}
+```
+
 ### MQTT 客户端
 
 ```c

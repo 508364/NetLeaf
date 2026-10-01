@@ -19,6 +19,8 @@
 #define BUFFER_SIZE 8192
 #define MAX_CLIENTS 65535
 #define DEFAULT_CONCURRENCY 4
+/* 高压场景：Web 服务（含反向代理）worker 池默认值，受 MAX_CONCURRENCY 约束。 */
+#define WEB_WORKER_DEFAULT 16
 #define MAX_CONCURRENCY 64
 #define MAX_WORKER_QUEUE 1024
 
@@ -381,6 +383,9 @@ static DWORD WINAPI worker_dispatch(LPVOID lpParam) {
                 size_t response_len = 0;
                 server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
 
+                // BUG-002: 契约要求 *response 必须堆分配（malloc/calloc/realloc）。
+                // 服务端在此处 free(response)：若 handler 传字符串字面量/静态数组
+                // 会触发 free(): invalid pointer。无响应时 handler 须置 *response = NULL。
                 if (response && response_len > 0) {
                     size_t total = 0;
                     while (total < response_len) {
@@ -410,14 +415,28 @@ static DWORD WINAPI listener_thread(LPVOID lpParam) {
         if (server->protocol == NL_PROTO_UDP) {
             if (server->udp_handler || server->udp_handler_v2) {
                 char buf[BUFFER_SIZE];
-                int n = recvfrom(server->fd, buf, BUFFER_SIZE, 0, NULL, NULL);
-                if (n > 0) {
+                // BUG-ARCH-003: 非阻塞 UDP socket 可能积压多个 datagram，
+                // 单次 recvfrom 只收一个会导致后续包被静默丢弃。
+                // 循环 recvfrom 直到 WSAEWOULDBLOCK（无更多数据）。
+                for (;;) {
+                    int n = recvfrom(server->fd, buf, BUFFER_SIZE, 0, NULL, NULL);
+                    if (n < 0) {
+                        int err = WSAGetLastError();
+                        if (err == WSAEWOULDBLOCK || err == WSAECONNRESET) break;
+                        if (err == WSAEINTR) continue;
+                        windows_log(NL_LOG_ERROR, "Windows: UDP recvfrom failed: %d", err);
+                        break;
+                    }
+                    if (n == 0) break;
                     if (server->udp_handler_v2) {
                         server->udp_handler_v2(buf, (size_t)n, "0.0.0.0", 0, server->user_data);
                     } else {
                         server->udp_handler(buf, (size_t)n, server->user_data);
                     }
                 }
+                // 轮询节流：避免忙循环；与原版一致（原为 Sleep(10)）。
+                // 若本迭代已收完包（进入本分支说明 udp_handler 非空），
+                // 这里仍保留休眠，保持与原始轮询节拍一致，不影响积压排空语义。
                 Sleep(10);
             }
         } else if (server->pool_used) {
@@ -471,6 +490,7 @@ static DWORD WINAPI listener_thread(LPVOID lpParam) {
                         char* response = NULL;
                         size_t response_len = 0;
                         server->handler(path, method, body, body_size, &response, &response_len, server->user_data);
+                        // BUG-002: *response 必须堆分配；服务端 free(response) 前不做字面量/静态缓冲校验。
                         if (response && response_len > 0) {
                             send(client_fd, response, (int)response_len, 0);
                             free(response);
@@ -1088,15 +1108,16 @@ void nl_config_set(nl_config_t* config, const char* key, const char* value) {
     
     for (int i = 0; i < config->count; i++) {
         if (strcmp(config->data + i * 128, key) == 0) {
-            strncpy(config->data + i * 128 + 64, value, 64);
+            // 用 snprintf 保证 NUL 终止并清空槽位残留（旧 token/密码不会被带出）
+            snprintf(config->data + i * 128 + 64, 64, "%s", value);
             LeaveCriticalSection(&config->mutex);
             return;
         }
     }
     
     if (config->count < 100) {
-        strncpy(config->data + config->count * 128, key, 64);
-        strncpy(config->data + config->count * 128 + 64, value, 64);
+        snprintf(config->data + config->count * 128, 64, "%s", key);
+        snprintf(config->data + config->count * 128 + 64, 64, "%s", value);
         config->count++;
     }
     
@@ -1753,6 +1774,8 @@ static DWORD WINAPI router_server_thread(LPVOID arg) {
             size_t response_size = 0;
             route->handler(path, method, body, body_size, &response, &response_size, route->user_data);
             
+            // BUG-002: *response 必须堆分配（malloc/calloc/realloc）；
+            // 字面量/静态缓冲传到这里 free() 会崩。无响应须置 *response = NULL。
             if (response) {
                 send_http_response(client, "application/json", response, response_size);
                 free(response);
@@ -1907,8 +1930,16 @@ int nl_serve(int port, nl_http_handler_t default_handler, void* user_data) {
 typedef enum {
     NL_ROUTE_TYPE_CONTENT = 0,    // Static content (html/vue/json)
     NL_ROUTE_TYPE_FILE = 1,       // File-based (hot reload)
-    NL_ROUTE_TYPE_REDIRECT = 2    // HTTP 302 redirect
+    NL_ROUTE_TYPE_REDIRECT = 2,   // HTTP 302 redirect
+    NL_ROUTE_TYPE_PROXY = 3       // Reverse proxy (upstream http/https/tcp)
 } nl_route_type_t;
+
+// 上游协议类型（反代使用）
+typedef enum {
+    NL_PROXY_HTTP = 0,           // 明文 HTTP 上游
+    NL_PROXY_HTTPS = 1,          // TLS 上游
+    NL_PROXY_TCP = 2             // 原始 TCP 字节透传
+} nl_proxy_protocol_t;
 
 typedef struct nl_web_route {
     char path[256];
@@ -1918,6 +1949,8 @@ typedef struct nl_web_route {
     nl_route_type_t type;         // Route type
     char file_path[512];          // File path for hot reload
     char redirect_url[512];       // Redirect URL for 302
+    char upstream[512];           // 反代上游地址 host:port（不带 scheme）
+    nl_proxy_protocol_t protocol; // 反代上游协议
     struct nl_web_route* next;
 } nl_web_route_t;
 
@@ -1935,12 +1968,93 @@ struct nl_web_server {
     int error_suggestions_enabled;
     char error_page_templates[8][256];
     nl_redirect_type_t redirect_type;  // Default redirect type (301 or 302)
+    // 工作池：accept 线程 + 动态 worker 线程池（堆分配，容量可运行时调整）
+    HANDLE* workers;          // 动态分配，容量由 worker_capacity 决定
+    int worker_capacity;      // workers 数组当前分配容量
+    int worker_count;         // 实际已启动/在跑的 worker 数
+    int worker_active;
+    // 路由 hash 表（加速 O(n) -> O(1) 查找）
+    nl_web_route_t** route_hash;
+    int route_hash_size;
+    int route_hash_count;
+    // 数据驱动反向代理引擎（select 多路复用 + ring 状态表）
+    SOCKET *pr_fd_client;      // [idx] -> 客户端 SOCKET
+    SOCKET *pr_fd_upstream;    // [idx] -> 上游 SOCKET（0=未连接）
+    int    *pr_route_idx;     // [idx] -> route 在 routes 链表下标
+    uint8_t *pr_state;         // [idx] -> 无状态状态位（bit0 方向 / bit1 EOF / bit7 活跃）
+    char  **pr_hbuf;          // [idx] -> 每连接 8KB 首包缓冲（malloc/free）
+    char  **pr_hbuf_out;      // [idx] -> 每连接 8KB 上游请求构造缓冲
+    int    *pr_hdr_len;       // [idx] -> 已收请求头累计字节数
+    int    *pr_remain;        // [idx] -> 该方向已收待发剩余字节数
+    int  pr_cap;              // ring 容量
+    int  pr_count;           // 活跃连接数
+    int  pr_free_top;        // 回收栈顶（pr_free[0..pr_free_top] 为空闲槽）
+    int  *pr_free;           // 回收栈（存空闲 idx）
+    HANDLE iocp;             // IOCP 完成端口（NULL=select 回退，非 NULL=IOCP 主路径）
+    SOCKET pr_accept_client; // AcceptEx 预创建的备用 client socket
+    void*  pr_iocp_client_ctx;  // [cap] 客户端侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
+    void*  pr_iocp_up_ctx;      // [cap] 上游侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
 };
 static struct nl_web_server* g_web_servers = NULL;
 static CRITICAL_SECTION g_web_servers_mutex;
 static int g_auto_cleanup_enabled = 0;
 
 static int g_mutex_initialized = 0;
+
+// 路由 hash 表辅助函数（FNV-1a + 线性探测，桶存 route* 指针，不修改 route->next）
+static const int NL_ROUTE_HASH_SIZE = 128;
+
+static unsigned nl_route_hash(const char* path) {
+    unsigned h = 2166136261u;
+    for (; *path; path++) {
+        h ^= (unsigned char)*path;
+        h *= 16777619u;
+    }
+    return h % NL_ROUTE_HASH_SIZE;
+}
+
+static void nl_route_hash_init(nl_web_server_t* server) {
+    if (server->route_hash) return;
+    server->route_hash_size = NL_ROUTE_HASH_SIZE;
+    server->route_hash_count = 0;
+    server->route_hash = (nl_web_route_t**)calloc(NL_ROUTE_HASH_SIZE, sizeof(nl_web_route_t*));
+}
+
+static void nl_route_hash_insert_simple(nl_web_server_t* server, nl_web_route_t* route) {
+    if (!server->route_hash) return;
+    int start = (int)nl_route_hash(route->path);
+    for (int i = 0; i < server->route_hash_size; i++) {
+        int idx = (start + i) % server->route_hash_size;
+        if (server->route_hash[idx] == NULL) {
+            server->route_hash[idx] = route;
+            server->route_hash_count++;
+            return;
+        }
+        if (strcmp(server->route_hash[idx]->path, route->path) == 0) {
+            server->route_hash[idx] = route;
+            return;
+        }
+    }
+}
+
+static nl_web_route_t* nl_route_hash_lookup_simple(nl_web_server_t* server, const char* path) {
+    if (!server->route_hash) return NULL;
+    int start = (int)nl_route_hash(path);
+    for (int i = 0; i < server->route_hash_size; i++) {
+        int idx = (start + i) % server->route_hash_size;
+        nl_web_route_t* r = server->route_hash[idx];
+        if (r == NULL) return NULL;
+        if (strcmp(r->path, path) == 0) return r;
+    }
+    return NULL;
+}
+
+static void nl_route_hash_rebuild(nl_web_server_t* server) {
+    if (!server->route_hash) nl_route_hash_init(server);
+    for (int i = 0; i < server->route_hash_size; i++) server->route_hash[i] = NULL;
+    server->route_hash_count = 0;
+    for (nl_web_route_t* r = server->routes; r; r = r->next) nl_route_hash_insert_simple(server, r);
+}
 
 static void init_web_mutex(void) {
     if (!g_mutex_initialized) {
@@ -1973,120 +2087,901 @@ static const char* nl_responsive_css =
 static const char* nl_vue_cdn = 
     "<script src=\"https://unpkg.com/vue@3/dist/vue.global.js\"></script>\n";
 
-static DWORD WINAPI web_server_thread(LPVOID arg) {
-    nl_web_server_t* server = (nl_web_server_t*)arg;
+// 连接上游服务器，成功返回套接字，失败返回 INVALID_SOCKET。
+// 依据 route 中已解析好的 upstream(host:port) 与 protocol 建立 TCP/TLS 连接。
+// select 数据驱动引擎会前置调用，故需前置声明。
+static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route);
+
+// ---------------------------------------------------------------------------
+// 数据驱动反向代理引擎（Windows select 版）
+// ---------------------------------------------------------------------------
+#define PR_ST_DIR_W   0x01   // 方向：等上游可读（写下游）
+#define PR_ST_UP_EOF  0x02   // 上游已 EOF，写尽后关闭
+#define PR_ST_ACTIVE  0x80   // 该槽活跃
+#define PR_PROXY_BUF_SZ 65536
+
+// ---- IOCP 事件类型常量 ----
+#define IOCP_EV_ACCEPT        1  // AcceptEx 完成
+#define IOCP_EV_CLIENT_READ   2  // WSARecv 客户端读完成
+#define IOCP_EV_UPSTREAM_READ 3  // WSARecv 上游读完成
+#define IOCP_LISTEN_KEY 0xFFFFFFFFUL  // listen socket completion key 哨兵
+
+// IOCP OVERLAPPED 上下文（嵌 OVERLAPPED，每次 WSARecv/AcceptEx 唯一实例）
+typedef struct {
+    OVERLAPPED ov;
+    int  idx;        // ring slot 索引
+    int  ev;         // IOCP_EV_* 事件类型
+    SOCKET sock;     // 关联的 socket（AcceptEx 完成时填新 client）
+    char *buf;       // 读写缓冲（非 OWN，指向 pr_hbuf[idx] / 临时缓冲）
+    DWORD buflen;    // 缓冲长度
+} pr_iocp_ctx_t;
+// Windows select 的 FD_SETSIZE 常为 1024，ring 容量必须 ≤ FD_SETSIZE-2
+// （留 listen + 1 给 max_fd+1 语义）。下限 64，上限 FD_SETSIZE-2。
+static int nl_web_proxy_ring_capacity(void) {
+    // IOCP 不受 FD_SETSIZE 限制，与 Linux/macOS 对齐：按逻辑核数 × 64 动态定容
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int cap = (int)si.dwNumberOfProcessors * 64;
+    if (cap < 1) cap = 1;
+    if (cap > 4096) cap = 4096;
+    if (cap < 64)   cap = 64;
+    return cap;
+}
+
+static int pr_alloc_slot(nl_web_server_t* s) {
+    if (s->pr_count >= s->pr_cap || s->pr_free_top < 0) return -1;
+    int idx = s->pr_free[s->pr_free_top--];
+    s->pr_count++;
+    return idx;
+}
+
+static void pr_free_slot(nl_web_server_t* s, int idx) {
+    if (idx < 0 || idx >= s->pr_cap) return;
+    if (s->pr_hbuf[idx])     { free(s->pr_hbuf[idx]);     s->pr_hbuf[idx] = NULL; }
+    if (s->pr_hbuf_out[idx]) { free(s->pr_hbuf_out[idx]); s->pr_hbuf_out[idx] = NULL; }
+    s->pr_state[idx] = 0;
+    s->pr_fd_client[idx]   = INVALID_SOCKET;
+    s->pr_fd_upstream[idx] = 0;
+    s->pr_route_idx[idx]   = -1;
+    if (s->pr_hdr_len) s->pr_hdr_len[idx] = 0;
+    if (s->pr_remain)  s->pr_remain[idx]  = 0;
+    s->pr_free[++(s->pr_free_top)] = idx;
+    if (s->pr_count > 0) s->pr_count--;
+}
+
+static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
+    int idx = 0;
+    EnterCriticalSection(&s->mutex);
+    for (nl_web_route_t* r = s->routes; r; r = r->next, idx++) {
+        if (strcmp(r->path, path) == 0) {
+            LeaveCriticalSection(&s->mutex);
+            return idx;
+        }
+    }
+    LeaveCriticalSection(&s->mutex);
+    return -1;
+}
+
+// 非阻塞泵：先补发上次未发完的余量（pr_remain），再读新数据转发。
+// 返回值：1=还有数据（EAGAIN/读满），0=对端 EOF，-1=错误。
+static int pr_pump_once(nl_web_server_t* s, int idx, SOCKET from, SOCKET to, char* buf, size_t cap) {
+    int* remain = s->pr_remain;
+    while (remain && remain[idx] > 0) {
+        int w = send(to, buf, remain[idx], 0);
+        if (w < 0) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) return 1;
+            return -1;
+        }
+        if (w == 0) return 0; // 对端关闭连接（recv 0）
+        remain[idx] -= w;
+    }
+    int n = recv(from, buf, (int)cap, 0);
+    if (n < 0) {
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) return 1;
+        return -1;
+    }
+    if (n == 0) {
+        if (remain && remain[idx] > 0) return 1;
+        return 0;
+    }
+    remain[idx] = n;
+    while (remain[idx] > 0) {
+        int w = send(to, buf, remain[idx], 0);
+        if (w < 0) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) return 1;
+            return -1;
+        }
+        if (w == 0) break;
+        remain[idx] -= w;
+    }
+    return 1;
+}
+
+// 构造上游请求，输出到 out，返回字节数（-1=失败）
+static int pr_build_upstream_http(nl_web_server_t* s, int idx,
+                                  const char* method, const char* path,
+                                  const char* proto,
+                                  const char* raw_hdrs, size_t raw_hdrs_len,
+                                  char* out, size_t out_cap) {
+    nl_web_route_t* r;
+    EnterCriticalSection(&s->mutex);
+    int rd = s->pr_route_idx[idx];
+    r = NULL;
+    int cur = 0;
+    for (nl_web_route_t* it = s->routes; it; it = it->next, cur++) {
+        if (cur == rd) { r = it; break; }
+    }
+    if (rd < 0 || !r) { LeaveCriticalSection(&s->mutex); return -1; }
+    int total = 0;
+    if (r->protocol == NL_PROXY_TCP) {
+        total = (int)raw_hdrs_len;
+        if (total > 0 && total < (int)out_cap) memcpy(out, raw_hdrs, total);
+        else total = 0;
+    } else {
+        total = snprintf(out, out_cap,
+                         "%s %s %s\r\nHost: %s\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: close\r\n",
+                         method, path, proto, r->upstream);
+        if ((size_t)total >= out_cap) total = (int)out_cap - 1;
+        if (raw_hdrs_len > 0 && (size_t)total + raw_hdrs_len < out_cap) {
+            memcpy(out + total, raw_hdrs, raw_hdrs_len);
+            total += (int)raw_hdrs_len;
+        }
+    }
+    LeaveCriticalSection(&s->mutex);
+    return total;
+}
+
+// select 数据驱动主循环：单线程 select 驱动 N 条 proxy 连接
+// 空闲 200ms 退避（select 超时），非阻塞 socket（WSAEMSGSIZE/EWOULDBLOCK）。
+void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
+    int cap = nl_web_proxy_ring_capacity();
+    s->pr_cap = cap;
+    s->pr_fd_client   = (SOCKET*)calloc((size_t)cap, sizeof(SOCKET));
+    s->pr_fd_upstream = (SOCKET*)calloc((size_t)cap, sizeof(SOCKET));
+    s->pr_route_idx   = (int*)calloc((size_t)cap, sizeof(int));
+    s->pr_state       = (uint8_t*)calloc((size_t)cap, 1);
+    s->pr_hbuf        = (char**)calloc((size_t)cap, sizeof(char*));
+    s->pr_hbuf_out    = (char**)calloc((size_t)cap, sizeof(char*));
+    s->pr_hdr_len     = (int*)calloc((size_t)cap, sizeof(int));
+    s->pr_remain      = (int*)calloc((size_t)cap, sizeof(int));
+    s->pr_free        = (int*)malloc((size_t)cap * sizeof(int));
+    for (int i = 0; i < cap; i++) {
+        s->pr_fd_client[i]   = INVALID_SOCKET;
+        s->pr_fd_upstream[i] = 0;
+        s->pr_route_idx[i]   = -1;
+        s->pr_free[i] = cap - 1 - i;
+    }
+    s->pr_free_top = cap - 1;
+    s->pr_count = 0;
+    if (!s->pr_fd_client || !s->pr_fd_upstream || !s->pr_route_idx ||
+        !s->pr_state || !s->pr_hbuf || !s->pr_hbuf_out ||
+        !s->pr_hdr_len || !s->pr_remain || !s->pr_free) {
+        goto cleanup_fail;
+    }
+
+    // ---- IOCP 完成端口初始化 ----
+    s->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!s->iocp) {
+        windows_log(NL_LOG_ERROR, "IOCP: CreateIoCompletionPort 失败 gle=%lu", GetLastError());
+        goto cleanup_fail;
+    }
+    // listen socket 关联到 IOCP，completion key 用哨兵
+    CreateIoCompletionPort((HANDLE)listen_sock, s->iocp, (ULONG_PTR)IOCP_LISTEN_KEY, 0);
+
+    // 预创建 per-slot OVERLAPPED 上下文数组（客户端侧 + 上游侧各 cap 个）
+    s->pr_iocp_client_ctx = calloc((size_t)cap, sizeof(pr_iocp_ctx_t));
+    s->pr_iocp_up_ctx     = calloc((size_t)cap, sizeof(pr_iocp_ctx_t));
+    if (!s->pr_iocp_client_ctx || !s->pr_iocp_up_ctx) {
+        windows_log(NL_LOG_ERROR, "IOCP: OVERLAPPED ctx calloc 失败");
+        goto cleanup_fail;
+    }
+
+    // 上游中转缓冲（每线程栈上一份，所有上游 WSARecv 复用）
+    char pump_buf[PR_PROXY_BUF_SZ];
+
+    // 模块级静态 AcceptEx 上下文（AcceptEx 的 OVERLAPPED 必须持续到完成）
+    static pr_iocp_ctx_t accept_ctx;
+    memset(&accept_ctx, 0, sizeof(accept_ctx));
+    accept_ctx.ev = IOCP_EV_ACCEPT;
+
+    // AcceptEx 预 post：先 WSASocket 一个 OVERLAPPED client 备用 socket
+    s->pr_accept_client = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (s->pr_accept_client == INVALID_SOCKET) {
+        windows_log(NL_LOG_ERROR, "IOCP: WSASocket (accept) 失败");
+        goto cleanup_fail;
+    }
+    // post 第一个 AcceptEx（addr 缓冲简化为 NULL + 0，让 kernel 处理）
+    DWORD bytes_recv_init = 0;
+    AcceptEx(listen_sock, s->pr_accept_client, NULL, 0, 0, 0, &bytes_recv_init, (LPOVERLAPPED)&accept_ctx);
+
+    // ---- IOCP 主循环 ----
+    while (s->running) {
+        DWORD bytes_trans;
+        ULONG_PTR compkey;
+        LPOVERLAPPED p_ov = NULL;
+        BOOL ok = GetQueuedCompletionStatus(s->iocp, &bytes_trans, &compkey, &p_ov, 200);
+        DWORD gle = GetLastError();
+        if (!ok && gle == WAIT_TIMEOUT) continue;   // 空闲退避
+        if (!ok || !p_ov) continue;                  // 错误 / 空 OVERLAPPED：跳过
+        pr_iocp_ctx_t* ctx = (pr_iocp_ctx_t*)p_ov;
+
+        // ---- AcceptEx 完成 ----
+        if (compkey == (ULONG_PTR)IOCP_LISTEN_KEY) {
+            // accept_ctx 是静态 OVERLAPPED，AcceptEx 刚把新 client 填入 s->pr_accept_client
+            SOCKET new_client = s->pr_accept_client;
+            if (new_client != INVALID_SOCKET) {
+                int idx = pr_alloc_slot(s);
+                if (idx < 0) {
+                    closesocket(new_client);
+                } else {
+                    // 新 client 关联到 IOCP（completion key = idx）
+                    CreateIoCompletionPort((HANDLE)new_client, s->iocp, (ULONG_PTR)idx, 0);
+                    s->pr_fd_client[idx] = new_client;
+                    s->pr_state[idx] = PR_ST_ACTIVE;
+                    s->pr_hbuf[idx]     = (char*)malloc(8192);
+                    s->pr_hbuf_out[idx] = (char*)malloc(8192);
+                    s->pr_hdr_len[idx]  = 0;
+                    s->pr_remain[idx]   = 0;
+                    if (!s->pr_hbuf[idx] || !s->pr_hbuf_out[idx]) {
+                        closesocket(new_client);
+                        pr_free_slot(s, idx);
+                    } else {
+                        // post 客户端 WSARecv（读首包）
+                        pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+                        memset(cctx, 0, sizeof(*cctx));
+                        cctx->idx = idx;
+                        cctx->ev  = IOCP_EV_CLIENT_READ;
+                        cctx->sock = new_client;
+                        cctx->buf = s->pr_hbuf[idx];
+                        cctx->buflen = 8192;
+                        WSABUF wsabuf = {8192, cctx->buf};
+                        DWORD flags = 0;
+                        DWORD dummy = 0;
+                        WSARecv(new_client, &wsabuf, 1, &dummy, &flags, (LPOVERLAPPED)cctx, NULL);
+                    }
+                }
+            }
+            // 预先创建下一个备用 socket，post 下一次 AcceptEx
+            s->pr_accept_client = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+            if (s->pr_accept_client != INVALID_SOCKET) {
+                DWORD bytes_recv_next = 0;
+                AcceptEx(listen_sock, s->pr_accept_client, NULL, 0, 0, 0,
+                         &bytes_recv_next, (LPOVERLAPPED)&accept_ctx);
+            }
+            continue;
+        }
+
+        // ---- client / upstream socket 完成（compkey == idx）----
+        int idx = (int)compkey;
+        if (idx < 0 || idx >= cap) continue;
+        if (!(s->pr_state[idx] & PR_ST_ACTIVE)) continue;
+
+        SOCKET cfd = s->pr_fd_client[idx];
+        if (cfd == INVALID_SOCKET) continue;
+
+        if (ctx->ev == IOCP_EV_CLIENT_READ) {
+            // ---- WSARecv 客户端读完成 ----
+            int nread = (int)bytes_trans;
+            if (nread <= 0) {
+                // 客户端 EOF / 错误
+                if (s->pr_fd_upstream[idx] > 0) { closesocket(s->pr_fd_upstream[idx]); s->pr_fd_upstream[idx] = 0; }
+                closesocket(cfd); s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                continue;
+            }
+
+            char* hbuf = s->pr_hbuf[idx];
+            int* hlen = &s->pr_hdr_len[idx];
+            *hlen += nread;
+            hbuf[*hlen] = '\0';
+
+            if (s->pr_fd_upstream[idx] == 0) {
+                // 首次收到首行：解析 method/path/proto，路由，连上游
+                char* line_end = memchr(hbuf, '\n', (size_t)*hlen);
+                if (!line_end) {
+                    // 等更多数据：再 post 一次 WSARecv
+                    pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+                    WSABUF wsabuf = {8192 - (ULONG)*hlen, hbuf + *hlen};
+                    DWORD flags = 0, dummy = 0;
+                    WSARecv(cfd, &wsabuf, 1, &dummy, &flags, (LPOVERLAPPED)cctx, NULL);
+                    continue;
+                }
+                *line_end = '\0';
+                char method[16] = {0}, path[4096] = {0}, proto[32] = {0};
+                char* sp1 = strchr(hbuf, ' ');
+                if (!sp1) { send_http_error(cfd, 400, "Bad Request"); closesocket(cfd); pr_free_slot(s, idx); continue; }
+                char* sp2 = strchr(sp1 + 1, ' ');
+                if (!sp2) { send_http_error(cfd, 400, "Bad Request"); closesocket(cfd); pr_free_slot(s, idx); continue; }
+                size_t mlen = (size_t)(sp1 - hbuf);
+                size_t plen = (size_t)(sp2 - (sp1 + 1));
+                size_t vlen = (size_t)(line_end - (sp2 + 1));
+                if (mlen == 0 || mlen >= sizeof(method) ||
+                    plen == 0 || plen >= sizeof(path) ||
+                    vlen == 0 || vlen >= sizeof(proto)) {
+                    send_http_error(cfd, 400, "Bad Request");
+                    closesocket(cfd);
+                    pr_free_slot(s, idx);
+                    continue;
+                }
+                memcpy(method, hbuf, mlen);
+                memcpy(path, sp1 + 1, plen);
+                memcpy(proto, sp2 + 1, vlen);
+                *hlen = 0;
+
+                int ridx = pr_lookup_route_idx(s, path);
+                nl_web_route_t* r = NULL;
+                EnterCriticalSection(&s->mutex);
+                int cur = 0;
+                for (nl_web_route_t* it = s->routes; it; it = it->next, cur++)
+                    if (cur == ridx) { r = it; break; }
+                LeaveCriticalSection(&s->mutex);
+                if (!r) {
+                    send_http_error(cfd, 404, "Not Found");
+                    closesocket(cfd);
+                    pr_free_slot(s, idx);
+                    continue;
+                }
+
+                // ---------- 完整混合路由分发 ----------
+                if (r->type != NL_ROUTE_TYPE_PROXY) {
+                    // 非 proxy：临时切阻塞发响应，处理完立即 close
+                    u_long nb_off = 0;
+                    ioctlsocket(cfd, FIONBIO, &nb_off);
+
+                    if (r->type == NL_ROUTE_TYPE_REDIRECT) {
+                        char resp[1024];
+                        snprintf(resp, sizeof(resp),
+                            "HTTP/1.1 302 Found\r\n"
+                            "Location: %s\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n\r\n",
+                            r->redirect_url);
+                        send(cfd, resp, (int)strlen(resp), 0);
+                    }
+                    else if (r->type == NL_ROUTE_TYPE_FILE) {
+                        FILE* fp = fopen(r->file_path, "rb");
+                        if (!fp) {
+                            send_http_error(cfd, 404, "File Not Found");
+                        } else {
+                            fseek(fp, 0, SEEK_END);
+                            long fsz = ftell(fp);
+                            fseek(fp, 0, SEEK_SET);
+                            if (fsz > 0 && fsz <= 10*1024*1024) {
+                                char* fc = (char*)malloc(fsz + 1);
+                                if (fc) {
+                                    size_t rs = fread(fc, 1, fsz, fp);
+                                    fc[rs] = '\0';
+                                    send_http_response(cfd, r->content_type, fc, rs);
+                                    free(fc);
+                                } else {
+                                    send_http_error(cfd, 500, "Memory Error");
+                                }
+                            } else {
+                                send_http_error(cfd, 500, "File Too Large");
+                            }
+                            fclose(fp);
+                        }
+                    }
+                    else { // NL_ROUTE_TYPE_CONTENT
+                        send_http_response(cfd, r->content_type,
+                                          r->content, strlen(r->content));
+                    }
+                    closesocket(cfd);   // 取消所有 pending I/O
+                    pr_free_slot(s, idx);
+                    continue;
+                }
+
+                // ---------- proxy 路由：连上游 ----------
+                SOCKET ufd_new = nl_proxy_connect_upstream(r);
+                if (ufd_new == INVALID_SOCKET) {
+                    send_http_error(cfd, 502, "Bad Gateway");
+                    closesocket(cfd);
+                    pr_free_slot(s, idx);
+                    continue;
+                }
+                // 上游 socket 切非阻塞 + 关联 IOCP
+                u_long nb3 = 1;
+                ioctlsocket(ufd_new, FIONBIO, &nb3);
+                CreateIoCompletionPort((HANDLE)ufd_new, s->iocp, (ULONG_PTR)idx, 0);
+                s->pr_fd_upstream[idx] = ufd_new;
+                s->pr_route_idx[idx]   = ridx;
+
+                // 构造上游请求并**同步阻塞发出去**（刚建连，还没 post OVERLAPPED，send 即可）
+                char* ubuf = s->pr_hbuf_out[idx];
+                int build_n = pr_build_upstream_http(s, idx, method, path, proto, NULL, 0, ubuf, 8192);
+                if (build_n > 0) {
+                    // 临时切阻塞，保证初始请求完整发出去
+                    u_long nb_off2 = 0;
+                    ioctlsocket(ufd_new, FIONBIO, &nb_off2);
+                    int off = 0;
+                    while (off < build_n) {
+                        int w = send(ufd_new, ubuf + off, build_n - off, 0);
+                        if (w <= 0) break;
+                        off += w;
+                    }
+                    u_long nb_on = 1;
+                    ioctlsocket(ufd_new, FIONBIO, &nb_on);
+                }
+
+                // post 上游 WSARecv（响应回来 → pump 回客户端）
+                pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
+                memset(uctx, 0, sizeof(*uctx));
+                uctx->idx = idx;
+                uctx->ev  = IOCP_EV_UPSTREAM_READ;
+                uctx->sock = ufd_new;
+                uctx->buf  = pump_buf;
+                uctx->buflen = PR_PROXY_BUF_SZ;
+                WSABUF wsb_up = {PR_PROXY_BUF_SZ, pump_buf};
+                DWORD flg_up = 0, dummy_up = 0;
+                WSARecv(ufd_new, &wsb_up, 1, &dummy_up, &flg_up, (LPOVERLAPPED)uctx, NULL);
+
+                // 再 post 一次客户端 WSARecv（可能还有 body 未读）
+                pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+                memset(cctx, 0, sizeof(*cctx));
+                cctx->idx = idx;
+                cctx->ev  = IOCP_EV_CLIENT_READ;
+                cctx->sock = cfd;
+                cctx->buf  = hbuf;
+                cctx->buflen = 8192;
+                WSABUF wsabuf2 = {8192, hbuf};
+                DWORD flags2 = 0, dummy2 = 0;
+                WSARecv(cfd, &wsabuf2, 1, &dummy2, &flags2, (LPOVERLAPPED)cctx, NULL);
+
+                s->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
+                continue;
+            }
+
+            // ---- 后续客户端数据（body 等）→ 阻塞转发上游 ----
+            if (s->pr_fd_upstream[idx] > 0) {
+                int w = (int)bytes_trans;
+                u_long nb_off3 = 0;
+                ioctlsocket(s->pr_fd_upstream[idx], FIONBIO, &nb_off3);
+                int off2 = 0;
+                while (off2 < w) {
+                    int wc = send(s->pr_fd_upstream[idx], hbuf + off2, w - off2, 0);
+                    if (wc <= 0) break;
+                    off2 += wc;
+                }
+                u_long nb_on2 = 1;
+                ioctlsocket(s->pr_fd_upstream[idx], FIONBIO, &nb_on2);
+                // 继续 post 客户端 WSARecv
+                pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+                memset(cctx, 0, sizeof(*cctx));
+                cctx->idx = idx;
+                cctx->ev  = IOCP_EV_CLIENT_READ;
+                cctx->sock = cfd;
+                cctx->buf  = hbuf;
+                cctx->buflen = 8192;
+                WSABUF wsabuf3 = {8192, hbuf};
+                DWORD flags3 = 0, dummy3 = 0;
+                WSARecv(cfd, &wsabuf3, 1, &dummy3, &flags3, (LPOVERLAPPED)cctx, NULL);
+            }
+            continue;
+        }
+
+        else if (ctx->ev == IOCP_EV_UPSTREAM_READ) {
+            // ---- 上游 WSARecv 完成 → pump 回客户端 ----
+            int nread_up = (int)bytes_trans;
+            SOCKET ufd = s->pr_fd_upstream[idx];
+
+            if (nread_up <= 0) {
+                // 上游 EOF
+                s->pr_state[idx] |= PR_ST_UP_EOF;
+                if (ufd > 0) { closesocket(ufd); s->pr_fd_upstream[idx] = 0; }
+                closesocket(cfd); s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                continue;
+            }
+
+            // 阻塞 send 回客户端（临时切阻塞）
+            u_long nb_off4 = 0;
+            ioctlsocket(cfd, FIONBIO, &nb_off4);
+            int off3 = 0;
+            while (off3 < nread_up) {
+                int wc2 = send(cfd, pump_buf + off3, nread_up - off3, 0);
+                if (wc2 <= 0) break;
+                off3 += wc2;
+            }
+            u_long nb_on3 = 1;
+            ioctlsocket(cfd, FIONBIO, &nb_on3);
+
+            // 继续 post 上游 WSARecv
+            if (ufd > 0 && (s->pr_state[idx] & PR_ST_ACTIVE)) {
+                pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
+                memset(uctx, 0, sizeof(*uctx));
+                uctx->idx = idx;
+                uctx->ev  = IOCP_EV_UPSTREAM_READ;
+                uctx->sock = ufd;
+                uctx->buf  = pump_buf;
+                uctx->buflen = PR_PROXY_BUF_SZ;
+                WSABUF wsb_up2 = {PR_PROXY_BUF_SZ, pump_buf};
+                DWORD flg_up2 = 0, dummy_up2 = 0;
+                WSARecv(ufd, &wsb_up2, 1, &dummy_up2, &flg_up2, (LPOVERLAPPED)uctx, NULL);
+            }
+            continue;
+        }
+        // 其他 ev 类型：忽略
+    }
+
+    // 清理所有活动连接
+    for (int i = 0; i < cap; i++) {
+        if (s->pr_state[i] & PR_ST_ACTIVE) {
+            if (s->pr_fd_client[i] != INVALID_SOCKET) closesocket(s->pr_fd_client[i]);
+            if (s->pr_fd_upstream[i] > 0) closesocket(s->pr_fd_upstream[i]);
+            s->pr_state[i] = 0;
+        }
+        if (s->pr_hbuf[i])     free(s->pr_hbuf[i]);
+        if (s->pr_hbuf_out[i]) free(s->pr_hbuf_out[i]);
+    }
+
+cleanup_fail:
+    // IOCP 清理：CloseHandle 会自动取消所有 pending I/O
+    if (s->iocp) { CloseHandle(s->iocp); s->iocp = NULL; }
+    if (s->pr_accept_client != INVALID_SOCKET) {
+        closesocket(s->pr_accept_client);
+        s->pr_accept_client = INVALID_SOCKET;
+    }
+    free(s->pr_iocp_client_ctx); s->pr_iocp_client_ctx = NULL;
+    free(s->pr_iocp_up_ctx);     s->pr_iocp_up_ctx     = NULL;
+    free(s->pr_fd_client);   s->pr_fd_client   = NULL;
+    free(s->pr_fd_upstream); s->pr_fd_upstream = NULL;
+    free(s->pr_route_idx);   s->pr_route_idx   = NULL;
+    free(s->pr_state);       s->pr_state       = NULL;
+    free(s->pr_hbuf);        s->pr_hbuf        = NULL;
+    free(s->pr_hbuf_out);    s->pr_hbuf_out    = NULL;
+    free(s->pr_hdr_len);     s->pr_hdr_len     = NULL;
+    free(s->pr_remain);      s->pr_remain      = NULL;
+    free(s->pr_free);        s->pr_free        = NULL;
+    s->pr_cap = s->pr_count = 0;
+}
+
+// 引擎线程入口
+static DWORD WINAPI nl_web_proxy_engine_thread(LPVOID arg) {
+    nl_web_server_t* s = (nl_web_server_t*)arg;
+    nl_web_proxy_engine(s, s->sock);
+    return 0;
+}
+
+// 连接上游服务器（原实现），成功返回套接字，失败返回 INVALID_SOCKET。
+static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route) {
+    char host[512];
+    int port = 0;
+    nl_proxy_protocol_t proto = route->protocol;
+
+    char upstream_copy[512];
+    snprintf(upstream_copy, sizeof(upstream_copy), "%s", route->upstream);
+    char* colon = strrchr(upstream_copy, ':');
+    if (colon) {
+        *colon = '\0';
+        port = atoi(colon + 1);
+        snprintf(host, sizeof(host), "%s", upstream_copy);
+    } else {
+        port = (proto == NL_PROXY_HTTPS) ? 443 : 80;
+        snprintf(host, sizeof(host), "%s", upstream_copy);
+    }
+    if (port <= 0) port = (proto == NL_PROXY_HTTPS) ? 443 : 80;
+
+    struct sockaddr_in up_addr;
+    memset(&up_addr, 0, sizeof(up_addr));
+    up_addr.sin_family = AF_INET;
+    up_addr.sin_port = htons((u_short)port);
+
+    struct hostent* he = gethostbyname(host);
+    if (he && he->h_addr_list[0]) {
+        memcpy(&up_addr.sin_addr, he->h_addr_list[0], sizeof(struct in_addr));
+    } else {
+        // 回退：inet_pton 解析 IP 字面量；再失败则设为 127.0.0.1（本地回环场景）
+        if (inet_pton(AF_INET, host, &up_addr.sin_addr) != 1) {
+            up_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        }
+    }
+
+    SOCKET up_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (up_sock == INVALID_SOCKET) return INVALID_SOCKET;
+
+    DWORD tv_ms = 5000;
+    setsockopt(up_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_ms, sizeof(tv_ms));
+    setsockopt(up_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv_ms, sizeof(tv_ms));
+
+    if (connect(up_sock, (struct sockaddr*)&up_addr, sizeof(up_addr)) == SOCKET_ERROR) {
+        closesocket(up_sock);
+        return INVALID_SOCKET;
+    }
+
+    // 完成反代：HTTPS 上游需要 TLS 握手。优先通过扩展系统动态发现 TLS 握手钩子，
+    // 取代原先依赖 #ifdef NL_HTTPS_ENABLE 的编译期死代码（核心库默认不定义该宏）。
+    if (proto == NL_PROXY_HTTPS) {
+        int tls_ok = 0;
+#ifdef NL_HTTPS_ENABLE
+        extern int nl_tls_handshake(int sock, const char* host);
+        tls_ok = nl_tls_handshake((int)up_sock, host);
+#else
+        extern void* nl_extension_get_func_by_id(const char* ext_id, const char* func_name);
+        /* 尝试取 HTTPS 扩展的 TLS 握手钩子（如扩展导出 nl_tls_handshake） */
+        void* handshake_fn = nl_extension_get_func_by_id("https", "nl_tls_handshake");
+        if (handshake_fn) {
+            typedef int (*nl_tls_handshake_fn)(int, const char*);
+            tls_ok = ((nl_tls_handshake_fn)handshake_fn)((int)up_sock, host);
+        }
+#endif
+        if (!tls_ok) {
+            windows_log(NL_LOG_WARN, "proxy: TLS not available for upstream %s, falling back to plaintext", host);
+        }
+    }
+
+    return up_sock;
+}
+
+static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
+    char buffer[8192];
+    int received = recv(client, buffer, sizeof(buffer) - 1, 0);
     
+    if (received <= 0) {
+        closesocket(client);
+        return;
+    }
+    
+    buffer[received] = '\0';
+
+    /* 取长补短：核心库旧路径原先用 sscanf 粗糙解析（无法提取请求头），
+     * 此处改用与优化层一致的"首行三段 + 请求头"结构化解析，得到
+     * method/path/version 及完整请求头，同时保留核心库特有的
+     * 路由表/反代/静态文件优势。解析失败则返回 400。 */
+    char method[16], path[4096], protocol[32];
+    method[0] = path[0] = protocol[0] = '\0';
+    {
+        char* line_end = memchr(buffer, '\n', (size_t)received);
+        if (!line_end || line_end == buffer) {
+            send_http_error(client, 400, "Bad Request");
+            closesocket(client);
+            return;
+        }
+        *line_end = '\0';
+        char* sp1 = strchr(buffer, ' ');
+        if (!sp1 || sp1 == buffer) {
+            send_http_error(client, 400, "Bad Request");
+            closesocket(client);
+            return;
+        }
+        *sp1 = '\0';
+        char* sp2 = strchr(sp1 + 1, ' ');
+        if (!sp2) {
+            send_http_error(client, 400, "Bad Request");
+            closesocket(client);
+            return;
+        }
+        size_t mlen = sp1 - buffer;
+        size_t plen = sp2 - (sp1 + 1);
+        size_t vlen = (size_t)(line_end - (sp2 + 1));
+        if (mlen == 0 || mlen >= sizeof(method) || plen == 0 || plen >= sizeof(path) ||
+            vlen == 0 || vlen >= sizeof(protocol)) {
+            send_http_error(client, 400, "Bad Request");
+            closesocket(client);
+            return;
+        }
+        memcpy(method, buffer, mlen);
+        method[mlen] = '\0';
+        memcpy(path, sp1 + 1, plen);
+        path[plen] = '\0';
+        memcpy(protocol, sp2 + 1, vlen);
+        protocol[vlen] = '\0';
+    }
+
+    EnterCriticalSection(&server->mutex);
+    // 使用 hash 表 O(1) 查找路由；若 hash 未初始化则回退到线性链表
+    nl_web_route_t* route = nl_route_hash_lookup_simple(server, path);
+    if (!route) {
+        for (nl_web_route_t* r = server->routes; r; r = r->next) {
+            if (strcmp(r->path, path) == 0) { route = r; break; }
+        }
+    }
+    if (route) {
+        if (route->type == NL_ROUTE_TYPE_REDIRECT) {
+                // Send redirect (301 or 302 based on server setting)
+                int redirect_code = server->redirect_type;
+                const char* redirect_text = (redirect_code == 301) ? "Moved Permanently" : "Found";
+                LeaveCriticalSection(&server->mutex);
+                char redirect_response[1024];
+                snprintf(redirect_response, sizeof(redirect_response),
+                    "HTTP/1.1 %d %s\r\n"
+                    "Location: %s\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n"
+                    "\r\n",
+                    redirect_code, redirect_text, route->redirect_url);
+                (void)send(client, redirect_response, (int)strlen(redirect_response), 0);
+                closesocket(client);
+                return;
+            }
+            else if (route->type == NL_ROUTE_TYPE_FILE) {
+                // Hot reload: read file content on each request
+                LeaveCriticalSection(&server->mutex);
+                
+                FILE* fp = fopen(route->file_path, "rb");
+                if (!fp) {
+                    send_http_error(client, 404, "File Not Found");
+                    closesocket(client);
+                    return;
+                }
+                
+                fseek(fp, 0, SEEK_END);
+                long file_size = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                
+                if (file_size <= 0 || file_size > 10 * 1024 * 1024) {
+                    fclose(fp);
+                    send_http_error(client, 500, "File Too Large");
+                    closesocket(client);
+                    return;
+                }
+                
+                char* file_content = (char*)malloc(file_size + 1);
+                if (!file_content) {
+                    fclose(fp);
+                    send_http_error(client, 500, "Memory Error");
+                    closesocket(client);
+                    return;
+                }
+                
+                size_t read_size = fread(file_content, 1, file_size, fp);
+                fclose(fp);
+                file_content[read_size] = '\0';
+                
+                send_http_response(client, route->content_type, file_content, read_size);
+                free(file_content);
+                closesocket(client);
+                return;
+            }
+            else if (route->type == NL_ROUTE_TYPE_PROXY) {
+                // 反向代理：连接上游并双向透传
+                LeaveCriticalSection(&server->mutex);
+
+                SOCKET up_sock = nl_proxy_connect_upstream(route);
+                if (up_sock == INVALID_SOCKET) {
+                    send_http_error(client, 502, "Bad Gateway");
+                    closesocket(client);
+                    return;
+                }
+
+                // 高压优化：代理双向透传缓冲堆分配一次复用，避免 16KB 栈占用。
+                char* proxy_buf = (char*)malloc(65536);
+                if (!proxy_buf) {
+                    closesocket(up_sock);
+                    send_http_error(client, 500, "Memory Error");
+                    closesocket(client);
+                    return;
+                }
+
+                // 高压优化：TCP 上游加 5s 超时，避免上游无响应时 worker 线程被无限占用。
+                DWORD up_tv_ms = 5000;
+                setsockopt(up_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&up_tv_ms, sizeof(up_tv_ms));
+                setsockopt(up_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&up_tv_ms, sizeof(up_tv_ms));
+
+                if (route->protocol == NL_PROXY_TCP) {
+                    /* 完成反代：纯字节透传（TCP 语义），不构造 HTTP 请求行。 */
+                    int sent = send(up_sock, buffer, (int)received, 0);
+                    if (sent <= 0) {
+                        free(proxy_buf);
+                        closesocket(up_sock);
+                        send_http_error(client, 502, "Bad Gateway");
+                        closesocket(client);
+                        return;
+                    }
+                    int n;
+                    while ((n = recv(up_sock, proxy_buf, sizeof(proxy_buf), 0)) > 0) {
+                        if (send(client, proxy_buf, n, 0) <= 0) break;
+                    }
+                    free(proxy_buf);
+                    closesocket(up_sock);
+                    closesocket(client);
+                    return;
+                }
+
+                // HTTP/HTTPS：重组 request line + 重写 Host/Connection + 透传
+                // X-Forwarded-For，并原样保留客户端原始请求头与请求体。
+                char upstream_req_full[12288];
+                int total = snprintf(upstream_req_full, sizeof(upstream_req_full),
+                    "%s %s %s\r\nHost: %s\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: close\r\n",
+                    method, path, protocol, route->upstream);
+                /* buffer 已被 memchr/strchr 改写（首行以 \0 收尾），
+                 * 必须用 memchr 重新定位首行换行符，取剩余部分即原始
+                 * 请求头与 body，避免 strstr 命中被破坏的 \r\n。 */
+                const char* line_term = memchr(buffer, '\n', (size_t)received);
+                if (line_term) {
+                    const char* rest = line_term + 1;
+                    size_t rest_len = 0;
+                    while (rest[rest_len] &&
+                           rest_len + total < (size_t)sizeof(upstream_req_full))
+                        rest_len++;
+                    if (rest_len > 0) {
+                        memcpy(upstream_req_full + total, rest, rest_len);
+                        total += (int)rest_len;
+                    }
+                }
+                int sent2 = send(up_sock, upstream_req_full, total, 0);
+                if (sent2 <= 0) {
+                    free(proxy_buf);
+                    closesocket(up_sock);
+                    send_http_error(client, 502, "Bad Gateway");
+                    closesocket(client);
+                    return;
+                }
+
+                int n;
+                while ((n = recv(up_sock, proxy_buf, sizeof(proxy_buf), 0)) > 0) {
+                    if (send(client, proxy_buf, n, 0) <= 0) break;
+                }
+                free(proxy_buf);
+                closesocket(up_sock);
+                closesocket(client);
+                return;
+            }
+            else {
+                // Static content
+                LeaveCriticalSection(&server->mutex);
+                send_http_response(client, route->content_type, route->content, route->content_size);
+                closesocket(client);
+                return;
+            }
+    }
+    LeaveCriticalSection(&server->mutex);
+    
+    send_http_error(client, 404, "Not Found");
+    closesocket(client);
+}
+
+static DWORD WINAPI nl_worker_thread(LPVOID arg) {
+    nl_web_server_t* server = (nl_web_server_t*)arg;
     while (server->running) {
-        struct sockaddr_in client_addr;
-        int client_len = sizeof(client_addr);
-        
-        SOCKET client = accept(server->sock, (struct sockaddr*)&client_addr, &client_len);
-        
+        SOCKET client = accept(server->sock, NULL, NULL);
         if (client == INVALID_SOCKET) {
             Sleep(10);
             continue;
         }
-        
-        char buffer[8192];
-        int received = recv(client, buffer, sizeof(buffer) - 1, 0);
-        
-        if (received <= 0) {
-            closesocket(client);
-            continue;
-        }
-        
-        buffer[received] = '\0';
-        
-        char method[16], path[4096], protocol[32];
-        if (sscanf(buffer, "%15s %4095s %31s", method, path, protocol) != 3) {
-            send_http_error(client, 400, "Bad Request");
-            closesocket(client);
-            continue;
-        }
-        
-        EnterCriticalSection(&server->mutex);
-        nl_web_route_t* route = server->routes;
-        while (route) {
-            if (strcmp(route->path, path) == 0) {
-                // Handle different route types
-                if (route->type == NL_ROUTE_TYPE_REDIRECT) {
-                    // Send redirect (301 or 302 based on server setting)
-                    int redirect_code = server->redirect_type;
-                    const char* redirect_text = (redirect_code == 301) ? "Moved Permanently" : "Found";
-                    LeaveCriticalSection(&server->mutex);
-                    char redirect_response[1024];
-                    snprintf(redirect_response, sizeof(redirect_response),
-                        "HTTP/1.1 %d %s\r\n"
-                        "Location: %s\r\n"
-                        "Content-Length: 0\r\n"
-                        "Connection: close\r\n"
-                        "\r\n",
-                        redirect_code, redirect_text, route->redirect_url);
-                    (void)send(client, redirect_response, (int)strlen(redirect_response), 0);
-                    closesocket(client);
-                    goto next_conn;
-                }
-                else if (route->type == NL_ROUTE_TYPE_FILE) {
-                    // Hot reload: read file content on each request
-                    LeaveCriticalSection(&server->mutex);
-                    
-                    // Read file content
-                    FILE* fp = fopen(route->file_path, "rb");
-                    if (!fp) {
-                        send_http_error(client, 404, "File Not Found");
-                        closesocket(client);
-                        goto next_conn;
-                    }
-                    
-                    // Get file size
-                    fseek(fp, 0, SEEK_END);
-                    long file_size = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
-                    
-                    if (file_size <= 0 || file_size > 10 * 1024 * 1024) {  // Max 10MB
-                        fclose(fp);
-                        send_http_error(client, 500, "File Too Large");
-                        closesocket(client);
-                        goto next_conn;
-                    }
-                    
-                    // Allocate and read
-                    char* file_content = (char*)malloc(file_size + 1);
-                    if (!file_content) {
-                        fclose(fp);
-                        send_http_error(client, 500, "Memory Error");
-                        closesocket(client);
-                        goto next_conn;
-                    }
-                    
-                    size_t read_size = fread(file_content, 1, file_size, fp);
-                    fclose(fp);
-                    file_content[read_size] = '\0';
-                    
-                    // Send response
-                    send_http_response(client, route->content_type, file_content, read_size);
-                    free(file_content);
-                    closesocket(client);
-                    goto next_conn;
-                }
-                else {
-                    // Static content
-                    LeaveCriticalSection(&server->mutex);
-                    send_http_response(client, route->content_type, route->content, route->content_size);
-                    closesocket(client);
-                    goto next_conn;
-                }
-            }
-            route = route->next;
-        }
-        LeaveCriticalSection(&server->mutex);
-        
-        send_http_error(client, 404, "Not Found");
-        closesocket(client);
-        
-    next_conn:;
+        nl_handle_client(server, client);
     }
-    
+    return 0;
+}
+
+static DWORD WINAPI web_server_thread(LPVOID arg) {
+    nl_web_server_t* server = (nl_web_server_t*)arg;
+
+    // 启动 worker 线程池
+    for (int i = 0; i < server->worker_count; i++) {
+        server->workers[i] = CreateThread(NULL, 0, nl_worker_thread, server, 0, NULL);
+        if (!server->workers[i]) {
+            server->worker_count = i;
+            break;
+        }
+    }
+    server->worker_active = 1;
+
+    // 若 worker 全部启动成功，则 accept 线程退出，让 worker 承担所有连接
+    if (server->worker_count > 0) {
+        for (int i = 0; i < server->worker_count; i++) {
+            if (server->workers && server->workers[i]) {
+                WaitForSingleObject(server->workers[i], INFINITE);
+                CloseHandle(server->workers[i]);
+                server->workers[i] = NULL;
+            }
+        }
+        server->worker_active = 0;
+        return 0;
+    }
+
+    // 回退：worker 未启动（启动失败或 worker_count=0），accept 线程自己承担主 accept 循环
+    while (server->running) {
+        SOCKET client = accept(server->sock, NULL, NULL);
+        if (client == INVALID_SOCKET) {
+            Sleep(10);
+            continue;
+        }
+        nl_handle_client(server, client);
+    }
+
     return 0;
 }
 
@@ -2112,18 +3007,15 @@ nl_web_server_t* nl_web_create(int port) {
     server->port = port;
     server->routes = NULL;
     InitializeCriticalSection(&server->mutex);
+    nl_route_hash_init(server);
     strncpy(server->encoding, "UTF-8", sizeof(server->encoding) - 1);
     server->redirect_type = NL_REDIRECT_TEMPORARY;  // Default: 302
     server->next = g_web_servers;
     g_web_servers = server;
     LeaveCriticalSection(&g_web_servers_mutex);
     
-    int result = nl_web_start(server);
-    if (result != NL_OK) {
-        nl_web_destroy(server);
-        return NULL;
-    }
-    
+    // 懒启动：create 仅注册并初始化，不绑定 socket、不起线程；
+    // 由调用方显式调用 nl_web_start 启动，降低服务启动阻塞时间。
     return server;
 }
 
@@ -2157,6 +3049,26 @@ void nl_web_destroy(nl_web_server_t* server) {
     LeaveCriticalSection(&server->mutex);
     
     DeleteCriticalSection(&server->mutex);
+    free(server->route_hash);
+    free(server->workers);
+    // 代理引擎 pr ring（引擎未启动时全为 NULL，free(NULL) 安全）
+    // IOCP 完成端口句柄（如果引擎线程还在跑，CloseHandle 后 pending I/O 会被取消）
+    if (server->iocp) { CloseHandle(server->iocp); server->iocp = NULL; }
+    if (server->pr_accept_client != INVALID_SOCKET) {
+        closesocket(server->pr_accept_client);
+        server->pr_accept_client = INVALID_SOCKET;
+    }
+    free(server->pr_iocp_client_ctx); server->pr_iocp_client_ctx = NULL;
+    free(server->pr_iocp_up_ctx);     server->pr_iocp_up_ctx     = NULL;
+    free(server->pr_fd_client);   server->pr_fd_client   = NULL;
+    free(server->pr_fd_upstream); server->pr_fd_upstream = NULL;
+    free(server->pr_route_idx);   server->pr_route_idx   = NULL;
+    free(server->pr_state);       server->pr_state       = NULL;
+    free(server->pr_hbuf);        server->pr_hbuf        = NULL;
+    free(server->pr_hbuf_out);    server->pr_hbuf_out    = NULL;
+    free(server->pr_hdr_len);     server->pr_hdr_len     = NULL;
+    free(server->pr_remain);      server->pr_remain      = NULL;
+    free(server->pr_free);        server->pr_free        = NULL;
     free(server);
 }
 
@@ -2188,6 +3100,40 @@ int nl_web_start(nl_web_server_t* server) {
     }
     
     server->running = 1;
+    // 数据驱动检测：是否存在反向代理路由，有则起 select 多路复用引擎（单线程泵 N 连接），
+    // 否则回退 worker 池。
+    int has_proxy = 0;
+    EnterCriticalSection(&server->mutex);
+    for (nl_web_route_t* r = server->routes; r; r = r->next)
+        if (r->type == NL_ROUTE_TYPE_PROXY) { has_proxy = 1; break; }
+    LeaveCriticalSection(&server->mutex);
+    if (has_proxy) {
+        server->thread = CreateThread(NULL, 0, nl_web_proxy_engine_thread, server, 0, NULL);
+        if (!server->thread) {
+            server->running = 0;
+            closesocket(server->sock);
+            return NL_ERROR;
+        }
+        windows_log(NL_LOG_INFO, "Web server (proxy engine) started on port %d", server->port);
+        return NL_OK;
+    }
+    // 全动态化：worker 池容量按需分配。未显式设置时用 WEB_WORKER_DEFAULT。
+    // 保留 64 上限（线程栈资源上限）防止误配置；worker_count 为 0 时由
+    // web_server_thread 回退到 accept 线程自处理连接。
+    int target = server->worker_count > 0 ? server->worker_count : WEB_WORKER_DEFAULT;
+    if (target > 64) target = 64;
+    if (server->worker_capacity < target) {
+        HANDLE* new_workers = (HANDLE*)realloc(server->workers,
+                                               (size_t)target * sizeof(HANDLE));
+        if (!new_workers) {
+            server->running = 0;
+            closesocket(server->sock);
+            return NL_ERROR;
+        }
+        server->workers = new_workers;
+        server->worker_capacity = target;
+    }
+    server->worker_count = target;
     server->thread = CreateThread(NULL, 0, web_server_thread, server, 0, NULL);
     if (!server->thread) {
         server->running = 0;
@@ -2196,6 +3142,16 @@ int nl_web_start(nl_web_server_t* server) {
     }
     
     windows_log(NL_LOG_INFO, "Web server started on port %d", server->port);
+    return NL_OK;
+}
+
+// 全动态化：运行时调整 worker 池目标容量（0 = 关闭池，回退 accept 线程自处理）。
+// 在 nl_web_start 前调用生效；已 start 的服务器下次重启后生效。
+int nl_web_set_worker_count(nl_web_server_t* server, int target) {
+    if (!server) return NL_ERROR;
+    if (target < 0) target = 0;
+    if (target > 64) target = 64;
+    server->worker_count = target;
     return NL_OK;
 }
 
@@ -2238,6 +3194,8 @@ static void cleanup_all_web_servers(void) {
         LeaveCriticalSection(&server->mutex);
         
         DeleteCriticalSection(&server->mutex);
+        free(server->route_hash);
+        free(server->workers);
         free(server);
         
         EnterCriticalSection(&g_web_servers_mutex);
@@ -2279,6 +3237,40 @@ void nl_web_stop(nl_web_server_t* server) {
         }
     }
     
+    // 兜底：代理引擎 pr ring（正常退出时引擎已自清理；TerminateThread 路径
+    // 可能未清理，此处 close 残留连接 + 释放数组，避免泄漏）
+    if (server->pr_fd_client || server->pr_fd_upstream || server->pr_state) {
+        int p_cap = server->pr_cap;
+        for (int i = 0; i < p_cap; i++) {
+            if (server->pr_fd_client) {
+                if (server->pr_fd_client[i] != INVALID_SOCKET) closesocket(server->pr_fd_client[i]);
+            }
+            if (server->pr_fd_upstream) {
+                if (server->pr_fd_upstream[i] > 0) closesocket(server->pr_fd_upstream[i]);
+            }
+            if (server->pr_hbuf) { free(server->pr_hbuf[i]); server->pr_hbuf[i] = NULL; }
+            if (server->pr_hbuf_out) { free(server->pr_hbuf_out[i]); server->pr_hbuf_out[i] = NULL; }
+        }
+        free(server->pr_fd_client);   server->pr_fd_client   = NULL;
+        free(server->pr_fd_upstream); server->pr_fd_upstream = NULL;
+        free(server->pr_route_idx);   server->pr_route_idx   = NULL;
+        free(server->pr_state);       server->pr_state       = NULL;
+        free(server->pr_hbuf);        server->pr_hbuf        = NULL;
+        free(server->pr_hbuf_out);    server->pr_hbuf_out    = NULL;
+        free(server->pr_hdr_len);     server->pr_hdr_len     = NULL;
+        free(server->pr_remain);      server->pr_remain      = NULL;
+        free(server->pr_free);        server->pr_free        = NULL;
+        server->pr_cap = server->pr_count = 0;
+    }
+    
+    // 清理 worker 线程（兜底：正常情况下 web_server_thread 内已 join）
+    for (int i = 0; i < server->worker_count; i++) {
+        if (server->workers && server->workers[i]) {
+            CloseHandle(server->workers[i]);
+            server->workers[i] = NULL;
+        }
+    }
+    
     windows_log(NL_LOG_INFO, "Web server stopped");
 }
 
@@ -2307,6 +3299,7 @@ static void add_web_route(nl_web_server_t* server, const char* path, const char*
         route->redirect_url[0] = '\0';
         route->next = server->routes;
         server->routes = route;
+        nl_route_hash_insert_simple(server, route);
     }
     LeaveCriticalSection(&server->mutex);
 }
@@ -2364,6 +3357,7 @@ static void add_web_route_smart(nl_web_server_t* server, const char* path, const
             route->type = NL_ROUTE_TYPE_REDIRECT;
             route->next = server->routes;
             server->routes = route;
+            nl_route_hash_insert_simple(server, route);
         }
         LeaveCriticalSection(&server->mutex);
         windows_log(NL_LOG_INFO, "Added redirect: %s -> %s", path, content);
@@ -2384,6 +3378,7 @@ static void add_web_route_smart(nl_web_server_t* server, const char* path, const
             route->type = NL_ROUTE_TYPE_FILE;
             route->next = server->routes;
             server->routes = route;
+            nl_route_hash_insert_simple(server, route);
         }
         LeaveCriticalSection(&server->mutex);
         windows_log(NL_LOG_INFO, "Added file route: %s -> %s (hot reload)", path, abs_path);
@@ -2392,6 +3387,90 @@ static void add_web_route_smart(nl_web_server_t* server, const char* path, const
     
     // Priority 3: Static content
     add_web_route(server, path, content, content_type);
+}
+
+// 解析 upstream 字符串为 host + port + protocol（支持 scheme 前缀或默认端口）
+// 返回 0 成功，-1 失败。host/port 由调用方提供足够缓冲。
+static int nl_parse_upstream(const char* upstream, char* host, size_t host_size,
+                             int* port_out, nl_proxy_protocol_t* proto_out) {
+    if (!upstream || upstream[0] == '\0') return -1;
+
+    const char* p = upstream;
+    nl_proxy_protocol_t proto = NL_PROXY_HTTP;
+
+    if (strncmp(p, "https://", 8) == 0) {
+        proto = NL_PROXY_HTTPS;
+        p += 8;
+    } else if (strncmp(p, "http://", 7) == 0) {
+        proto = NL_PROXY_HTTP;
+        p += 7;
+    } else if (strncmp(p, "tcp://", 6) == 0) {
+        proto = NL_PROXY_TCP;
+        p += 6;
+    }
+
+    // 分离 host 与 port
+    char host_port[512];
+    size_t len = strlen(p);
+    if (len >= sizeof(host_port)) len = sizeof(host_port) - 1;
+    memcpy(host_port, p, len);
+    host_port[len] = '\0';
+
+    int port = 0;
+    char* colon = strrchr(host_port, ':');
+    char* host_end = host_port;
+    if (colon && colon != host_port) {
+        *colon = '\0';
+        host_end = host_port;
+        port = atoi(colon + 1);
+        if (port <= 0) port = 0;
+    }
+
+    if (port == 0) {
+        // 未显式指定端口：按协议取默认端口
+        if (proto == NL_PROXY_HTTPS) port = 443;
+        else port = 80;
+    }
+
+    snprintf(host, host_size, "%s", host_end);
+    *port_out = port;
+    *proto_out = proto;
+    return 0;
+}
+
+// 数据驱动反向代理：将 path 路径的请求转发至上游（http/https/tcp）
+int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream) {
+    if (!server || !path || !upstream) return NL_EINVAL;
+
+    char host[512];
+    int port = 0;
+    nl_proxy_protocol_t proto = NL_PROXY_HTTP;
+    if (nl_parse_upstream(upstream, host, sizeof(host), &port, &proto) != 0) {
+        return NL_EINVAL;
+    }
+
+    EnterCriticalSection(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (route) {
+        strncpy(route->path, path, sizeof(route->path) - 1);
+        route->path[sizeof(route->path) - 1] = '\0';
+        // 上游地址统一存 host:port（不带 scheme），protocol 单独存放
+        snprintf(route->upstream, sizeof(route->upstream), "%s:%d", host, port);
+        route->protocol = proto;
+        route->type = NL_ROUTE_TYPE_PROXY;
+        route->content = NULL;
+        route->content_size = 0;
+        route->file_path[0] = '\0';
+        route->redirect_url[0] = '\0';
+        route->next = server->routes;
+        server->routes = route;
+        nl_route_hash_insert_simple(server, route);
+        LeaveCriticalSection(&server->mutex);
+        windows_log(NL_LOG_INFO, "Added proxy route: %s -> %s (%d)", path, route->upstream, port);
+        return NL_OK;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return NL_ENOMEM;
 }
 
 // Runtime route management APIs (v2.2.2)
@@ -2419,6 +3498,7 @@ int nl_web_add_route(nl_web_server_t* server, const char* path, const char* cont
         route->redirect_url[0] = '\0';
         route->next = server->routes;
         server->routes = route;
+        nl_route_hash_insert_simple(server, route);
         windows_log(NL_LOG_INFO, "Added route: %s", path);
         LeaveCriticalSection(&server->mutex);
         return NL_OK;
@@ -2438,6 +3518,8 @@ int nl_web_remove_route(nl_web_server_t* server, const char* path) {
             *pp = target->next;
             if (target->content) free(target->content);
             free(target);
+            // 路由已删除，重建 hash 表以剔除指向已释放 route 的指针
+            nl_route_hash_rebuild(server);
             LeaveCriticalSection(&server->mutex);
             windows_log(NL_LOG_INFO, "Removed route: %s", path);
             return NL_OK;
@@ -3302,6 +4384,41 @@ void* nl_json_object_get(void* json, const char* key) { nl_json_t* j = (nl_json_
 int nl_json_has_key(void* json, const char* key) { nl_json_t* j = (nl_json_t*)json; if (!j || !j->root || j->root->type != 6 || !key) return 0; for (size_t i = 0; i < j->root->data.object_val.count; i++) if (strcmp(j->root->data.object_val.keys[i], key) == 0) return 1; return 0; }
 char* nl_json_stringify(void* json, int pretty) { nl_json_t* j = (nl_json_t*)json; if (!j || !j->root) return (char*)""; size_t cap = 256, len = 0; char* out = (char*)malloc(cap); if (!out) return NULL; stringify_node(j->root, &out, &cap, &len, pretty, 0); out = (char*)realloc(out, len + 1); out[len] = '\0'; return out; }
 int nl_json_save_file(void* json, const char* file_path, int pretty) { if (!json || !file_path) return NL_EINVAL; char* s = nl_json_stringify(json, pretty); if (!s) return NL_ENOMEM; FILE* fp = fopen(file_path, "w"); if (!fp) { free(s); return NL_EFILE; } fwrite(s, 1, strlen(s), fp); fclose(fp); free(s); return NL_OK; }
+
+// JSON 字符串转义：把任意字符串（含 token/key 等敏感字段）转义为安全 JSON 字符串字面量。
+// 调用方可将返回值拼接进 JSON 再输出，避免原值被直接打印造成信息泄露或注入。
+// 返回值需调用方 free。NULL 输入返回指向空串的静态常量。
+char* nl_json_escape(const char* input) {
+    if (!input) return (char*)"";
+    size_t len = strlen(input);
+    size_t cap = len * 6 + 2;
+    char* out = (char*)malloc(cap);
+    if (!out) return NULL;
+    char* p = out;
+    *p++ = '"';
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)input[i];
+        switch (c) {
+            case '"':  *p++ = '\\'; *p++ = '"';  break;
+            case '\\': *p++ = '\\'; *p++ = '\\'; break;
+            case '\b': *p++ = '\\'; *p++ = 'b';  break;
+            case '\f': *p++ = '\\'; *p++ = 'f';  break;
+            case '\n': *p++ = '\\'; *p++ = 'n';  break;
+            case '\r': *p++ = '\\'; *p++ = 'r';  break;
+            case '\t': *p++ = '\\'; *p++ = 't';  break;
+            default:
+                if (c < 0x20) {
+                    p += sprintf(p, "\\u%04x", c);
+                } else {
+                    *p++ = (char)c;
+                }
+                break;
+        }
+    }
+    *p++ = '"';
+    *p = '\0';
+    return out;
+}
 
 const char* nl_json_error_message(nl_status_t error_code) {
     switch (error_code) {

@@ -842,6 +842,16 @@ NL_API int nl_web_start(nl_web_server_t* server);
 NL_API void nl_web_stop(nl_web_server_t* server);
 
 /**
+ * @brief Dynamically set the web worker pool target size
+ * @details High-load tuning: sizes the dynamic worker thread pool. 0 disables
+ *          the pool (falls back to the accept thread); values > 64 are capped.
+ *          Apply before nl_web_start for the current start, or before a
+ *          restart for an already-started server. Returns 0 on success, -1 on
+ *          a NULL server.
+ */
+NL_API int nl_web_set_worker_count(nl_web_server_t* server, int target);
+
+/**
  * @brief Add a route to web server
  */
 NL_API int nl_web_add_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type);
@@ -870,6 +880,18 @@ NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char
  * @brief Add JSON content to web server
  */
 NL_API void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
+
+/**
+ * @brief Add a data-driven reverse proxy route (http/https/tcp upstream) — **Beta**
+ * @note 反向代理引擎目前处于 Beta 阶段，API 与行为可能在后续版本调整。
+ *       三平台实现：Linux epoll / macOS kqueue / Windows select/IOCP。
+ * @details New short-interface API; upstream may carry an optional scheme
+ *          (e.g. "http://host:8080", "https://api.example.com", "tcp://host:6379").
+ *          The matched path is transparently forwarded to the upstream.
+ *          Mixed routes supported since v2.4.2：同一 server 内 proxy + static +
+ *          content + redirect + file 路由可共存，引擎内部统一处理。
+ */
+NL_API int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream);
 
 /**
  * @brief Enable or disable automatic encoding handling

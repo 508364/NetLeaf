@@ -195,31 +195,54 @@ static void* http2_client_thread(void* arg) {
     return NULL;
 }
 
+/* 读取单个完整 HTTP/1 请求到 buf（容量 cap）。成功返回实际读取字节数，
+ * 连接关闭/出错返回 <=0。配合 nl_http_find_terminator 做增量解析。 */
+static long nl_http_read_request(int fd, char* buf, size_t cap, size_t* total) {
+    *total = 0;
+    while (*total < cap - 1) {
+        ssize_t n = read(fd, buf + *total, cap - 1 - *total);
+        if (n <= 0) return *total;
+        *total += (size_t)n;
+        buf[*total] = '\0';
+        if (nl_http_find_terminator(buf, *total) != -1) return (long)*total;
+    }
+    return (long)*total;
+}
+
 static void* http1_client_thread(void* arg) {
     http1_client_args_t* args = (http1_client_args_t*)arg;
     int client_fd = args->client_fd;
     nl_http_server_t* server = args->server;
     free(args);
 
-    char buffer[BUFFER_SIZE];
-    int has_more = 1;
-    size_t total = 0;
-    while (has_more && total < sizeof(buffer) - 1) {
-        ssize_t bytes_read = read(client_fd, buffer + total, sizeof(buffer) - 1 - total);
-        if (bytes_read <= 0) break;
-        total += bytes_read;
-        /* 收到完整请求头即可停止 */
-        has_more = (nl_http_find_terminator(buffer, total) == -1);
-    }
-    buffer[total] = '\0';
+    /* 取长补短：旧路径（核心库 nl_handle_client）支持 keep-alive 连接复用，
+     * 新路径原先"读完即 close"。此处改为 Connection 感知：默认 keep-alive，
+     * 请求头显式指定 close 或为 HTTP/1.0 无 keep-alive 时关闭。 */
+    int keep_alive = 1;
+    while (keep_alive) {
+        char buffer[BUFFER_SIZE];
+        size_t total = 0;
+        long got = nl_http_read_request(client_fd, buffer, sizeof(buffer), &total);
+        if (got <= 0 || total == 0) break;
 
-    if (total > 0) {
         nl_http_request_t req;
         nl_http_response_t resp;
         memset(&resp, 0, sizeof(resp));
         resp.status = 200;
+        int parsed = 0;
 
         if (nl_http_parse_request(&req, buffer, total) == 0) {
+            parsed = 1;
+            /* 解析出的 Connection 头决定本连接是否复用 */
+            const char* conn = nl_http_request_get_header(&req, "Connection");
+            if (conn && strcasecmp(conn, "close") == 0) {
+                keep_alive = 0;
+            }
+            if (req.version == NL_HTTP_VERSION_1_0) {
+                const char* ka = nl_http_request_get_header(&req, "Keep-Alive");
+                if (!ka) keep_alive = 0;
+            }
+
             if (server && server->handler) {
                 server->handler(&req, &resp, server->user_data);
             } else {
@@ -229,10 +252,12 @@ static void* http1_client_thread(void* arg) {
 
         char* response_data = NULL;
         size_t response_len = 0;
+        /* 回写 Connection 头，让客户端知道连接是否复用 */
+        if (keep_alive && parsed) nl_http_response_set_header(&resp, "Connection", "keep-alive");
         nl_http_generate_response_http1(&resp, &response_data, &response_len);
 
         if (response_data) {
-            write(client_fd, response_data, response_len);
+            if (response_len > 0) write(client_fd, response_data, response_len);
             free(response_data);
         }
 

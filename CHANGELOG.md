@@ -8,6 +8,36 @@
 
 ### 变更
 
+#### 反向代理升级为数据驱动异步并行事件引擎 — **Beta**
+
+> ⚠️ **Beta 阶段**：API 与行为可能在后续版本调整；三平台实现已完成并通过语法校验。
+
+- **数据驱动状态表**：Web 反向代理不再为每连接建对象，连接状态编码为
+  8 位无状态字节（`pr_state`）+ 按设备动态定容的整数 ring buffer
+  （`pr_fd_client` / `pr_fd_upstream` / `pr_route_idx` / `pr_hbuf` /
+  `pr_hbuf_out` / `pr_hdr_len` / `pr_remain` / `pr_free`），单线程一次
+  泵多个连接，彻底摆脱"并发 ≈ worker 数"瓶颈。
+- **混合路由支持**（v2.4.2 新特性）：同一 Web 服务器可同时启用 proxy + static
+  + content + redirect + file 路由，引擎内统一处理，消除早期"proxy 路由激活
+  后其它路由返回 501 Not Proxy"的限制。
+- **I/O 多路复用后端（按平台自动选择）**：
+  - Linux：`epoll`（`event.data.u32` 编码 idx + 方向位，`epoll_wait` 1000ms 退避）。
+  - macOS：`kqueue`（`kevent.udata` 编码 idx + 方向位，`kevent` 1s 退避）。
+  - Windows：`IOCP`（内核完成端口，无 `FD_SETSIZE` 上限），`select` 作为兼容回退。
+- **极低占用**：listen / 客户端 / 上游 fd 全非阻塞（`O_NONBLOCK` /
+  `ioctlsocket(FIONBIO)`）；空闲退避超时，无连接时近乎零 CPU；`nl_web_start`
+  检测到 proxy 路由时**单线程引擎直接拉起、不分配 worker 池**，无 proxy 路由
+  回退原 worker 池，行为不变。
+- **防半包丢数据**：`pr_remain` 记录每方向"已收待发余量"，先补发上次
+  `EAGAIN` / `WSAEWOULDBLOCK` 未发完部分再读新数据。
+- **ring 容量按设备动态调整**：Linux/macOS = `逻辑核数 × 64`（[64, 4096]）；
+  Windows = `FD_SETSIZE-2`（[64, 1024]）。
+- **上游协议分流**：`tcp://` 纯字节透传；`http://` / `https://` 重组
+  request line + `Host` / `X-Forwarded-For` / `Connection: close` 头并透传
+  原始 header / body。
+- **生命周期安全**：`nl_web_stop` / `nl_web_destroy` 增加 pr ring 兜底清理
+  （close 残留连接 + 逐字段 free 置 NULL），防 `TerminateThread` 路径泄漏。
+
 #### HTTPS 正式纳入 CMake 构建 + 扩展自动依赖检查 + Lang 软依赖解耦 (v2.4.2)
 
 - **HTTPS 主库独立成** **`netleaf_http`** **目标**：为避免 `netleaf_core → netleaf_tls → netleaf_core`

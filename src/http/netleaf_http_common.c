@@ -419,8 +419,20 @@ int hpack_encode_header(struct hpack_context* ctx, uint8_t* data, size_t len, co
     size_t value_len = strlen(value);
 
     if (idx < 0) {
+        /* 索引名 literal（RFC 7541 §6.2.1）：name index 用 4 位前缀 0x10 编码。
+         * 旧实现误用 6 位前缀 0x00，会把索引写成 "索引型 header"，客户端 HPACK
+         * 解析错乱 → 连接能建但无响应。此处按 4 位前缀写，索引 >15 时退化为
+         * 全字面形式（0x00 + name_len + 名字）。 */
         idx = -idx;
-        offset += hpack_write_varint(data + offset, len - offset, 6, idx, 0x00);
+        if (idx <= 15) {
+            offset += hpack_write_varint(data + offset, len - offset, 4, idx, 0x10);
+        } else {
+            data[offset++] = 0x00;
+            offset += hpack_write_varint(data + offset, len - offset, 7, name_len, 0x00);
+            if (offset + name_len > len) return 0;
+            memcpy(data + offset, name, name_len);
+            offset += name_len;
+        }
     } else {
         data[offset++] = 0x00;
         offset += hpack_write_varint(data + offset, len - offset, 7, name_len, 0x00);
