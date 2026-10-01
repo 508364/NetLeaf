@@ -1,17 +1,28 @@
-<img src="./Logo.svg" width="50" height="50" align="left"> 
-
-### **NetLeaf v2.2.2**
-高性能跨平台网络库，支持TCP/UDP/HTTP/HTTP2/HTTP3，以及内联HTML/Vue响应式Web服务器
+<div align="center">
+  <img src="./Logo.svg" width="72" height="72" alt="NetLeaf Logo">
+  <h1>NetLeaf</h1>
+  <p><b>NetLeaf</b> 是一个现代化的、高性能的网络库，采用 <b>NL扩展系统</b> 架构，支持跨平台运行（Windows/Linux/macOS/Android）。提供 TCP/UDP、HTTP、WebSocket 和 MQTT 协议支持，内置智能路由、自动补全、多语言等扩展模块。</p>
+  <img src="https://img.shields.io/badge/NetLeaf-v2.4.1-blue?style=for-the-badge" alt="NetLeaf Version">
+  <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
+  <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28.10-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
+  <a href="https://mqttt.com"><img src="https://img.shields.io/badge/MQTT-5.0/3.1.1-yellow?style=for-the-badge" alt="MQTT v5.0/3.1.1"></a>
+  <a href="https://opensource.org/license/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
+  <a href="https://en.cppreference.com/c"><img src="https://img.shields.io/badge/C-99%2F11-red?style=for-the-badge" alt="C Standard"></a>
+</div>
 
 **平台支持:**
 - ✅ Windows (IOCP) - 完全支持
 - ✅ Linux (epoll) - 完全支持
 - ✅ macOS (kqueue) - 完全支持
+- ✅ Android (Bionic) - 核心库交叉编译支持（arm64-v8a/armeabi-v7a/x86_64），扩展系统暂不支持（代码保留、后续跟进）
 
-**重要变更 (v2.2.2):**
+**重要变更 (v2.4.0):**
 - ⚠️ 静态库已不再支持，仅提供动态库（DLL/SO）
 - 原因：扩展库需要动态链接以共享全局状态
 - 如需静态链接，请使用 v2.2.1 或更早版本
+- 新增 Lang 模块变量替换功能：`{{VAR_NAME}}` 和 `{{<var>nl.lang.VAR</var>}}` 格式
+- 新增完整扩展生命周期管理 API
+- 新增扩展搜索、过滤、元数据管理 API
 
 **仓库地址:**
 - GitHub: [https://github.com/508364/NetLeaf](https://github.com/508364/NetLeaf)
@@ -24,15 +35,10 @@
 在 Visual Studio Developer Command Prompt 中运行：
 
 ```cmd
-build_all.bat
+build_all-Clang.bat
 ```
 
-或指定架构：
-
-```cmd
-build_all.bat x86
-build_all.bat arm64
-```
+> 自动构建 Windows x64 / x86 / ARM64 三个架构并打包为 ZIP。
 
 ### Linux/WSL
 
@@ -59,6 +65,26 @@ chmod +x build.sh
 build_all_windows.bat
 ```
 
+### Android 构建（移动端）
+
+```bash
+# Linux / WSL / macOS
+./build_android.sh          # 构建全部三 ABI
+./build_android.sh aarch64  # 仅 arm64-v8a
+
+# Windows
+build_android.bat
+```
+
+支持 `arm64-v8a`（推荐）/`armeabi-v7a`/`x86_64`，`minSdkVersion` 21。
+需 Android NDK r25+，脚本自动探测 NDK 路径。
+
+> **范围说明**：Android 覆盖**核心库**（`netleaf_core`）；**扩展系统（NL Extension）
+> 暂不支持 Android 运行时**，但源码与构建配置保留，后续按扩展逐个跟进。
+> 各扩展共享库在 Android 目标下仍按 Linux 语义构建。
+
+详细指南见 `docs/android_build.md`。
+
 ## 输出位置
 
 构建完成后：
@@ -69,7 +95,7 @@ build/
 └── lib/Release/netleaf.lib (Windows导入库) | libnetleaf.a (Linux符号库)
 ```
 
-注：v2.2.2 仅提供动态库，静态库已不再支持。
+注：v2.4.0 仅提供动态库，静态库已不再支持。
 
 ## 使用示例
 
@@ -110,8 +136,6 @@ int main() {
 ```
 
 ### 3. 文件热加载（v2.2.2新增）
-
-修改外部文件后刷新页面立即生效，无需重启服务器。
 
 ```c
 #include "netleaf.h"
@@ -219,21 +243,7 @@ int main() {
 - `nl_web_list_routes()` - 列出所有路由路径
 - `nl_web_update_route()` - 更新路由内容
 
-### 7. 使用预设组件
-
-```c
-// 计数器
-nl_web_add_counter(server, "/", "Counter Demo");
-
-// 数据面板
-nl_web_add_dashboard(server, "/dashboard", "Analytics");
-
-// 表单
-const char* fields[] = {"name", "email", "message"};
-nl_web_add_form(server, "/contact", "Contact Us", fields, 3);
-```
-
-### 8. TCP服务器
+### 7. TCP服务器
 
 ```c
 #include "netleaf.h"
@@ -552,7 +562,7 @@ nl_router_serve(router, 8080);
 ### Windows
 
 ```cmd
-build_all.bat
+build_all-Clang.bat
 ```
 
 自动构建 x64、x86、ARM64 架构并打包为ZIP格式。
@@ -585,7 +595,6 @@ gcc myapp.c -I include -L build/lib -lnetleaf -lpthread -o myapp
 ✅ **TCP/UDP** - 完整的网络协议支持  
 ✅ **HTTP/1.1, HTTP/2, HTTP/3** - 全HTTP协议栈  
 ✅ **内联HTML/Vue** - 直接在代码中嵌入响应式界面  
-✅ **预设组件** - 计数器、面板、表单等开箱即用  
 ✅ **现代CSS** - 美观的渐变和动画效果  
 ✅ **跨平台** - Windows (IOCP) + Linux (epoll) + macOS (kqueue) 🔶  
 ✅ **宽可用库** - 简洁统一的输出结构  
@@ -608,22 +617,16 @@ void nl_web_add_html(nl_web_server_t* server, const char* path, const char* html
 void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
 void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
 
-// 预设组件
-void nl_web_add_counter(nl_web_server_t* server, const char* path, const char* title);
-void nl_web_add_dashboard(nl_web_server_t* server, const char* path, const char* title);
-void nl_web_add_form(nl_web_server_t* server, const char* path, const char* title, const char** fields, int field_count);
-
 // 一行代码启动
 int nl_serve_html(int port, const char* html);
 int nl_serve_vue(int port, const char* vue_code);
-int nl_serve_dashboard(int port, const char* title);
 ```
 
 更多API请查看 `include/netleaf.h`。
 
 ## 附加模块
 
-以下模块是从主库分离出来的独立库，与主库共用版本号(v2.2.2)，构建时一起构建。
+以下模块是从主库分离出来的独立库，与主库共用版本号(v2.4.1)
 
 ### 1. Auto-complete 模块 (netleaf_autocomplete)
 

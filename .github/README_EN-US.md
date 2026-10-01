@@ -1,17 +1,24 @@
-<img src="Logo.svg" width="40" height="40" align="left"> 
-
-# NetLeaf v2.2.2
-
-High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.
+<div align="center">
+  <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
+  <h1>NetLeaf</h1>
+  <p>High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.</p>
+  <img src="https://img.shields.io/badge/NetLeaf-v2.4.1-blue?style=for-the-badge" alt="NetLeaf Version">
+  <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
+  <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28.10-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
+  <a href="https://mqttt.com"><img src="https://img.shields.io/badge/MQTT-5.0/3.1.1-yellow?style=for-the-badge" alt="MQTT v5.0/3.1.1"></a>
+  <a href="https://opensource.org/license/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
+  <a href="https://en.cppreference.com/c"><img src="https://img.shields.io/badge/C-99%2F11-red?style=for-the-badge" alt="C Standard"></a>
+</div>
 
 **Platform Support:**
 - ✅ Windows (IOCP) - Full support
 - ✅ Linux (epoll) - Full support
 - ✅ macOS (kqueue) - Full support
+- ✅ Android (Bionic) - Core library cross-compilation (arm64-v8a/armeabi-v7a/x86_64); extension system not yet supported (code retained, follow-up planned)
 
 ## Features
 
-- ✅ **Cross-platform**: Windows / Linux / macOS
+- ✅ **Cross-platform**: Windows / Linux / macOS / Android (core library; extensions pending)
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
 - ✅ **Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, TCP, UDP
 - ✅ **Web Server**: Built-in HTML/Vue.js support with server-side variable replacement
@@ -67,7 +74,7 @@ int main() {
 Download prebuilt libraries from [releases](releases/) or build from source:
 
 ```cmd
-build_all.bat
+build_all-Clang.bat
 ```
 
 ### Linux/WSL
@@ -76,6 +83,28 @@ build_all.bat
 chmod +x build_all.sh
 ./build_all.sh
 ```
+
+### Android (cross-compilation)
+
+```bash
+# Linux / WSL / macOS
+chmod +x build_android.sh
+./build_android.sh            # build all three ABIs
+./build_android.sh aarch64    # arm64-v8a only
+
+# Windows
+build_android.bat
+```
+
+Supports `arm64-v8a` (recommended) / `armeabi-v7a` / `x86_64`, `minSdkVersion` 21.
+Requires Android NDK r25+; the script auto-detects the NDK path.
+
+> **Scope**: Android covers the **core library** (`netleaf_core`). The **extension
+> system (NL Extension) is not yet supported on the Android runtime**; its source
+> code and build configuration are retained and will be followed up per extension.
+> Extension shared libraries are still built under Linux semantics for Android targets.
+
+See `docs/android_build.md` for the full guide.
 
 ## API Reference
 
@@ -148,11 +177,11 @@ MIT License
 
 ## Version
 
-2.2.2
+2.4.0
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v2.2.2) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v2.4.1) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 
