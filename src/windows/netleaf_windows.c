@@ -51,6 +51,14 @@ struct nl_server {
     HANDLE queue_not_full;
     int queue_init;
     int pool_used;
+    // ---- UDP IOCP OVERLAPPED 上下文（IOCP 驱动 UDP 读，彻底摆脱裸轮询） ----
+    OVERLAPPED udp_ov;
+    WSABUF     udp_wsabuf;
+    char       udp_buf[BUFFER_SIZE];
+    // WSARecvFrom 需要的地址缓冲：size = SOCKADDR + 预留
+    char       udp_addrbuf[sizeof(SOCKADDR_IN) + 32];
+    // 标记 listener_thread 是否需要对 UDP socket 做 IOCP WSARecvFrom 预 post
+    int        udp_iocp_active;
 };
 
 struct nl_client {
@@ -411,35 +419,109 @@ static DWORD WINAPI worker_dispatch(LPVOID lpParam) {
 static DWORD WINAPI listener_thread(LPVOID lpParam) {
     nl_server_t* server = (nl_server_t*)lpParam;
 
-    while (server->running == 1) {
-        if (server->protocol == NL_PROTO_UDP) {
-            if (server->udp_handler || server->udp_handler_v2) {
-                char buf[BUFFER_SIZE];
-                // BUG-ARCH-003: 非阻塞 UDP socket 可能积压多个 datagram，
-                // 单次 recvfrom 只收一个会导致后续包被静默丢弃。
-                // 循环 recvfrom 直到 WSAEWOULDBLOCK（无更多数据）。
-                for (;;) {
-                    int n = recvfrom(server->fd, buf, BUFFER_SIZE, 0, NULL, NULL);
-                    if (n < 0) {
-                        int err = WSAGetLastError();
-                        if (err == WSAEWOULDBLOCK || err == WSAECONNRESET) break;
-                        if (err == WSAEINTR) continue;
-                        windows_log(NL_LOG_ERROR, "Windows: UDP recvfrom failed: %d", err);
-                        break;
-                    }
-                    if (n == 0) break;
-                    if (server->udp_handler_v2) {
-                        server->udp_handler_v2(buf, (size_t)n, "0.0.0.0", 0, server->user_data);
-                    } else {
-                        server->udp_handler(buf, (size_t)n, server->user_data);
-                    }
-                }
-                // 轮询节流：避免忙循环；与原版一致（原为 Sleep(10)）。
-                // 若本迭代已收完包（进入本分支说明 udp_handler 非空），
-                // 这里仍保留休眠，保持与原始轮询节拍一致，不影响积压排空语义。
-                Sleep(10);
+    if (server->protocol == NL_PROTO_UDP) {
+        // ---- UDP 专属 IOCP 读循环（替代旧版裸轮询 + Sleep(10)） ----
+        // 前置：nl_server_create 已 CreateIoCompletionPort 把 UDP fd 挂进
+        // server->iocp_handle（completion key = (ULONG_PTR)server->fd）。
+        //
+        // 策略：有 handler → 预 post WSARecvFrom OVERLAPPED，GetQueuedCompletionStatus
+        //        驱动；无 handler → 不 post，GetQueuedCompletionStatus 等 timeout
+        //        自然睡眠，零 CPU。
+        //
+        // BUG-ARCH-003 仍然保留：GetQueuedCompletionStatus 收到一次完成就 dispatch，
+        // 然后立刻重新 post 下一个 WSARecvFrom。由于 OVERLAPPED 完成是"一次一完成"
+        // 语义（WSARecvFrom 收一个 datagram 就完成），不存在裸 recvfrom 的"非阻塞
+        // 积压多 datagram 排空"问题。
+        WSABUF wb;
+        wb.buf = server->udp_buf;
+        wb.len = BUFFER_SIZE;
+        DWORD flags = 0;
+        int addr_len = sizeof(server->udp_addrbuf);
+
+        // 首次：有 handler 才预 post WSARecvFrom
+        if (server->udp_handler || server->udp_handler_v2) {
+            memset(&server->udp_ov, 0, sizeof(server->udp_ov));
+            DWORD wsa_flags = 0;
+            DWORD dummy_bytes = 0;
+            int rc = WSARecvFrom(server->fd, &wb, 1, &dummy_bytes, &wsa_flags,
+                                 (struct sockaddr*)&server->udp_addrbuf, &addr_len,
+                                 &server->udp_ov, NULL);
+            // WSA_IO_PENDING = 正常异步投递；0 = 立即完成（少见）
+            if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+                windows_log(NL_LOG_ERROR, "Windows UDP IOCP: 首次 WSARecvFrom 失败 gle=%d", WSAGetLastError());
+            } else {
+                server->udp_iocp_active = 1;
             }
-        } else if (server->pool_used) {
+        }
+
+        while (server->running == 1) {
+            DWORD bytes_xfer = 0;
+            ULONG_PTR completion_key = 0;
+            OVERLAPPED* pov = NULL;
+
+            BOOL ok = GetQueuedCompletionStatus(server->iocp_handle, &bytes_xfer,
+                                                &completion_key, &pov, 200);
+            DWORD gle = ok ? 0 : GetLastError();
+
+            if (!ok) {
+                if (gle == WAIT_TIMEOUT) continue;     // 正常 idle 睡眠
+                if (gle == ERROR_OPERATION_ABORTED) continue; // server 关闭期间取消
+                windows_log(NL_LOG_ERROR, "Windows UDP IOCP: GetQueuedCompletionStatus 失败 gle=%lu", gle);
+                break;
+            }
+
+            // completion key 应该就是 server->fd（nl_server_create 里挂进 iocp 时设的）
+            if ((SOCKET)completion_key != server->fd) continue;
+
+            // WSARecvFrom OVERLAPPED 完成
+            if (pov == &server->udp_ov && server->udp_iocp_active) {
+                if (bytes_xfer > 0) {
+                    // BUG-201：peer 地址从 WSARecvFrom 的 addrbuf 解出来
+                    char peer_addr[INET6_ADDRSTRLEN] = "0.0.0.0";
+                    int  peer_port = 0;
+                    struct sockaddr_in* sin = (struct sockaddr_in*)&server->udp_addrbuf;
+                    if (sin->sin_family == AF_INET) {
+                        inet_ntop(AF_INET, &sin->sin_addr, peer_addr, sizeof(peer_addr));
+                        peer_port = (int)ntohs(sin->sin_port);
+                    }
+                    if (server->udp_handler_v2) {
+                        server->udp_handler_v2(server->udp_buf, (size_t)bytes_xfer,
+                                               peer_addr, peer_port, server->user_data);
+                    } else {
+                        server->udp_handler(server->udp_buf, (size_t)bytes_xfer, server->user_data);
+                    }
+                } else {
+                    // bytes_xfer == 0 + gle==ERROR_OPERATION_ABORTED 常见于 server 关闭
+                    // 非 abort 的 0 长度 datagram 理论上合法但罕见
+                }
+
+                // 重新 post 下一个 WSARecvFrom（只要还在 running）
+                if (server->running == 1 && (server->udp_handler || server->udp_handler_v2)) {
+                    memset(&server->udp_ov, 0, sizeof(server->udp_ov));
+                    wb.buf = server->udp_buf;
+                    wb.len = BUFFER_SIZE;
+                    DWORD wsa_flags2 = 0;
+                    DWORD dummy_bytes2 = 0;
+                    addr_len = sizeof(server->udp_addrbuf);
+                    int rc = WSARecvFrom(server->fd, &wb, 1, &dummy_bytes2, &wsa_flags2,
+                                         (struct sockaddr*)&server->udp_addrbuf, &addr_len,
+                                         &server->udp_ov, NULL);
+                    if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+                        windows_log(NL_LOG_ERROR, "Windows UDP IOCP: 重 post WSARecvFrom 失败 gle=%d", WSAGetLastError());
+                        server->udp_iocp_active = 0;
+                    }
+                } else if (!server->udp_handler && !server->udp_handler_v2) {
+                    // handler 被动态清空 → 停止 post，iocp Wait 自然睡眠
+                    server->udp_iocp_active = 0;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // ---- TCP / HTTP / WEBSOCKET 路径（原有 worker pool + legacy 单线程不变） ----
+    while (server->running == 1) {
+        if (server->pool_used) {
             while (server->running == 1) {
                 SOCKET client_fd = accept(server->fd, NULL, NULL);
                 if (client_fd == INVALID_SOCKET) {
@@ -1954,6 +2036,156 @@ typedef struct nl_web_route {
     struct nl_web_route* next;
 } nl_web_route_t;
 
+// ============ 上游 keep-alive 连接池（单线程引擎持有，无需加锁）============
+// 空闲上游连接按 "host:port|proto" 分桶，取用时探测存活，空闲超时回收。
+// 说明：Windows 下 socket 为句柄，fd 字段用 SOCKET 承载（避免 int 截断）。
+typedef struct nl_up_pool_entry {
+    SOCKET fd;                 // 空闲上游连接 socket
+    int64_t last_used_ms;      // 上次归还时间（用于空闲回收）
+    struct nl_up_pool_entry* next;
+} nl_up_pool_entry_t;
+typedef struct {
+    char  key[576];            // "host:port|proto"
+    nl_up_pool_entry_t* head;
+    int   count;
+} nl_up_pool_bucket_t;
+typedef struct {
+    nl_up_pool_bucket_t* buckets;
+    int bucket_cap;
+    int total_idle;
+    int max_total;             // 全局空闲上限，默认 256
+    int max_per_key;           // 每 key 空闲上限，默认 8
+    int idle_timeout_ms;       // 空闲超时，默认 30000
+} nl_web_upstream_pool_t;
+
+// 当前毫秒（GetTickCount64 为系统毫秒计数，用于空闲回收）
+static int64_t pr_pool_now_ms(void) {
+    return (int64_t)GetTickCount64();
+}
+// 关闭池中 socket（平台差异集中于此）
+static void pr_pool_close_fd(SOCKET fd) { if (fd != INVALID_SOCKET) closesocket(fd); }
+// 探测空闲上游连接是否仍存活：MSG_PEEK 非阻塞偷看，WSAEWOULDBLOCK=健康
+static int pr_pool_probe_alive(SOCKET fd) {
+    if (fd == INVALID_SOCKET) return 0;
+    char c;
+    int r = recv(fd, &c, 1, MSG_PEEK);
+    if (r == 0) return 0;                 // 对端已关闭
+    if (r > 0)  return 0;                 // 有残留数据，不复用
+    int err = WSAGetLastError();
+    return (err == WSAEWOULDBLOCK) ? 1 : 0;
+}
+// key 构造："host:port|proto"
+static void pr_pool_make_key(char* out, size_t cap, const char* host, int port, int proto) {
+    if (!out || cap == 0) return;
+    snprintf(out, cap, "%s:%d|%d", host ? host : "", port, proto);
+}
+// FNV-1a 哈希
+static unsigned pr_pool_hash(const char* key) {
+    unsigned h = 2166136261u;
+    for (; *key; key++) { h ^= (unsigned char)*key; h *= 16777619u; }
+    return h;
+}
+// 定位桶（create=1 时创建新键桶；线性探测解决碰撞）
+static nl_up_pool_bucket_t* pr_pool_bucket(nl_web_upstream_pool_t* p, const char* key, int create) {
+    if (!p || !p->buckets || p->bucket_cap <= 0) return NULL;
+    int start = (int)(pr_pool_hash(key) % (unsigned)p->bucket_cap);
+    for (int i = 0; i < p->bucket_cap; i++) {
+        nl_up_pool_bucket_t* b = &p->buckets[(start + i) % p->bucket_cap];
+        if (b->key[0] == '\0') {
+            if (!create) return NULL;
+            snprintf(b->key, sizeof(b->key), "%s", key);
+            return b;
+        }
+        if (strcmp(b->key, key) == 0) return b;
+    }
+    return NULL;
+}
+// 初始化池
+static void pool_init(nl_web_upstream_pool_t* p, int max_total, int max_per_key, int idle_timeout_ms) {
+    if (!p) return;
+    memset(p, 0, sizeof(*p));
+    p->bucket_cap = 64;
+    p->buckets = (nl_up_pool_bucket_t*)calloc((size_t)p->bucket_cap, sizeof(nl_up_pool_bucket_t));
+    if (!p->buckets) { p->bucket_cap = 0; return; }
+    p->max_total = max_total > 0 ? max_total : 256;
+    p->max_per_key = max_per_key > 0 ? max_per_key : 8;
+    p->idle_timeout_ms = idle_timeout_ms > 0 ? idle_timeout_ms : 30000;
+}
+// 取一条可用上游连接（探测存活，死连接丢弃）；无可用返回 INVALID_SOCKET
+static SOCKET pool_get(nl_web_upstream_pool_t* p, const char* host, int port, int proto) {
+    char key[576];
+    pr_pool_make_key(key, sizeof(key), host, port, proto);
+    nl_up_pool_bucket_t* b = pr_pool_bucket(p, key, 0);
+    if (!b) return INVALID_SOCKET;
+    nl_up_pool_entry_t** pp = &b->head;
+    while (*pp) {
+        nl_up_pool_entry_t* e = *pp;
+        if (pr_pool_probe_alive(e->fd)) {
+            *pp = e->next;
+            SOCKET fd = e->fd;
+            free(e);
+            b->count--; p->total_idle--;
+            return fd;
+        }
+        pr_pool_close_fd(e->fd);       // 死连接：丢弃
+        *pp = e->next;
+        free(e);
+        b->count--; p->total_idle--;
+    }
+    return INVALID_SOCKET;
+}
+// 归还一条上游连接（超全局/单 key 上限则直接关闭）
+static void pool_put(nl_web_upstream_pool_t* p, const char* key, SOCKET fd) {
+    if (fd == INVALID_SOCKET) return;
+    if (!p || !p->buckets || !key || key[0] == '\0' ||
+        p->total_idle >= p->max_total) { pr_pool_close_fd(fd); return; }
+    nl_up_pool_bucket_t* b = pr_pool_bucket(p, key, 1);
+    if (!b || b->count >= p->max_per_key) { pr_pool_close_fd(fd); return; }
+    nl_up_pool_entry_t* e = (nl_up_pool_entry_t*)malloc(sizeof(*e));
+    if (!e) { pr_pool_close_fd(fd); return; }
+    e->fd = fd;
+    e->last_used_ms = pr_pool_now_ms();
+    e->next = b->head;
+    b->head = e;
+    b->count++; p->total_idle++;
+}
+// 回收空闲超时连接
+static void pool_reap(nl_web_upstream_pool_t* p, int64_t now_ms) {
+    if (!p || !p->buckets) return;
+    for (int i = 0; i < p->bucket_cap; i++) {
+        nl_up_pool_bucket_t* b = &p->buckets[i];
+        nl_up_pool_entry_t** pp = &b->head;
+        while (*pp) {
+            nl_up_pool_entry_t* e = *pp;
+            if (now_ms - e->last_used_ms >= p->idle_timeout_ms) {
+                pr_pool_close_fd(e->fd);
+                *pp = e->next;
+                free(e);
+                b->count--; p->total_idle--;
+            } else {
+                pp = &e->next;
+            }
+        }
+    }
+}
+// 销毁池（关闭全部空闲连接）
+static void pool_destroy(nl_web_upstream_pool_t* p) {
+    if (!p) return;
+    if (p->buckets) {
+        for (int i = 0; i < p->bucket_cap; i++) {
+            nl_up_pool_entry_t* e = p->buckets[i].head;
+            while (e) { nl_up_pool_entry_t* n = e->next; pr_pool_close_fd(e->fd); free(e); e = n; }
+            p->buckets[i].head = NULL;
+            p->buckets[i].key[0] = '\0';
+            p->buckets[i].count = 0;
+        }
+        free(p->buckets);
+        p->buckets = NULL;
+    }
+    p->bucket_cap = 0;
+    p->total_idle = 0;
+}
+
 struct nl_web_server {
     int port;
     SOCKET sock;
@@ -1990,10 +2222,24 @@ struct nl_web_server {
     int  pr_count;           // 活跃连接数
     int  pr_free_top;        // 回收栈顶（pr_free[0..pr_free_top] 为空闲槽）
     int  *pr_free;           // 回收栈（存空闲 idx）
+    // ---- 上游 keep-alive 连接池（单线程引擎持有，无需锁）----
+    nl_web_upstream_pool_t* up_pool;  // 空闲上游连接池（NULL=未启用）
+    // 响应 framing 解析（每上游连接一份状态，旁路判定响应是否完整可复用）
+    uint8_t *pr_up_parse;    // [idx] -> 解析状态（见 PR_UP_*）
+    int64_t *pr_up_cl;       // [idx] -> 剩余 Content-Length
+    int64_t *pr_chunk_rem;   // [idx] -> chunk 当前段剩余字节
+    uint8_t *pr_chunk_state; // [idx] -> chunk 子状态（见 PR_CHUNK_*）
+    int     *pr_up_hlen;     // [idx] -> 上游响应头/临时行缓冲已用长度
+    uint8_t *pr_req_is_head; // [idx] -> 客户端请求是否 HEAD（无 body）
+    char   **pr_up_key;      // [idx] -> 池 key（归还时使用，slot 归还即释放）
+    // 上游→客户端方向的延迟写：客户端写慢（send WSAEWOULDBLOCK）时按 slot 缓冲待补发字节
+    char   **pr_up_pend;     // [idx] -> 待补发缓冲（懒分配，PR_PROXY_BUF_SZ）
+    int     *pr_up_pend_len; // [idx] -> 待补发剩余字节数
     HANDLE iocp;             // IOCP 完成端口（NULL=select 回退，非 NULL=IOCP 主路径）
     SOCKET pr_accept_client; // AcceptEx 预创建的备用 client socket
     void*  pr_iocp_client_ctx;  // [cap] 客户端侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
     void*  pr_iocp_up_ctx;      // [cap] 上游侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
+    void*  pr_iocp_cw_ctx;      // [cap] 客户端写侧 OVERLAPPED 上下文（补发上游→客户端余量）
 };
 static struct nl_web_server* g_web_servers = NULL;
 static CRITICAL_SECTION g_web_servers_mutex;
@@ -2100,10 +2346,23 @@ static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route);
 #define PR_ST_ACTIVE  0x80   // 该槽活跃
 #define PR_PROXY_BUF_SZ 65536
 
+// ---- 上游响应 framing 解析状态（旁路判定响应是否完整可复用）----
+#define PR_UP_HDR     0  // 响应头未收全
+#define PR_UP_CL      1  // 按 Content-Length 计 body
+#define PR_UP_CHUNK   2  // Transfer-Encoding: chunked
+#define PR_UP_DONE    3  // 完成，可复用
+#define PR_UP_EOF     4  // 不可复用（body 以 EOF 结束 / Connection: close）
+// ---- chunked 子状态 ----
+#define PR_CHUNK_SIZE    0  // 读 chunk 大小行
+#define PR_CHUNK_DATA    1  // 读 chunk 数据
+#define PR_CHUNK_CRLF    2  // 读 chunk 数据后的 CRLF
+#define PR_CHUNK_TRAILER 3  // 读 trailer / 终止空行
+
 // ---- IOCP 事件类型常量 ----
 #define IOCP_EV_ACCEPT        1  // AcceptEx 完成
 #define IOCP_EV_CLIENT_READ   2  // WSARecv 客户端读完成
 #define IOCP_EV_UPSTREAM_READ 3  // WSARecv 上游读完成
+#define IOCP_EV_CLIENT_WRITE  4  // WSASend 客户端写完成（补发上游→客户端余量）
 #define IOCP_LISTEN_KEY 0xFFFFFFFFUL  // listen socket completion key 哨兵
 
 // IOCP OVERLAPPED 上下文（嵌 OVERLAPPED，每次 WSARecv/AcceptEx 唯一实例）
@@ -2138,14 +2397,204 @@ static void pr_free_slot(nl_web_server_t* s, int idx) {
     if (idx < 0 || idx >= s->pr_cap) return;
     if (s->pr_hbuf[idx])     { free(s->pr_hbuf[idx]);     s->pr_hbuf[idx] = NULL; }
     if (s->pr_hbuf_out[idx]) { free(s->pr_hbuf_out[idx]); s->pr_hbuf_out[idx] = NULL; }
+    if (s->pr_up_key && s->pr_up_key[idx]) { free(s->pr_up_key[idx]); s->pr_up_key[idx] = NULL; }
+    if (s->pr_up_pend && s->pr_up_pend[idx]) { free(s->pr_up_pend[idx]); s->pr_up_pend[idx] = NULL; }
+    if (s->pr_up_pend_len) s->pr_up_pend_len[idx] = 0;
     s->pr_state[idx] = 0;
     s->pr_fd_client[idx]   = INVALID_SOCKET;
     s->pr_fd_upstream[idx] = 0;
     s->pr_route_idx[idx]   = -1;
     if (s->pr_hdr_len) s->pr_hdr_len[idx] = 0;
     if (s->pr_remain)  s->pr_remain[idx]  = 0;
+    if (s->pr_up_parse) s->pr_up_parse[idx] = PR_UP_HDR;
+    if (s->pr_up_cl) s->pr_up_cl[idx] = 0;
+    if (s->pr_chunk_rem) s->pr_chunk_rem[idx] = 0;
+    if (s->pr_chunk_state) s->pr_chunk_state[idx] = 0;
+    if (s->pr_up_hlen) s->pr_up_hlen[idx] = 0;
+    if (s->pr_req_is_head) s->pr_req_is_head[idx] = 0;
     s->pr_free[++(s->pr_free_top)] = idx;
     if (s->pr_count > 0) s->pr_count--;
+}
+
+// 忽略大小写判断 [s, s+n) 是否以 prefix 开头（prefix 为小写字面量）
+static int pr_ci_starts(const char* s, size_t n, const char* prefix) {
+    size_t i = 0;
+    for (; prefix[i]; i++) {
+        if (i >= n) return 0;
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != prefix[i]) return 0;
+    }
+    return 1;
+}
+// 忽略大小写判断 [s, s+n) 是否包含 needle（needle 为小写字面量）
+static int pr_ci_has(const char* s, size_t n, const char* needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0) return 1;
+    if (n < nl) return 0;
+    for (size_t i = 0; i + nl <= n; i++) {
+        size_t j = 0;
+        for (; j < nl; j++) {
+            char c = s[i + j];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != needle[j]) break;
+        }
+        if (j == nl) return 1;
+    }
+    return 0;
+}
+// 在 [s, s+n) 中查找 needle（可移植，替代非标准 memmem）
+static const char* pr_memfind(const char* s, size_t n, const char* needle, size_t nl) {
+    if (nl == 0) return s;
+    if (n < nl) return NULL;
+    for (size_t i = 0; i + nl <= n; i++)
+        if (s[i] == needle[0] && memcmp(s + i, needle, nl) == 0) return s + i;
+    return NULL;
+}
+
+// 解析响应头块，确定 body framing 与是否可复用（结果写入 pr_up_parse 等字段）
+static void pr_up_parse_headers(nl_web_server_t* s, int idx, const char* hdr, int hlen) {
+    const char* end = hdr + hlen;
+    // 状态行：第一个空格后 3 位为状态码
+    int status = 0;
+    const char* sp = (const char*)memchr(hdr, ' ', (size_t)hlen);
+    if (sp && sp + 4 <= end) {
+        status = (sp[1] - '0') * 100 + (sp[2] - '0') * 10 + (sp[3] - '0');
+    }
+    int no_body = (s->pr_req_is_head && s->pr_req_is_head[idx]) ||
+                  (status >= 100 && status < 200) || status == 204 || status == 304;
+    int conn_close = 0;
+    long long cl = -1;
+    int chunked = 0;
+    const char* line = pr_memfind(hdr, (size_t)hlen, "\r\n", 2);
+    if (line) line += 2; else line = end;
+    while (line < end) {
+        const char* le = pr_memfind(line, (size_t)(end - line), "\r\n", 2);
+        if (!le) break;
+        size_t ll = (size_t)(le - line);
+        if (ll == 0) break;
+        if (ll >= 11 && pr_ci_starts(line, ll, "connection:")) {
+            if (pr_ci_has(line + 11, ll - 11, "close")) conn_close = 1;
+        } else if (ll >= 15 && pr_ci_starts(line, ll, "content-length:")) {
+            cl = atoll(line + 15);
+        } else if (ll >= 18 && pr_ci_starts(line, ll, "transfer-encoding:")) {
+            if (pr_ci_has(line + 18, ll - 18, "chunked")) chunked = 1;
+        }
+        line = le + 2;
+    }
+    if (conn_close) { s->pr_up_parse[idx] = PR_UP_EOF; return; }  // 对端将关闭 → 不可复用
+    if (no_body)    { s->pr_up_parse[idx] = PR_UP_DONE; return; } // 无 body → 完成
+    if (cl == 0)    { s->pr_up_parse[idx] = PR_UP_DONE; return; }
+    if (cl > 0) {
+        s->pr_up_cl[idx] = (int64_t)cl;
+        s->pr_up_parse[idx] = PR_UP_CL;
+        return;
+    }
+    if (chunked) {
+        s->pr_chunk_state[idx] = PR_CHUNK_SIZE;
+        s->pr_chunk_rem[idx] = 0;
+        s->pr_up_hlen[idx] = 0;
+        s->pr_up_parse[idx] = PR_UP_CHUNK;
+        return;
+    }
+    // 无 Content-Length 且非 chunked：body 以 EOF 结束 → 不可复用
+    s->pr_up_parse[idx] = PR_UP_EOF;
+}
+
+// 消费 chunked body 字节，推进至终止帧（0\r\n\r\n）后置 PR_UP_DONE
+static void pr_up_parse_chunked(nl_web_server_t* s, int idx, const char* data, size_t* ppos, size_t len) {
+    size_t pos = *ppos;
+    while (pos < len) {
+        uint8_t cs = s->pr_chunk_state[idx];
+        if (cs == PR_CHUNK_SIZE || cs == PR_CHUNK_TRAILER) {
+            // 累积一行到 pr_hbuf_out（临时行缓冲），pr_up_hlen 记长度
+            char* lb = s->pr_hbuf_out[idx];
+            int* ll = &s->pr_up_hlen[idx];
+            while (pos < len) {
+                char c = data[pos++];
+                if (*ll < 8191) lb[(*ll)++] = c;
+                else { s->pr_up_parse[idx] = PR_UP_EOF; *ppos = pos; return; }
+                if (c == '\n') break;
+            }
+            if (*ll > 0 && lb[*ll - 1] == '\n') {
+                int line_len = *ll;
+                while (line_len > 0 && (lb[line_len - 1] == '\n' || lb[line_len - 1] == '\r')) line_len--;
+                if (cs == PR_CHUNK_SIZE) {
+                    long long sz = 0; int ok = 0;
+                    for (int i = 0; i < line_len; i++) {
+                        char c = lb[i];
+                        int d;
+                        if (c == ';') break;                       // chunk 扩展，忽略其后
+                        else if (c >= '0' && c <= '9') d = c - '0';
+                        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                        else if (c == ' ' || c == '\t') { if (!ok) continue; else break; }
+                        else { s->pr_up_parse[idx] = PR_UP_EOF; *ll = 0; *ppos = pos; return; }
+                        sz = sz * 16 + d; ok = 1;
+                    }
+                    *ll = 0;
+                    if (sz == 0) { s->pr_chunk_state[idx] = PR_CHUNK_TRAILER; }
+                    else { s->pr_chunk_rem[idx] = sz; s->pr_chunk_state[idx] = PR_CHUNK_DATA; }
+                } else {
+                    *ll = 0;
+                    if (line_len == 0) { s->pr_up_parse[idx] = PR_UP_DONE; *ppos = pos; return; }
+                }
+            }
+            continue;
+        }
+        if (cs == PR_CHUNK_DATA) {
+            long long take = (long long)(len - pos);
+            if (take > s->pr_chunk_rem[idx]) take = s->pr_chunk_rem[idx];
+            pos += (size_t)take;
+            s->pr_chunk_rem[idx] -= take;
+            if (s->pr_chunk_rem[idx] == 0) { s->pr_chunk_state[idx] = PR_CHUNK_CRLF; s->pr_chunk_rem[idx] = 2; }
+            continue;
+        }
+        if (cs == PR_CHUNK_CRLF) {
+            long long take = (long long)(len - pos);
+            if (take > s->pr_chunk_rem[idx]) take = s->pr_chunk_rem[idx];
+            pos += (size_t)take;
+            s->pr_chunk_rem[idx] -= take;
+            if (s->pr_chunk_rem[idx] == 0) s->pr_chunk_state[idx] = PR_CHUNK_SIZE;
+            continue;
+        }
+        break;
+    }
+    *ppos = pos;
+}
+
+// 旁路解析被转发的上游字节（方向：上游→客户端），判定响应是否完整可复用。
+// 绝不修改 data（转发必须字节级原样）。
+static void pr_parse_upstream_bytes(nl_web_server_t* s, int idx, const char* data, size_t len) {
+    if (!s || !s->pr_up_parse || !s->pr_hbuf_out || !data || len == 0) return;
+    size_t pos = 0;
+    while (pos < len) {
+        uint8_t st = s->pr_up_parse[idx];
+        if (st == PR_UP_DONE || st == PR_UP_EOF) return;  // 终态：停止解析
+        if (st == PR_UP_HDR) {
+            char* hb = s->pr_hbuf_out[idx];
+            int* hl = &s->pr_up_hlen[idx];
+            int found = 0;
+            while (pos < len) {
+                if (*hl >= 8190) { s->pr_up_parse[idx] = PR_UP_EOF; return; }  // 头过大：判不可复用
+                char c = data[pos++];
+                hb[(*hl)++] = c;
+                if (*hl >= 4 && hb[*hl - 4] == '\r' && hb[*hl - 3] == '\n' &&
+                    hb[*hl - 2] == '\r' && hb[*hl - 1] == '\n') { found = 1; break; }
+            }
+            if (found) { pr_up_parse_headers(s, idx, hb, *hl); *hl = 0; }
+            continue;
+        }
+        if (st == PR_UP_CL) {
+            long long rem = s->pr_up_cl[idx];
+            long long take = (long long)(len - pos);
+            if (take >= rem) { pos += (size_t)rem; s->pr_up_cl[idx] = 0; s->pr_up_parse[idx] = PR_UP_DONE; }
+            else { s->pr_up_cl[idx] = rem - take; pos = len; }
+            continue;
+        }
+        if (st == PR_UP_CHUNK) { pr_up_parse_chunked(s, idx, data, &pos, len); continue; }
+        return;
+    }
 }
 
 static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
@@ -2221,7 +2670,7 @@ static int pr_build_upstream_http(nl_web_server_t* s, int idx,
         else total = 0;
     } else {
         total = snprintf(out, out_cap,
-                         "%s %s %s\r\nHost: %s\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: close\r\n",
+                         "%s %s %s\r\nHost: %s\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: keep-alive\r\n",
                          method, path, proto, r->upstream);
         if ((size_t)total >= out_cap) total = (int)out_cap - 1;
         if (raw_hdrs_len > 0 && (size_t)total + raw_hdrs_len < out_cap) {
@@ -2247,19 +2696,36 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
     s->pr_hdr_len     = (int*)calloc((size_t)cap, sizeof(int));
     s->pr_remain      = (int*)calloc((size_t)cap, sizeof(int));
     s->pr_free        = (int*)malloc((size_t)cap * sizeof(int));
+    s->pr_up_parse    = (uint8_t*)calloc((size_t)cap, 1);
+    s->pr_up_cl       = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
+    s->pr_chunk_rem   = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
+    s->pr_chunk_state = (uint8_t*)calloc((size_t)cap, 1);
+    s->pr_up_hlen     = (int*)calloc((size_t)cap, sizeof(int));
+    s->pr_req_is_head = (uint8_t*)calloc((size_t)cap, 1);
+    s->pr_up_key      = (char**)calloc((size_t)cap, sizeof(char*));
+    s->pr_up_pend     = (char**)calloc((size_t)cap, sizeof(char*));
+    s->pr_up_pend_len = (int*)calloc((size_t)cap, sizeof(int));
     for (int i = 0; i < cap; i++) {
         s->pr_fd_client[i]   = INVALID_SOCKET;
         s->pr_fd_upstream[i] = 0;
         s->pr_route_idx[i]   = -1;
+        s->pr_up_parse[i]    = PR_UP_HDR;
         s->pr_free[i] = cap - 1 - i;
     }
     s->pr_free_top = cap - 1;
     s->pr_count = 0;
     if (!s->pr_fd_client || !s->pr_fd_upstream || !s->pr_route_idx ||
         !s->pr_state || !s->pr_hbuf || !s->pr_hbuf_out ||
-        !s->pr_hdr_len || !s->pr_remain || !s->pr_free) {
+        !s->pr_hdr_len || !s->pr_remain || !s->pr_free ||
+        !s->pr_up_parse || !s->pr_up_cl || !s->pr_chunk_rem ||
+        !s->pr_chunk_state || !s->pr_up_hlen || !s->pr_req_is_head || !s->pr_up_key ||
+        !s->pr_up_pend || !s->pr_up_pend_len) {
         goto cleanup_fail;
     }
+    // 初始化上游 keep-alive 连接池（全局空闲 256，单 key 8，空闲 30s 回收）
+    s->up_pool = (nl_web_upstream_pool_t*)malloc(sizeof(nl_web_upstream_pool_t));
+    if (!s->up_pool) goto cleanup_fail;
+    pool_init(s->up_pool, 256, 8, 30000);
 
     // ---- IOCP 完成端口初始化 ----
     s->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
@@ -2273,13 +2739,11 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
     // 预创建 per-slot OVERLAPPED 上下文数组（客户端侧 + 上游侧各 cap 个）
     s->pr_iocp_client_ctx = calloc((size_t)cap, sizeof(pr_iocp_ctx_t));
     s->pr_iocp_up_ctx     = calloc((size_t)cap, sizeof(pr_iocp_ctx_t));
-    if (!s->pr_iocp_client_ctx || !s->pr_iocp_up_ctx) {
+    s->pr_iocp_cw_ctx     = calloc((size_t)cap, sizeof(pr_iocp_ctx_t));
+    if (!s->pr_iocp_client_ctx || !s->pr_iocp_up_ctx || !s->pr_iocp_cw_ctx) {
         windows_log(NL_LOG_ERROR, "IOCP: OVERLAPPED ctx calloc 失败");
         goto cleanup_fail;
     }
-
-    // 上游中转缓冲（每线程栈上一份，所有上游 WSARecv 复用）
-    char pump_buf[PR_PROXY_BUF_SZ];
 
     // 模块级静态 AcceptEx 上下文（AcceptEx 的 OVERLAPPED 必须持续到完成）
     static pr_iocp_ctx_t accept_ctx;
@@ -2303,6 +2767,8 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
         LPOVERLAPPED p_ov = NULL;
         BOOL ok = GetQueuedCompletionStatus(s->iocp, &bytes_trans, &compkey, &p_ov, 200);
         DWORD gle = GetLastError();
+        // 每轮回收空闲超时的池连接
+        pool_reap(s->up_pool, pr_pool_now_ms());
         if (!ok && gle == WAIT_TIMEOUT) continue;   // 空闲退避
         if (!ok || !p_ov) continue;                  // 错误 / 空 OVERLAPPED：跳过
         pr_iocp_ctx_t* ctx = (pr_iocp_ctx_t*)p_ov;
@@ -2322,9 +2788,16 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
                     s->pr_state[idx] = PR_ST_ACTIVE;
                     s->pr_hbuf[idx]     = (char*)malloc(8192);
                     s->pr_hbuf_out[idx] = (char*)malloc(8192);
+                    s->pr_up_key[idx]   = (char*)malloc(576);
                     s->pr_hdr_len[idx]  = 0;
                     s->pr_remain[idx]   = 0;
-                    if (!s->pr_hbuf[idx] || !s->pr_hbuf_out[idx]) {
+                    s->pr_up_parse[idx] = PR_UP_HDR;
+                    s->pr_up_cl[idx]    = 0;
+                    s->pr_chunk_rem[idx] = 0;
+                    s->pr_chunk_state[idx] = 0;
+                    s->pr_up_hlen[idx]  = 0;
+                    s->pr_req_is_head[idx] = 0;
+                    if (!s->pr_hbuf[idx] || !s->pr_hbuf_out[idx] || !s->pr_up_key[idx]) {
                         closesocket(new_client);
                         pr_free_slot(s, idx);
                     } else {
@@ -2408,6 +2881,8 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
                 memcpy(method, hbuf, mlen);
                 memcpy(path, sp1 + 1, plen);
                 memcpy(proto, sp2 + 1, vlen);
+                // HEAD 请求无响应 body，用于响应 framing 判定
+                s->pr_req_is_head[idx] = (strcmp(method, "HEAD") == 0) ? 1 : 0;
                 *hlen = 0;
 
                 int ridx = pr_lookup_route_idx(s, path);
@@ -2473,13 +2948,40 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
                     continue;
                 }
 
-                // ---------- proxy 路由：连上游 ----------
-                SOCKET ufd_new = nl_proxy_connect_upstream(r);
+                // ---------- proxy 路由：优先复用池中 keep-alive 连接 ----------
+                // 解析上游 host:port（供池 key 使用；tcp 不参与池）
+                char up_host[512];
+                int  up_port = 0;
+                {
+                    char up_copy[512];
+                    snprintf(up_copy, sizeof(up_copy), "%s", r->upstream);
+                    char* colon = strrchr(up_copy, ':');
+                    if (colon) { *colon = '\0'; up_port = atoi(colon + 1); snprintf(up_host, sizeof(up_host), "%s", up_copy); }
+                    else { up_port = (r->protocol == NL_PROXY_HTTPS) ? 443 : 80; snprintf(up_host, sizeof(up_host), "%s", up_copy); }
+                    if (up_port <= 0) up_port = (r->protocol == NL_PROXY_HTTPS) ? 443 : 80;
+                }
+                SOCKET ufd_new = INVALID_SOCKET;
+                if (r->protocol != NL_PROXY_TCP) {
+                    ufd_new = pool_get(s->up_pool, up_host, up_port, (int)r->protocol);
+                    if (ufd_new != INVALID_SOCKET) {
+                        // 命中池：重关联到当前 slot（completion key = idx）
+                        CreateIoCompletionPort((HANDLE)ufd_new, s->iocp, (ULONG_PTR)idx, 0);
+                    }
+                }
+                if (ufd_new == INVALID_SOCKET) {
+                    ufd_new = nl_proxy_connect_upstream(r);
+                }
                 if (ufd_new == INVALID_SOCKET) {
                     send_http_error(cfd, 502, "Bad Gateway");
                     closesocket(cfd);
                     pr_free_slot(s, idx);
                     continue;
+                }
+                // 记录池 key（归还时使用）；tcp 置空表示不参与池
+                if (r->protocol != NL_PROXY_TCP) {
+                    pr_pool_make_key(s->pr_up_key[idx], 576, up_host, up_port, (int)r->protocol);
+                } else {
+                    s->pr_up_key[idx][0] = '\0';
                 }
                 // 上游 socket 切非阻塞 + 关联 IOCP
                 u_long nb3 = 1;
@@ -2506,14 +3008,24 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
                 }
 
                 // post 上游 WSARecv（响应回来 → pump 回客户端）
+                // 懒分配 per-slot 上游响应缓冲（pr_up_pend[idx]），替换共享 pump_buf 避免并发竞争
+                if (!s->pr_up_pend[idx]) {
+                    s->pr_up_pend[idx] = (char*)malloc(PR_PROXY_BUF_SZ);
+                    if (!s->pr_up_pend[idx]) {
+                        if (ufd_new > 0) { closesocket(ufd_new); s->pr_fd_upstream[idx] = 0; }
+                        closesocket(cfd); s->pr_fd_client[idx] = INVALID_SOCKET;
+                        pr_free_slot(s, idx);
+                        continue;
+                    }
+                }
                 pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
                 memset(uctx, 0, sizeof(*uctx));
                 uctx->idx = idx;
                 uctx->ev  = IOCP_EV_UPSTREAM_READ;
                 uctx->sock = ufd_new;
-                uctx->buf  = pump_buf;
+                uctx->buf  = s->pr_up_pend[idx];
                 uctx->buflen = PR_PROXY_BUF_SZ;
-                WSABUF wsb_up = {PR_PROXY_BUF_SZ, pump_buf};
+                WSABUF wsb_up = {PR_PROXY_BUF_SZ, s->pr_up_pend[idx]};
                 DWORD flg_up = 0, dummy_up = 0;
                 WSARecv(ufd_new, &wsb_up, 1, &dummy_up, &flg_up, (LPOVERLAPPED)uctx, NULL);
 
@@ -2575,17 +3087,61 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
                 continue;
             }
 
-            // 阻塞 send 回客户端（临时切阻塞）
-            u_long nb_off4 = 0;
-            ioctlsocket(cfd, FIONBIO, &nb_off4);
-            int off3 = 0;
-            while (off3 < nread_up) {
-                int wc2 = send(cfd, pump_buf + off3, nread_up - off3, 0);
-                if (wc2 <= 0) break;
-                off3 += wc2;
+            // 旁路解析本批上游字节（判定响应 framing，不修改转发字节）
+            // 数据已在 per-slot pr_up_pend[idx] 中（WSARecv 直接 recv 到此缓冲）
+            pr_parse_upstream_bytes(s, idx, s->pr_up_pend[idx], (size_t)nread_up);
+
+            // 非阻塞发送回客户端（不回退阻塞，避免客户端写慢卡住引擎线程）
+            int sent = 0, werr = 0;
+            while (sent < nread_up) {
+                int wc2 = send(cfd, s->pr_up_pend[idx] + sent, nread_up - sent, 0);
+                if (wc2 > 0) { sent += wc2; continue; }
+                if (wc2 < 0 && WSAGetLastError() == WSAEWOULDBLOCK) break;  // 写满，走延迟补发
+                werr = 1; break;
             }
-            u_long nb_on3 = 1;
-            ioctlsocket(cfd, FIONBIO, &nb_on3);
+            if (werr) {
+                // 客户端写错误：连接不可用，关闭两端
+                if (ufd > 0) { closesocket(ufd); s->pr_fd_upstream[idx] = 0; }
+                closesocket(cfd); s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                continue;
+            }
+
+            if (sent < nread_up) {
+                // 客户端写慢：剩余数据已在 pr_up_pend[idx][sent..nread_up]，前移后投递 WSASend 继续补发
+                int rem = nread_up - sent;
+                if (rem > PR_PROXY_BUF_SZ) rem = PR_PROXY_BUF_SZ;
+                if (sent > 0)
+                    memmove(s->pr_up_pend[idx], s->pr_up_pend[idx] + sent, (size_t)rem);
+                s->pr_up_pend_len[idx] = rem;
+                pr_iocp_ctx_t* wctx = &((pr_iocp_ctx_t*)s->pr_iocp_cw_ctx)[idx];
+                memset(wctx, 0, sizeof(*wctx));
+                wctx->idx = idx;
+                wctx->ev  = IOCP_EV_CLIENT_WRITE;
+                wctx->sock = cfd;
+                wctx->buf  = s->pr_up_pend[idx];
+                wctx->buflen = (DWORD)rem;
+                WSABUF wsb_w = {(ULONG)rem, s->pr_up_pend[idx]};
+                DWORD wsent = 0, wflg = 0;
+                WSASend(cfd, &wsb_w, 1, &wsent, wflg, (LPOVERLAPPED)wctx, NULL);
+                // 补发期间不 post 上游 WSARecv，避免响应字节乱序
+                continue;
+            }
+
+            // 响应完整且已全部转发给客户端 → 归还上游连接复用，关闭客户端
+            if (s->pr_up_parse[idx] == PR_UP_DONE) {
+                if (s->pr_up_key[idx] && s->pr_up_key[idx][0] != '\0') {
+                    // 归还池（不关闭 socket；IOCP 无显式摘除 API，重关联时更新 key）
+                    pool_put(s->up_pool, s->pr_up_key[idx], ufd);
+                } else {
+                    closesocket(ufd);   // 不参与池（如 tcp）直接关闭
+                }
+                s->pr_fd_upstream[idx] = 0;
+                closesocket(cfd);
+                s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                continue;
+            }
 
             // 继续 post 上游 WSARecv
             if (ufd > 0 && (s->pr_state[idx] & PR_ST_ACTIVE)) {
@@ -2594,11 +3150,73 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
                 uctx->idx = idx;
                 uctx->ev  = IOCP_EV_UPSTREAM_READ;
                 uctx->sock = ufd;
-                uctx->buf  = pump_buf;
+                uctx->buf  = s->pr_up_pend[idx];
                 uctx->buflen = PR_PROXY_BUF_SZ;
-                WSABUF wsb_up2 = {PR_PROXY_BUF_SZ, pump_buf};
+                WSABUF wsb_up2 = {PR_PROXY_BUF_SZ, s->pr_up_pend[idx]};
                 DWORD flg_up2 = 0, dummy_up2 = 0;
                 WSARecv(ufd, &wsb_up2, 1, &dummy_up2, &flg_up2, (LPOVERLAPPED)uctx, NULL);
+            }
+            continue;
+        }
+
+        else if (ctx->ev == IOCP_EV_CLIENT_WRITE) {
+            // ---- 客户端 WSASend 完成 → 继续补发上游→客户端余量 ----
+            SOCKET ufd = s->pr_fd_upstream[idx];
+            int rem = s->pr_up_pend_len[idx];
+            int sent = (int)bytes_trans;
+
+            if (sent <= 0 || !s->pr_up_pend[idx]) {
+                // 客户端写失败/关闭：清理两端
+                s->pr_up_pend_len[idx] = 0;
+                if (ufd > 0) { closesocket(ufd); s->pr_fd_upstream[idx] = 0; }
+                closesocket(cfd); s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                continue;
+            }
+            if (sent < rem) {
+                // 仍有剩余：前移后重新投递 WSASend
+                memmove(s->pr_up_pend[idx], s->pr_up_pend[idx] + sent, (size_t)(rem - sent));
+                s->pr_up_pend_len[idx] = rem - sent;
+                pr_iocp_ctx_t* wctx2 = &((pr_iocp_ctx_t*)s->pr_iocp_cw_ctx)[idx];
+                memset(wctx2, 0, sizeof(*wctx2));
+                wctx2->idx = idx;
+                wctx2->ev  = IOCP_EV_CLIENT_WRITE;
+                wctx2->sock = cfd;
+                wctx2->buf  = s->pr_up_pend[idx];
+                wctx2->buflen = (DWORD)(rem - sent);
+                WSABUF wsb_w2 = {(ULONG)(rem - sent), s->pr_up_pend[idx]};
+                DWORD wsent2 = 0, wflg2 = 0;
+                WSASend(cfd, &wsb_w2, 1, &wsent2, wflg2, (LPOVERLAPPED)wctx2, NULL);
+                continue;
+            }
+
+            // 余量全部补发完成
+            s->pr_up_pend_len[idx] = 0;
+            // 响应完整 → 归还上游连接复用，关闭客户端（与上游读完成分支一致）
+            if (s->pr_up_parse[idx] == PR_UP_DONE) {
+                if (s->pr_up_key[idx] && s->pr_up_key[idx][0] != '\0') {
+                    pool_put(s->up_pool, s->pr_up_key[idx], ufd);
+                } else {
+                    closesocket(ufd);
+                }
+                s->pr_fd_upstream[idx] = 0;
+                closesocket(cfd);
+                s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                continue;
+            }
+            // 响应未完整：继续 post 上游 WSARecv
+            if (ufd > 0 && (s->pr_state[idx] & PR_ST_ACTIVE)) {
+                pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
+                memset(uctx, 0, sizeof(*uctx));
+                uctx->idx = idx;
+                uctx->ev  = IOCP_EV_UPSTREAM_READ;
+                uctx->sock = ufd;
+                uctx->buf  = s->pr_up_pend[idx];
+                uctx->buflen = PR_PROXY_BUF_SZ;
+                WSABUF wsb_up3 = {PR_PROXY_BUF_SZ, s->pr_up_pend[idx]};
+                DWORD flg_up3 = 0, dummy_up3 = 0;
+                WSARecv(ufd, &wsb_up3, 1, &dummy_up3, &flg_up3, (LPOVERLAPPED)uctx, NULL);
             }
             continue;
         }
@@ -2614,9 +3232,13 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
         }
         if (s->pr_hbuf[i])     free(s->pr_hbuf[i]);
         if (s->pr_hbuf_out[i]) free(s->pr_hbuf_out[i]);
+        if (s->pr_up_key && s->pr_up_key[i]) free(s->pr_up_key[i]);
+        if (s->pr_up_pend && s->pr_up_pend[i]) free(s->pr_up_pend[i]);
     }
 
 cleanup_fail:
+    // 销毁上游 keep-alive 连接池（关闭所有空闲连接）
+    if (s->up_pool) { pool_destroy(s->up_pool); free(s->up_pool); s->up_pool = NULL; }
     // IOCP 清理：CloseHandle 会自动取消所有 pending I/O
     if (s->iocp) { CloseHandle(s->iocp); s->iocp = NULL; }
     if (s->pr_accept_client != INVALID_SOCKET) {
@@ -2625,6 +3247,7 @@ cleanup_fail:
     }
     free(s->pr_iocp_client_ctx); s->pr_iocp_client_ctx = NULL;
     free(s->pr_iocp_up_ctx);     s->pr_iocp_up_ctx     = NULL;
+    free(s->pr_iocp_cw_ctx);     s->pr_iocp_cw_ctx     = NULL;
     free(s->pr_fd_client);   s->pr_fd_client   = NULL;
     free(s->pr_fd_upstream); s->pr_fd_upstream = NULL;
     free(s->pr_route_idx);   s->pr_route_idx   = NULL;
@@ -2634,6 +3257,15 @@ cleanup_fail:
     free(s->pr_hdr_len);     s->pr_hdr_len     = NULL;
     free(s->pr_remain);      s->pr_remain      = NULL;
     free(s->pr_free);        s->pr_free        = NULL;
+    free(s->pr_up_parse);    s->pr_up_parse    = NULL;
+    free(s->pr_up_cl);       s->pr_up_cl       = NULL;
+    free(s->pr_chunk_rem);   s->pr_chunk_rem   = NULL;
+    free(s->pr_chunk_state); s->pr_chunk_state = NULL;
+    free(s->pr_up_hlen);     s->pr_up_hlen     = NULL;
+    free(s->pr_req_is_head); s->pr_req_is_head = NULL;
+    free(s->pr_up_key);      s->pr_up_key      = NULL;
+    free(s->pr_up_pend);     s->pr_up_pend     = NULL;
+    free(s->pr_up_pend_len); s->pr_up_pend_len = NULL;
     s->pr_cap = s->pr_count = 0;
 }
 
@@ -3059,6 +3691,7 @@ void nl_web_destroy(nl_web_server_t* server) {
     }
     free(server->pr_iocp_client_ctx); server->pr_iocp_client_ctx = NULL;
     free(server->pr_iocp_up_ctx);     server->pr_iocp_up_ctx     = NULL;
+    free(server->pr_iocp_cw_ctx);     server->pr_iocp_cw_ctx     = NULL;
     free(server->pr_fd_client);   server->pr_fd_client   = NULL;
     free(server->pr_fd_upstream); server->pr_fd_upstream = NULL;
     free(server->pr_route_idx);   server->pr_route_idx   = NULL;
@@ -3068,6 +3701,16 @@ void nl_web_destroy(nl_web_server_t* server) {
     free(server->pr_hdr_len);     server->pr_hdr_len     = NULL;
     free(server->pr_remain);      server->pr_remain      = NULL;
     free(server->pr_free);        server->pr_free        = NULL;
+    free(server->pr_up_parse);    server->pr_up_parse    = NULL;
+    free(server->pr_up_cl);       server->pr_up_cl       = NULL;
+    free(server->pr_chunk_rem);   server->pr_chunk_rem   = NULL;
+    free(server->pr_chunk_state); server->pr_chunk_state = NULL;
+    free(server->pr_up_hlen);     server->pr_up_hlen     = NULL;
+    free(server->pr_req_is_head); server->pr_req_is_head = NULL;
+    free(server->pr_up_key);      server->pr_up_key      = NULL;
+    free(server->pr_up_pend);     server->pr_up_pend     = NULL;
+    free(server->pr_up_pend_len); server->pr_up_pend_len = NULL;
+    if (server->up_pool) { pool_destroy(server->up_pool); free(server->up_pool); server->up_pool = NULL; }
     free(server);
 }
 
@@ -3249,6 +3892,8 @@ void nl_web_stop(nl_web_server_t* server) {
             }
             if (server->pr_hbuf) { free(server->pr_hbuf[i]); server->pr_hbuf[i] = NULL; }
             if (server->pr_hbuf_out) { free(server->pr_hbuf_out[i]); server->pr_hbuf_out[i] = NULL; }
+            if (server->pr_up_key && server->pr_up_key[i]) { free(server->pr_up_key[i]); server->pr_up_key[i] = NULL; }
+            if (server->pr_up_pend && server->pr_up_pend[i]) { free(server->pr_up_pend[i]); server->pr_up_pend[i] = NULL; }
         }
         free(server->pr_fd_client);   server->pr_fd_client   = NULL;
         free(server->pr_fd_upstream); server->pr_fd_upstream = NULL;
@@ -3259,8 +3904,20 @@ void nl_web_stop(nl_web_server_t* server) {
         free(server->pr_hdr_len);     server->pr_hdr_len     = NULL;
         free(server->pr_remain);      server->pr_remain      = NULL;
         free(server->pr_free);        server->pr_free        = NULL;
+        free(server->pr_up_parse);    server->pr_up_parse    = NULL;
+        free(server->pr_up_cl);       server->pr_up_cl       = NULL;
+        free(server->pr_chunk_rem);   server->pr_chunk_rem   = NULL;
+        free(server->pr_chunk_state); server->pr_chunk_state = NULL;
+        free(server->pr_up_hlen);     server->pr_up_hlen     = NULL;
+        free(server->pr_req_is_head); server->pr_req_is_head = NULL;
+        free(server->pr_up_key);      server->pr_up_key      = NULL;
+        free(server->pr_up_pend);     server->pr_up_pend     = NULL;
+        free(server->pr_up_pend_len); server->pr_up_pend_len = NULL;
+        free(server->pr_iocp_cw_ctx); server->pr_iocp_cw_ctx = NULL;
         server->pr_cap = server->pr_count = 0;
     }
+    // 销毁上游 keep-alive 连接池（兜底：正常退出时引擎已自清理）
+    if (server->up_pool) { pool_destroy(server->up_pool); free(server->up_pool); server->up_pool = NULL; }
     
     // 清理 worker 线程（兜底：正常情况下 web_server_thread 内已 join）
     for (int i = 0; i < server->worker_count; i++) {
