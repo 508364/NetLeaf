@@ -30,8 +30,8 @@
   回退原 worker 池，行为不变。
 - **防半包丢数据**：`pr_remain` 记录每方向"已收待发余量"，先补发上次
   `EAGAIN` / `WSAEWOULDBLOCK` 未发完部分再读新数据。
-- **ring 容量按设备动态调整**：Linux/macOS = `逻辑核数 × 64`（[64, 4096]）；
-  Windows = `FD_SETSIZE-2`（[64, 1024]）。
+- **ring 容量按设备动态调整**：三平台统一——`逻辑核数 × 64`（下限 64、上限 4096）。
+  Windows 采用 IOCP 完成端口，**不受 `FD_SETSIZE` 限制**，4096 为工程保护值而非 IOCP 硬上限。
 - **上游协议分流**：`tcp://` 纯字节透传；`http://` / `https://` 重组
   request line + `Host` / `X-Forwarded-For` / `Connection: close` 头并透传
   原始 header / body。

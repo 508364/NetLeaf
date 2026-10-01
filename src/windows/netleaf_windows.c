@@ -2115,10 +2115,9 @@ typedef struct {
     char *buf;       // 读写缓冲（非 OWN，指向 pr_hbuf[idx] / 临时缓冲）
     DWORD buflen;    // 缓冲长度
 } pr_iocp_ctx_t;
-// Windows select 的 FD_SETSIZE 常为 1024，ring 容量必须 ≤ FD_SETSIZE-2
-// （留 listen + 1 给 max_fd+1 语义）。下限 64，上限 FD_SETSIZE-2。
+// IOCP 不受 FD_SETSIZE 限制，与 Linux/macOS 对齐：按逻辑核数 × 64 动态定容
+// 下限 64，上限 4096（工程保护值，IOCP 本身无硬上限）。
 static int nl_web_proxy_ring_capacity(void) {
-    // IOCP 不受 FD_SETSIZE 限制，与 Linux/macOS 对齐：按逻辑核数 × 64 动态定容
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     int cap = (int)si.dwNumberOfProcessors * 64;

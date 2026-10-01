@@ -18,9 +18,6 @@ build*/
 /macoslog
 /winlog
 
-# Third-party libraries (do not commit source code)
-third-party/mbedtls/
-third-party/mbedtls3/
 # stray in-source mbedTLS binary directory (out-of-source builds use build*/mbedtls)
 /mbedtls/
 
