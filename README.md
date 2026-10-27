@@ -580,7 +580,7 @@ ctest --test-dir build --output-on-failure
 
 ## 许可证
 
-MIT License - 详见 [LICENSE](LICENSE) 文件
+BSD 3-Clause License - 详见 [LICENSE](LICENSE) 文件
 
 ## 开源项目来源
 
