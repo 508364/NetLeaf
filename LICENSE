@@ -1,42 +1,38 @@
-================================================================================
-附加署名要求 / Additional Attribution Requirement
+BSD 3-Clause License
 
-中文：
-在 MIT 许可证的条款之上，作者要求：如果您在您的项目或产品中使用、复制或修改本软件，
-您必须在显著位置保留作者的署名
-署名格式需包含以下至少一项：
-- GitHub: 508364
-- Gitee: x508364
-同时，您必须在您的项目中保留本 LICENSE 文件的完整副本
+Copyright (c) 2026, 508364
 
-English:
-In addition to the terms of the MIT License, the author requests that:
-If you use, copy, or modify this software in your project or product,
-you must retain prominent attribution to the author.
-The attribution must include at least one of the following:
-- GitHub: 508364
-- Gitee: x508364
-Additionally, you must include a complete copy of this LICENSE file in your project.
-================================================================================
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
 
-MIT License
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
 
-Copyright (c) 2026 508364
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+
+Additional Clause:
+
+In any redistribution or derivative work, the source of this software
+and the original author’s license notice shall be clearly stated in
+the accompanying documentation, including but not limited to README
+files, user manuals, about pages, help pages, or other visible
+documentation. The existence of this project shall not be excessively
+downplayed, obscured, or otherwise unduly minimized.
