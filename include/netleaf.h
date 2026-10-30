@@ -857,6 +857,38 @@ NL_API void nl_web_stop(nl_web_server_t* server);
 NL_API int nl_web_set_worker_count(nl_web_server_t* server, int target);
 
 /**
+ * @brief P6: Set the number of epoll engine instances (SO_REUSEPORT).
+ * @details 0 = auto (single instance); > 1 enables multi-instance with
+ *          SO_REUSEPORT listen-socket sharing for kernel-level load balancing.
+ *          Values > 128 are capped. Apply before nl_web_start.
+ *          Linux only; other platforms fall back to single instance.
+ */
+NL_API int nl_web_set_engine_threads(nl_web_server_t* server, int n);
+
+/**
+ * @brief P6: Set the total connection budget across all engine instances.
+ * @details 0 = auto (ncpu*64). Divided evenly by engine_count.
+ *          Apply before nl_web_start.
+ */
+NL_API int nl_web_set_max_conns(nl_web_server_t* server, int total);
+
+/**
+ * @brief P7: Set idle connection timeout in milliseconds (slowloris defense).
+ * @details 0 or negative = default 30000 ms (30 s). Connections idle longer
+ *          than this are reclaimed by the engine event loop.
+ *          Apply before nl_web_start.
+ */
+NL_API int nl_web_set_idle_timeout(nl_web_server_t* server, int ms);
+
+/**
+ * @brief P5: Force fallback to legacy worker pool instead of the epoll engine.
+ * @details enable=1 keeps the old worker-pool code path; enable=0 (default)
+ *          uses the epoll data-driven engine. Transition switch for rollback.
+ *          Apply before nl_web_start.
+ */
+NL_API int nl_web_force_legacy_pool(nl_web_server_t* server, int enable);
+
+/**
  * @brief Add a route to web server
  */
 NL_API int nl_web_add_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type);

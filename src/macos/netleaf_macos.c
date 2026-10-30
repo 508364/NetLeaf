@@ -2031,6 +2031,11 @@ struct nl_web_server {
     int     *pr_up_hlen;     // [idx] -> 上游响应头/临时行缓冲已用长度
     uint8_t *pr_req_is_head; // [idx] -> 客户端请求是否 HEAD（无 body）
     char   **pr_up_key;      // [idx] -> 池 key（归还时使用，slot 归还即释放）
+    // P6/P7 配置字段（与 Linux 对齐；kqueue 引擎暂不启用多实例，仅记字段不生效）
+    int engine_threads_cfg;   // P6: 引擎实例数（0=自动单实例；Linux SO_REUSEPORT）
+    int max_conns_cfg;        // P6: 总连接预算（0=自动 ncpu*64）
+    int idle_timeout_ms;      // P7: 空闲超时 ms（0=默认 30000）
+    int force_legacy_pool;    // P5: 强制走 legacy worker 池（0=默认引擎）
 };
 
 static struct nl_web_server* g_web_servers = NULL;
@@ -3291,7 +3296,8 @@ int nl_web_start(nl_web_server_t* server) {
     server->running = 1;
 
     // 检测是否存在 proxy 路由：有则走 kqueue 数据驱动引擎（单线程泵 N 条连接），
-    // 否则回退到 worker 池（兼容旧行为：static/content/redirect/file 路由）
+    // 否则回退到 worker 池（兼容旧行为：static/content/redirect/file 路由）。
+    // P5: force_legacy_pool=1 强制走 worker 池（回退开关）
     int has_proxy = 0;
     {
         pthread_mutex_lock(&server->mutex);
@@ -3299,6 +3305,7 @@ int nl_web_start(nl_web_server_t* server) {
             if (r->type == NL_ROUTE_TYPE_PROXY) { has_proxy = 1; break; }
         pthread_mutex_unlock(&server->mutex);
     }
+    if (server->force_legacy_pool) has_proxy = 0;
 
     if (has_proxy) {
         // 数据驱动引擎：kqueue 多路复用，单线程，极低占用（非阻塞 fd + 1s 空闲退避）
@@ -3328,6 +3335,38 @@ int nl_web_set_worker_count(nl_web_server_t* server, int target) {
     if (target < 0) target = 0;
     if (target > 64) target = 64;
     server->worker_count = target;
+    return 0;
+}
+
+// P6: 引擎实例数。macOS kqueue 引擎暂不支持多实例，仅记字段不生效。
+int nl_web_set_engine_threads(nl_web_server_t* server, int n) {
+    if (!server) return -1;
+    if (n < 0) n = 0;
+    if (n > 128) n = 128;
+    server->engine_threads_cfg = n;
+    return 0;
+}
+
+// P6: 总连接预算。macOS kqueue 引擎暂不支持，仅记字段不生效。
+int nl_web_set_max_conns(nl_web_server_t* server, int total) {
+    if (!server) return -1;
+    if (total < 0) total = 0;
+    server->max_conns_cfg = total;
+    return 0;
+}
+
+// P7: 空闲超时。macOS kqueue 引擎暂不实现扫描，仅记字段不生效。
+int nl_web_set_idle_timeout(nl_web_server_t* server, int ms) {
+    if (!server) return -1;
+    if (ms < 0) ms = 0;
+    server->idle_timeout_ms = ms;
+    return 0;
+}
+
+// P5: 强制 legacy worker 池。macOS kqueue 引擎支持 force_legacy_pool 回退。
+int nl_web_force_legacy_pool(nl_web_server_t* server, int enable) {
+    if (!server) return -1;
+    server->force_legacy_pool = enable ? 1 : 0;
     return 0;
 }
 

@@ -32,6 +32,7 @@ target_include_directories(netleaf_quictls PUBLIC
 
 target_compile_definitions(netleaf_quictls PRIVATE
     NL_QUICTLS_EXPORTS
+    NLH3_DBG
 )
 
 target_link_libraries(netleaf_quictls PRIVATE

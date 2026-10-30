@@ -128,6 +128,11 @@ NL_QUICTLS_API uint64_t nl_quic_pn_decode(uint64_t largest_pn, uint64_t truncate
 /* 首部保护解除（自动读取 pn_len，去掉固定 pn_len=1 限制）与 AEAD 解密（分离式，供 QUIC 包解析） */
 NL_QUICTLS_API int nl_quic_hp_unprotect(const nl_quic_keys_t* keys, uint8_t* pkt, size_t pn_offset,
                                         int long_header, size_t total_len, size_t* out_pn_len);
+/* 带 length 一致性校验的 HP 解除（RFC 9001 §5.4.1：b0 的 pn_len 位被 HP 掩码覆盖，
+ * 需用包头 length 逐候选 pn_len 校验；length==0 退化为仅采样，供短首/自测使用） */
+NL_QUICTLS_API int nl_quic_hp_unprotect_len(const nl_quic_keys_t* keys, uint8_t* pkt, size_t pn_offset,
+                                             int long_header, size_t total_len, uint64_t length,
+                                             size_t* out_pn_len);
 NL_QUICTLS_API int nl_quic_unprotect_payload(const nl_quic_keys_t* keys, uint64_t pn,
                                              uint8_t* pkt, size_t pn_offset, size_t pn_len,
                                              size_t ct_len, size_t* plaintext_len);
@@ -327,9 +332,9 @@ NL_QUICTLS_API int nl_tls13_parse_handshake(const uint8_t* data, size_t len,
                                             uint8_t* msg_type,
                                             const uint8_t** body, size_t* body_len,
                                             size_t* consumed);
-/* 握手消息类型（RFC 8446 §4） */
-#define NL_TLS13_HS_CLIENT_HELLO        1
-#define NL_TLS13_HS_SERVER_HELLO        2
+/* 握手消息类型（RFC 8446 §4.4） */
+#define NL_TLS13_HS_CLIENT_HELLO          1
+#define NL_TLS13_HS_SERVER_HELLO          2
 #define NL_TLS13_HS_ENCRYPTED_EXTENSIONS 8
 #define NL_TLS13_HS_CERTIFICATE         11
 #define NL_TLS13_HS_CERTIFICATE_VERIFY  15
@@ -370,16 +375,31 @@ NL_QUICTLS_API const char* nl_tls13_conn_alpn(const nl_tls13_conn_t* c);
 NL_QUICTLS_API int nl_tls13_conn_get_1rtt_keys(const nl_tls13_conn_t* c,
                                                nl_quic_keys_t* read_keys,
                                                nl_quic_keys_t* write_keys);
+/* 1-RTT 密钥 peek（不检查 established；server_handshake 内已派生 read1/write1，
+ * 用于 2a 分支在 client Finished 之前解密 client 的 1-RTT 长首包） */
+NL_QUICTLS_API int nl_tls13_conn_peek_1rtt_keys(const nl_tls13_conn_t* c,
+                                                nl_quic_keys_t* read_keys,
+                                                nl_quic_keys_t* write_keys);
 /* 取握手级密钥（QUIC Handshake 包用） */
 NL_QUICTLS_API int nl_tls13_conn_get_handshake_keys(const nl_tls13_conn_t* c,
                                                     nl_quic_keys_t* read_keys,
                                                     nl_quic_keys_t* write_keys);
+/* 服务端 1-RTT CRYPTO（FINISHED）消息：verify_data = finished_verify_data(
+ * finished_key(s_hs), Hash(transcript-so-far))，与 nl_tls13_server_handshake 已发
+ * FINISHED 一致。供 C 服务端在 2b/fallback 处理完 client Finished 后，把服务端
+ * FINISHED 用 CRYPTO 帧装进 1-RTT 短首包发给客户端（aioquic 据此进 1-RTT 发 H3 数据）。 */
+NL_QUICTLS_API int nl_tls13_server_finished_msg(const nl_tls13_conn_t* c,
+                                                uint8_t* out, size_t cap, size_t* out_len);
 
 /* 证书与认证（ECDSA P-256 / ecdsa_secp256r1_sha256 = 0x0403） */
 NL_QUICTLS_API int nl_tls13_conn_set_cert(nl_tls13_conn_t* c,
                                           const char* cert_pem, const char* key_pem);
 NL_QUICTLS_API int nl_tls13_conn_set_ca(nl_tls13_conn_t* c, const char* ca_pem);
 NL_QUICTLS_API int nl_tls13_conn_peer_verified(const nl_tls13_conn_t* c);
+/* 注入客户端 ODCID（initial_source_connection_id），服务端在
+ * nl_tls13_server_handshake 前调用，用于填充 0x00 传输参数 */
+NL_QUICTLS_API void nl_tls13_conn_set_odcid(nl_tls13_conn_t* c,
+                                            const uint8_t* odcid, size_t len);
 /* 生成自签 P-256 证书 + 私钥（PEM，测试/示例用） */
 NL_QUICTLS_API int nl_tls13_gen_self_signed(char* cert_pem, size_t cert_cap,
                                             char* key_pem, size_t key_cap);

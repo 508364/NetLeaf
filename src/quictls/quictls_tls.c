@@ -12,6 +12,7 @@
 #include "quictls_internal.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
@@ -53,34 +54,55 @@ int nl_tls13_handshake_secrets(const uint8_t* ecdhe, size_t ecdhe_len,
     uint8_t zero[NL_TLS13_HASH_LEN];
     memset(zero, 0, sizeof(zero));
 
-    /* Early Secret = HKDF-Extract(0, 0)（无 PSK） */
+    /* Early Secret = HKDF-Extract(zero_salt, empty_ikm)（无 PSK，RFC 8446 §7.1）
+     * ikm 为空串（长度 0），不是 32 字节零；用 zero 指针替代 NULL 以确保 mbedTLS 安全 */
     uint8_t early[NL_TLS13_HASH_LEN];
-    if (nl_quic__hkdf_extract(zero, sizeof(zero), zero, sizeof(zero), early) != 0) return -1;
+    if (nl_quic__hkdf_extract(zero, sizeof(zero), zero, 0, early) != 0) return -1;
 
-    uint8_t empty_hash[NL_TLS13_HASH_LEN];
-    if (nl_tls13_sha256(NULL, 0, empty_hash) != 0) return -1;
-
-    /* derived = Derive-Secret(Early, "derived", "") */
+    /* derived1 = Derive-Secret(early, "derived", "")（RFC 8446 §7.1：context 为空串，context_len=0） */
     uint8_t derived1[NL_TLS13_HASH_LEN];
     if (nl_quic__expand_label(early, sizeof(early), "derived",
-                              empty_hash, sizeof(empty_hash), derived1, sizeof(derived1)) != 0) return -1;
+                              NULL, 0, derived1, sizeof(derived1)) != 0) return -1;
 
-    /* Handshake Secret = HKDF-Extract(derived, ECDHE) */
+    /* Handshake Secret = HKDF-Extract(derived1, ECDHE) */
     uint8_t hs[NL_TLS13_HASH_LEN];
     if (nl_quic__hkdf_extract(derived1, sizeof(derived1), ecdhe, ecdhe_len, hs) != 0) return -1;
+
+    /* dump 中间量：early / derived1 / hs / ecdhe 供 Python 逐层对比 */
+    {
+        FILE* fmid = fopen("f:/C-C++/NetLeaf/build_win/dump/srv_hs_midstages.txt", "w");
+        if (fmid) {
+            fprintf(fmid, "early=");
+            for (int i = 0; i < 32; i++) fprintf(fmid, "%02x", early[i]);
+            fprintf(fmid, "\nderived1=");
+            for (int i = 0; i < 32; i++) fprintf(fmid, "%02x", derived1[i]);
+            fprintf(fmid, "\nhs_secret=");
+            for (int i = 0; i < 32; i++) fprintf(fmid, "%02x", hs[i]);
+            fprintf(fmid, "\necdhe_len=%zu\necdhe=", ecdhe_len);
+            for (size_t i = 0; i < ecdhe_len; i++) fprintf(fmid, "%02x", ecdhe[i]);
+            fprintf(fmid, "\nth_ch_sh=");
+            for (int i = 0; i < (int)th_len; i++) fprintf(fmid, "%02x", th_ch_sh[i]);
+            fprintf(fmid, "\nc_hs=");
+            for (int i = 0; i < 32; i++) fprintf(fmid, "%02x", c_hs[i]);
+            fprintf(fmid, "\ns_hs=");
+            for (int i = 0; i < 32; i++) fprintf(fmid, "%02x", s_hs[i]);
+            fprintf(fmid, "\n");
+            fclose(fmid);
+        }
+    }
 
     if (nl_quic__expand_label(hs, sizeof(hs), "c hs traffic", th_ch_sh, th_len,
                               c_hs, NL_TLS13_SECRET_LEN) != 0) return -1;
     if (nl_quic__expand_label(hs, sizeof(hs), "s hs traffic", th_ch_sh, th_len,
                               s_hs, NL_TLS13_SECRET_LEN) != 0) return -1;
 
-    /* derived2 = Derive-Secret(Handshake, "derived", "") */
+    /* derived2 = Derive-Secret(hs, "derived", "")（RFC 8446 §7.1：context 为空串，context_len=0） */
     uint8_t derived2[NL_TLS13_HASH_LEN];
     if (nl_quic__expand_label(hs, sizeof(hs), "derived",
-                              empty_hash, sizeof(empty_hash), derived2, sizeof(derived2)) != 0) return -1;
+                              NULL, 0, derived2, sizeof(derived2)) != 0) return -1;
 
-    /* Master Secret = HKDF-Extract(derived2, 0) */
-    if (nl_quic__hkdf_extract(derived2, sizeof(derived2), zero, sizeof(zero), master) != 0) return -1;
+    /* Master Secret = HKDF-Extract(derived2, empty_ikm)（RFC 8446 §7.1） */
+    if (nl_quic__hkdf_extract(derived2, sizeof(derived2), zero, 0, master) != 0) return -1;
     return 0;
 }
 
@@ -110,10 +132,10 @@ int nl_tls13_secret_to_quic_keys(const uint8_t* secret, size_t secret_len,
         default:                                      kl = 16; chacha = 0; break;
     }
 
-    if (nl_quic__expand_label(secret, secret_len, "quic key", NULL, 0, out->key, kl) != 0) return -1;
+    if (nl_quic__expand_label_quic_pub(secret, secret_len, "quic key", NULL, 0, out->key, kl) != 0) return -1;
     out->key_len = kl;
-    if (nl_quic__expand_label(secret, secret_len, "quic iv", NULL, 0, out->iv, NL_QUIC_IV_LEN) != 0) return -1;
-    if (nl_quic__expand_label(secret, secret_len, "quic hp", NULL, 0, out->hp, kl) != 0) return -1;
+    if (nl_quic__expand_label_quic_pub(secret, secret_len, "quic iv", NULL, 0, out->iv, NL_QUIC_IV_LEN) != 0) return -1;
+    if (nl_quic__expand_label_quic_pub(secret, secret_len, "quic hp", NULL, 0, out->hp, kl) != 0) return -1;
     out->hp_len = kl;
     out->is_chacha = chacha;
     return 0;

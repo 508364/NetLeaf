@@ -2240,6 +2240,11 @@ struct nl_web_server {
     void*  pr_iocp_client_ctx;  // [cap] 客户端侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
     void*  pr_iocp_up_ctx;      // [cap] 上游侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
     void*  pr_iocp_cw_ctx;      // [cap] 客户端写侧 OVERLAPPED 上下文（补发上游→客户端余量）
+    // P6/P7 配置字段（与 Linux 对齐；Windows IOCP 引擎暂不启用多实例，仅记字段不生效）
+    int engine_threads_cfg;   // P6: 引擎实例数（0=自动单实例；Linux SO_REUSEPORT）
+    int max_conns_cfg;        // P6: 总连接预算（0=自动 ncpu*64）
+    int idle_timeout_ms;      // P7: 空闲超时 ms（0=默认 30000）
+    int force_legacy_pool;    // P5: 强制走 legacy worker 池（0=默认引擎）
 };
 static struct nl_web_server* g_web_servers = NULL;
 static CRITICAL_SECTION g_web_servers_mutex;
@@ -3744,11 +3749,13 @@ int nl_web_start(nl_web_server_t* server) {
     server->running = 1;
     // 数据驱动检测：是否存在反向代理路由，有则起 select 多路复用引擎（单线程泵 N 连接），
     // 否则回退 worker 池。
+    // P5: force_legacy_pool=1 强制走 worker 池（回退开关）
     int has_proxy = 0;
     EnterCriticalSection(&server->mutex);
     for (nl_web_route_t* r = server->routes; r; r = r->next)
         if (r->type == NL_ROUTE_TYPE_PROXY) { has_proxy = 1; break; }
     LeaveCriticalSection(&server->mutex);
+    if (server->force_legacy_pool) has_proxy = 0;
     if (has_proxy) {
         server->thread = CreateThread(NULL, 0, nl_web_proxy_engine_thread, server, 0, NULL);
         if (!server->thread) {
@@ -3794,6 +3801,38 @@ int nl_web_set_worker_count(nl_web_server_t* server, int target) {
     if (target < 0) target = 0;
     if (target > 64) target = 64;
     server->worker_count = target;
+    return NL_OK;
+}
+
+// P6: 引擎实例数。Windows IOCP 引擎暂不支持多实例，仅记字段不生效。
+int nl_web_set_engine_threads(nl_web_server_t* server, int n) {
+    if (!server) return NL_ERROR;
+    if (n < 0) n = 0;
+    if (n > 128) n = 128;
+    server->engine_threads_cfg = n;
+    return NL_OK;
+}
+
+// P6: 总连接预算。Windows IOCP 引擎暂不支持，仅记字段不生效。
+int nl_web_set_max_conns(nl_web_server_t* server, int total) {
+    if (!server) return NL_ERROR;
+    if (total < 0) total = 0;
+    server->max_conns_cfg = total;
+    return NL_OK;
+}
+
+// P7: 空闲超时。Windows IOCP 引擎暂不实现扫描，仅记字段不生效。
+int nl_web_set_idle_timeout(nl_web_server_t* server, int ms) {
+    if (!server) return NL_ERROR;
+    if (ms < 0) ms = 0;
+    server->idle_timeout_ms = ms;
+    return NL_OK;
+}
+
+// P5: 强制 legacy worker 池。
+int nl_web_force_legacy_pool(nl_web_server_t* server, int enable) {
+    if (!server) return NL_ERROR;
+    server->force_legacy_pool = enable ? 1 : 0;
     return NL_OK;
 }
 

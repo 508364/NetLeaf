@@ -2117,6 +2117,56 @@ static void pool_destroy(nl_web_upstream_pool_t* p) {
     p->total_idle = 0;
 }
 
+/* ------------------------------------------------------------------
+ * P1: nl_web_engine_t 子结构（第107轮设计）
+ * 把现有 pr_* 数组 + epfd 封装为独立引擎实例，
+ * server 持有 engines[N]，单实例先跑通，后续扩展为 SO_REUSEPORT 多实例。
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int      epfd;              // epoll fd（-1=未启用）
+    int      sock;              // 本实例监听 socket
+    int      cap;               // ring 容量（按核数动态定，上限 4096）
+    int      count;             // 当前活动 proxy 连接数
+    int      free_top;          // 回收栈顶（O(1) 取 free slot）
+    int*     free;             // 回收栈（int 数组，存空闲 idx）
+    // per-slot 数组（与 ring 对齐）
+    int*     pr_fd_client;     // [idx] -> 客户端 fd
+    int*     pr_fd_upstream;   // [idx] -> 上游 fd（0=未连接）
+    int*     pr_route_idx;     // [idx] -> 该连接对应 route 在 server->routes 的下标
+    void**   pr_route_ptr;     // [idx] -> 该连接命中的 route 指针（P5 热路径锁竞争优化：accept 时缓存，后续不再拿 s->mutex 遍历路由表）
+    uint8_t* pr_state;         // [idx] -> 状态位（bit0 方向 / bit3 EOF / bit7 活跃）
+    char**   pr_hbuf;          // [idx] -> 每连接 8KB 首包缓冲
+    char**   pr_hbuf_out;      // [idx] -> 每连接 8KB 上游请求构造缓冲
+    char**   pr_up_buf;        // [idx] -> 每连接 64KB 上游响应→客户端方向缓冲
+    int*     pr_hdr_len;       // [idx] -> 当前连接已收到的请求头累计字节数
+    int*     pr_remain;        // [idx] -> 该方向已收待发的剩余字节数
+    // 上游 keep-alive 连接池（单线程引擎持有，无需锁）
+    nl_web_upstream_pool_t* up_pool;
+    // 响应 framing 解析（每上游连接一份状态，旁路判定响应是否完整可复用）
+    uint8_t*  pr_up_parse;     // [idx] -> 解析状态（见 PR_UP_*）
+    int64_t*  pr_up_cl;        // [idx] -> 剩余 Content-Length
+    int64_t*  pr_chunk_rem;   // [idx] -> chunk 当前段剩余字节
+    uint8_t*  pr_chunk_state; // [idx] -> chunk 子状态（见 PR_CHUNK_*）
+    int*      pr_up_hlen;     // [idx] -> 上游响应头/临时行缓冲已用长度
+    uint8_t*  pr_req_is_head; // [idx] -> 客户端请求是否 HEAD（无 body）
+    char**    pr_up_key;      // [idx] -> 池 key（归还时使用，slot 归还即释放）
+    // ---- P2: 全异步输出（替代"临时切阻塞"）----
+    uint8_t*  pr_role;        // [idx] -> ROLE_LOCAL / ROLE_PROXY
+    uint8_t*  pr_phase;       // [idx] -> 状态机阶段（见 PR_PHASE_*）
+    char**    pr_outbuf;      // [idx] -> 本地响应输出缓冲（头+body 当前块）
+    int*      pr_out_len;     // [idx] -> outbuf 有效长度
+    int*      pr_out_off;     // [idx] -> 已发出偏移
+    void**    pr_body_src;    // [idx] -> 当前读取位置（BODY_FILE 时指向 FILE*）
+    int64_t*  pr_body_remain; // [idx] -> body 剩余字节数
+    uint8_t*  pr_body_kind;   // [idx] -> BODY_MEM / BODY_FILE / BODY_NONE
+    // P4: chunked 编码（未知长度动态内容边生成边发）
+    uint8_t*  pr_use_chunked; // [idx] -> 是否 chunked 分块发送（每块 %x\r\n 前缀 + 末尾 0\r\n\r\n）
+    // P7: 空闲超时（slowloris 防护）
+    int64_t*  pr_last_active_ms; // [idx] -> 最后活跃时间（ms，clock_gettime(CLOCK_MONOTONIC)）
+    // 回指针
+    nl_web_server_t* server;
+} nl_web_engine_t;
+
 struct nl_web_server {
     int port;
     int sock;
@@ -2140,32 +2190,18 @@ struct nl_web_server {
     int route_hash_size;
     int route_hash_count;
     // 数据驱动反向代理引擎（epoll 多路复用 + ring buffer 状态表）：
-    // 不为每个连接建对象，状态编码为 8 位无状态字节 + fd 映射整数数组。
-    // 单线程 epoll_wait 驱动 N 条 proxy 连接，彻底摆脱"并发≈worker 数"。
-    int  epfd;              // epoll fd（-1=未启用）
-    int *pr_fd_client;     // [idx] -> 客户端 fd（占位，真正驱动靠 event.data.u32）
-    int *pr_fd_upstream;   // [idx] -> 上游 fd（0=未连接）
-    int *pr_route_idx;     // [idx] -> 该连接对应 route 在 server->routes 链表的下标
-    uint8_t *pr_state;     // [idx] -> 无状态状态位（bit0 方向 / bit3 EOF / bit7 活跃）
-    char** pr_hbuf;        // [idx] -> 每连接 8KB 首包缓冲（活跃时 malloc，归还即 free）
-    char** pr_hbuf_out;    // [idx] -> 每连接 8KB 上游请求构造缓冲（与 pr_hbuf 对称）
-    char** pr_up_buf;      // [idx] -> 每连接 64KB 上游响应→客户端方向缓冲（替共享 pump_buf）
-    int *pr_hdr_len;       // [idx] -> 当前连接已收到的请求头累计字节数
-    int *pr_remain;       // [idx] -> 该方向已收待发的剩余字节数（0=全部发完）
-    int  pr_cap;           // ring 容量（按核数动态定，上限 4096）
-    int  pr_count;         // 当前活动 proxy 连接数
-    int  pr_free_top;      // 回收栈顶（O(1) 取 free slot）
-    int *pr_free;          // 回收栈（int 数组，存空闲 idx）
-    // ---- 上游 keep-alive 连接池（单线程引擎持有，无需锁）----
-    nl_web_upstream_pool_t* up_pool;  // 空闲上游连接池（NULL=未启用）
-    // 响应 framing 解析（每上游连接一份状态，旁路判定响应是否完整可复用）
-    uint8_t *pr_up_parse;    // [idx] -> 解析状态（见 PR_UP_*）
-    int64_t *pr_up_cl;       // [idx] -> 剩余 Content-Length
-    int64_t *pr_chunk_rem;   // [idx] -> chunk 当前段剩余字节
-    uint8_t *pr_chunk_state; // [idx] -> chunk 子状态（见 PR_CHUNK_*）
-    int     *pr_up_hlen;     // [idx] -> 上游响应头/临时行缓冲已用长度
-    uint8_t *pr_req_is_head; // [idx] -> 客户端请求是否 HEAD（无 body）
-    char   **pr_up_key;      // [idx] -> 池 key（归还时使用，slot 归还即释放）
+    // P1: 抽取为 nl_web_engine_t 子结构，server 持有 engines[N]
+    // P6: SO_REUSEPORT 多实例（N 线程各自独占一条 ring，内核按四元组哈希分派连接）
+    nl_web_engine_t* engines;   // 引擎实例数组（P6：[N]，N=engine_count）
+    int engine_count;           // 引擎实例数（P1=1，P6=N）
+    int* engine_slots;          // [engine_idx] -> 当前活动连接数（统计用）
+    pthread_t* engine_threads;  // P6: [engine_count] 引擎线程句柄（多实例时各线程 join）
+    int engine_threads_ready;   // P6: 已就绪线程数（用于优雅关闭前等待）
+    // P6/P7 配置
+    int engine_threads_cfg;     // P6: 引擎线程数（0=自动=逻辑核数；1=单实例）
+    int max_conns_cfg;          // P6: 总连接预算（0=自动=ncpu*64；按 N 均分到每实例 ring cap）
+    int idle_timeout_ms;        // P7: 空闲超时（ms），防 slowloris；0=默认 30s
+    int force_legacy_pool;      // P5: 回退 legacy worker 池开关（1=旧行为，默认 0=引擎）
 };
 
 // 数据驱动 ring 容量：按"逻辑核数 × 64"动态定，1 核=64、8 核=512、16 核=1024，
@@ -2371,35 +2407,70 @@ static int nl_proxy_connect_upstream(const nl_web_route_t* route) {
 #define PR_CHUNK_CRLF    2  // 读 chunk 数据后的 CRLF
 #define PR_CHUNK_TRAILER 3  // 读 trailer / 终止空行
 
+// ---- P2: 全异步输出状态机 ----
+// 角色：本地服务 vs 代理转发
+#define PR_ROLE_LOCAL  0
+#define PR_ROLE_PROXY  1
+// 状态机阶段（uint8）
+#define PR_PHASE_READ_REQ     0  // 读请求头（首包~到 \n）
+#define PR_PHASE_DISPATCH     1  // 已解析首行，路由查找
+#define PR_PHASE_SERVE_OUT    2  // 本地响应发送中（outbuf 未发完）
+#define PR_PHASE_SERVE_FILE   3  // 本地文件流式发送中（fread 块推进）
+#define PR_PHASE_PROXY_CONN   4  // 上游已连接，等待可写/收响应
+#define PR_PHASE_PROXY_PUMP   5  // 上游 pump 双向透传（已实现）
+// body 来源类型
+#define PR_BODY_NONE  0
+#define PR_BODY_MEM   1  // 内存内容（content 路由）
+#define PR_BODY_FILE  2  // 文件流式（file 路由，fread 块）
+
 // 给 proxy 连接分配 ring 槽（O(1) 取回收栈顶），失败返回 -1
-static int pr_alloc_slot(nl_web_server_t* s) {
-    if (s->pr_count >= s->pr_cap || s->pr_free_top < 0) return -1;
-    int idx = s->pr_free[s->pr_free_top--];
-    s->pr_count++;
+static int pr_alloc_slot(nl_web_engine_t* eng) {
+    if (eng->count >= eng->cap || eng->free_top < 0) return -1;
+    int idx = eng->free[eng->free_top--];
+    eng->count++;
     return idx;
 }
 
 // 归还 ring 槽
-static void pr_free_slot(nl_web_server_t* s, int idx) {
-    if (idx < 0 || idx >= s->pr_cap) return;
-    if (s->pr_hbuf[idx])     { free(s->pr_hbuf[idx]);     s->pr_hbuf[idx] = NULL; }
-    if (s->pr_hbuf_out[idx]) { free(s->pr_hbuf_out[idx]); s->pr_hbuf_out[idx] = NULL; }
-    if (s->pr_up_buf[idx])   { free(s->pr_up_buf[idx]);   s->pr_up_buf[idx] = NULL; }
-    if (s->pr_up_key && s->pr_up_key[idx]) { free(s->pr_up_key[idx]); s->pr_up_key[idx] = NULL; }
-    s->pr_state[idx] = 0;
-    s->pr_fd_client[idx] = -1;
-    s->pr_fd_upstream[idx] = 0;
-    s->pr_route_idx[idx] = -1;
-    if (s->pr_hdr_len) s->pr_hdr_len[idx] = 0;
-    if (s->pr_remain) s->pr_remain[idx] = 0;
-    if (s->pr_up_parse) s->pr_up_parse[idx] = PR_UP_HDR;
-    if (s->pr_up_cl) s->pr_up_cl[idx] = 0;
-    if (s->pr_chunk_rem) s->pr_chunk_rem[idx] = 0;
-    if (s->pr_chunk_state) s->pr_chunk_state[idx] = 0;
-    if (s->pr_up_hlen) s->pr_up_hlen[idx] = 0;
-    if (s->pr_req_is_head) s->pr_req_is_head[idx] = 0;
-    s->pr_free[++(s->pr_free_top)] = idx;
-    if (s->pr_count > 0) s->pr_count--;
+static void pr_free_slot(nl_web_engine_t* eng, int idx) {
+    if (idx < 0 || idx >= eng->cap) return;
+    if (eng->pr_hbuf[idx])     { free(eng->pr_hbuf[idx]);     eng->pr_hbuf[idx] = NULL; }
+    if (eng->pr_hbuf_out[idx]) { free(eng->pr_hbuf_out[idx]); eng->pr_hbuf_out[idx] = NULL; }
+    if (eng->pr_up_buf[idx])   { free(eng->pr_up_buf[idx]);   eng->pr_up_buf[idx] = NULL; }
+    if (eng->pr_up_key && eng->pr_up_key[idx]) { free(eng->pr_up_key[idx]); eng->pr_up_key[idx] = NULL; }
+    // P2/P3: 本地响应缓冲 + 文件句柄释放
+    // BODY_FILE: pr_body_src 指向 FILE*，需 fclose
+    // BODY_MEM:  pr_body_src 指向 route->content（引擎持有），不 free
+    if (eng->pr_outbuf[idx])   { free(eng->pr_outbuf[idx]);   eng->pr_outbuf[idx] = NULL; }
+    if (eng->pr_body_src[idx]) {
+        if (eng->pr_body_kind[idx] == PR_BODY_FILE)
+            fclose((FILE*)eng->pr_body_src[idx]);
+        eng->pr_body_src[idx] = NULL;
+    }
+    eng->pr_state[idx] = 0;
+    eng->pr_fd_client[idx] = -1;
+    eng->pr_fd_upstream[idx] = 0;
+    eng->pr_route_idx[idx] = -1;
+    if (eng->pr_route_ptr) eng->pr_route_ptr[idx] = NULL;   // P5: 重置缓存的 route 指针
+    if (eng->pr_last_active_ms) eng->pr_last_active_ms[idx] = 0;  // P7: 重置空闲超时时间戳
+    if (eng->pr_hdr_len) eng->pr_hdr_len[idx] = 0;
+    if (eng->pr_remain) eng->pr_remain[idx] = 0;
+    if (eng->pr_up_parse) eng->pr_up_parse[idx] = PR_UP_HDR;
+    if (eng->pr_up_cl) eng->pr_up_cl[idx] = 0;
+    if (eng->pr_chunk_rem) eng->pr_chunk_rem[idx] = 0;
+    if (eng->pr_chunk_state) eng->pr_chunk_state[idx] = 0;
+    if (eng->pr_up_hlen) eng->pr_up_hlen[idx] = 0;
+    if (eng->pr_req_is_head) eng->pr_req_is_head[idx] = 0;
+    // P2: 重置全异步输出字段
+    if (eng->pr_role) eng->pr_role[idx] = PR_ROLE_LOCAL;
+    if (eng->pr_phase) eng->pr_phase[idx] = PR_PHASE_READ_REQ;
+    if (eng->pr_out_len) eng->pr_out_len[idx] = 0;
+    if (eng->pr_out_off) eng->pr_out_off[idx] = 0;
+    if (eng->pr_body_remain) eng->pr_body_remain[idx] = 0;
+    if (eng->pr_body_kind) eng->pr_body_kind[idx] = PR_BODY_NONE;
+    if (eng->pr_use_chunked) eng->pr_use_chunked[idx] = 0;
+    eng->free[++(eng->free_top)] = idx;
+    if (eng->count > 0) eng->count--;
 }
 
 // 忽略大小写判断 [s, s+n) 是否以 prefix 开头（prefix 为小写字面量）
@@ -2440,7 +2511,7 @@ static const char* pr_memfind(const char* s, size_t n, const char* needle, size_
 }
 
 // 解析响应头块，确定 body framing 与是否可复用（结果写入 pr_up_parse 等字段）
-static void pr_up_parse_headers(nl_web_server_t* s, int idx, const char* hdr, int hlen) {
+static void pr_up_parse_headers(nl_web_engine_t* eng, int idx, const char* hdr, int hlen) {
     const char* end = hdr + hlen;
     // 状态行：第一个空格后 3 位为状态码
     int status = 0;
@@ -2448,7 +2519,7 @@ static void pr_up_parse_headers(nl_web_server_t* s, int idx, const char* hdr, in
     if (sp && sp + 4 <= end) {
         status = (sp[1] - '0') * 100 + (sp[2] - '0') * 10 + (sp[3] - '0');
     }
-    int no_body = (s->pr_req_is_head && s->pr_req_is_head[idx]) ||
+    int no_body = (eng->pr_req_is_head && eng->pr_req_is_head[idx]) ||
                   (status >= 100 && status < 200) || status == 204 || status == 304;
     int conn_close = 0;
     long long cl = -1;
@@ -2469,38 +2540,38 @@ static void pr_up_parse_headers(nl_web_server_t* s, int idx, const char* hdr, in
         }
         line = le + 2;
     }
-    if (conn_close) { s->pr_up_parse[idx] = PR_UP_EOF; return; }  // 对端将关闭 → 不可复用
-    if (no_body)    { s->pr_up_parse[idx] = PR_UP_DONE; return; } // 无 body → 完成
-    if (cl == 0)    { s->pr_up_parse[idx] = PR_UP_DONE; return; }
+    if (conn_close) { eng->pr_up_parse[idx] = PR_UP_EOF; return; }  // 对端将关闭 → 不可复用
+    if (no_body)    { eng->pr_up_parse[idx] = PR_UP_DONE; return; } // 无 body → 完成
+    if (cl == 0)    { eng->pr_up_parse[idx] = PR_UP_DONE; return; }
     if (cl > 0) {
-        s->pr_up_cl[idx] = (int64_t)cl;
-        s->pr_up_parse[idx] = PR_UP_CL;
+        eng->pr_up_cl[idx] = (int64_t)cl;
+        eng->pr_up_parse[idx] = PR_UP_CL;
         return;
     }
     if (chunked) {
-        s->pr_chunk_state[idx] = PR_CHUNK_SIZE;
-        s->pr_chunk_rem[idx] = 0;
-        s->pr_up_hlen[idx] = 0;
-        s->pr_up_parse[idx] = PR_UP_CHUNK;
+        eng->pr_chunk_state[idx] = PR_CHUNK_SIZE;
+        eng->pr_chunk_rem[idx] = 0;
+        eng->pr_up_hlen[idx] = 0;
+        eng->pr_up_parse[idx] = PR_UP_CHUNK;
         return;
     }
     // 无 Content-Length 且非 chunked：body 以 EOF 结束 → 不可复用
-    s->pr_up_parse[idx] = PR_UP_EOF;
+    eng->pr_up_parse[idx] = PR_UP_EOF;
 }
 
 // 消费 chunked body 字节，推进至终止帧（0\r\n\r\n）后置 PR_UP_DONE
-static void pr_up_parse_chunked(nl_web_server_t* s, int idx, const char* data, size_t* ppos, size_t len) {
+static void pr_up_parse_chunked(nl_web_engine_t* eng, int idx, const char* data, size_t* ppos, size_t len) {
     size_t pos = *ppos;
     while (pos < len) {
-        uint8_t cs = s->pr_chunk_state[idx];
+        uint8_t cs = eng->pr_chunk_state[idx];
         if (cs == PR_CHUNK_SIZE || cs == PR_CHUNK_TRAILER) {
             // 累积一行到 pr_hbuf_out（临时行缓冲），pr_up_hlen 记长度
-            char* lb = s->pr_hbuf_out[idx];
-            int* ll = &s->pr_up_hlen[idx];
+            char* lb = eng->pr_hbuf_out[idx];
+            int* ll = &eng->pr_up_hlen[idx];
             while (pos < len) {
                 char c = data[pos++];
                 if (*ll < 8191) lb[(*ll)++] = c;
-                else { s->pr_up_parse[idx] = PR_UP_EOF; *ppos = pos; return; }
+                else { eng->pr_up_parse[idx] = PR_UP_EOF; *ppos = pos; return; }
                 if (c == '\n') break;
             }
             if (*ll > 0 && lb[*ll - 1] == '\n') {
@@ -2516,33 +2587,33 @@ static void pr_up_parse_chunked(nl_web_server_t* s, int idx, const char* data, s
                         else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
                         else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
                         else if (c == ' ' || c == '\t') { if (!ok) continue; else break; }
-                        else { s->pr_up_parse[idx] = PR_UP_EOF; *ll = 0; *ppos = pos; return; }
+                        else { eng->pr_up_parse[idx] = PR_UP_EOF; *ll = 0; *ppos = pos; return; }
                         sz = sz * 16 + d; ok = 1;
                     }
                     *ll = 0;
-                    if (sz == 0) { s->pr_chunk_state[idx] = PR_CHUNK_TRAILER; }
-                    else { s->pr_chunk_rem[idx] = sz; s->pr_chunk_state[idx] = PR_CHUNK_DATA; }
+                    if (sz == 0) { eng->pr_chunk_state[idx] = PR_CHUNK_TRAILER; }
+                    else { eng->pr_chunk_rem[idx] = sz; eng->pr_chunk_state[idx] = PR_CHUNK_DATA; }
                 } else {
                     *ll = 0;
-                    if (line_len == 0) { s->pr_up_parse[idx] = PR_UP_DONE; *ppos = pos; return; }
+                    if (line_len == 0) { eng->pr_up_parse[idx] = PR_UP_DONE; *ppos = pos; return; }
                 }
             }
             continue;
         }
         if (cs == PR_CHUNK_DATA) {
             long long take = (long long)(len - pos);
-            if (take > s->pr_chunk_rem[idx]) take = s->pr_chunk_rem[idx];
+            if (take > eng->pr_chunk_rem[idx]) take = eng->pr_chunk_rem[idx];
             pos += (size_t)take;
-            s->pr_chunk_rem[idx] -= take;
-            if (s->pr_chunk_rem[idx] == 0) { s->pr_chunk_state[idx] = PR_CHUNK_CRLF; s->pr_chunk_rem[idx] = 2; }
+            eng->pr_chunk_rem[idx] -= take;
+            if (eng->pr_chunk_rem[idx] == 0) { eng->pr_chunk_state[idx] = PR_CHUNK_CRLF; eng->pr_chunk_rem[idx] = 2; }
             continue;
         }
         if (cs == PR_CHUNK_CRLF) {
             long long take = (long long)(len - pos);
-            if (take > s->pr_chunk_rem[idx]) take = s->pr_chunk_rem[idx];
+            if (take > eng->pr_chunk_rem[idx]) take = eng->pr_chunk_rem[idx];
             pos += (size_t)take;
-            s->pr_chunk_rem[idx] -= take;
-            if (s->pr_chunk_rem[idx] == 0) s->pr_chunk_state[idx] = PR_CHUNK_SIZE;
+            eng->pr_chunk_rem[idx] -= take;
+            if (eng->pr_chunk_rem[idx] == 0) eng->pr_chunk_state[idx] = PR_CHUNK_SIZE;
             continue;
         }
         break;
@@ -2552,44 +2623,48 @@ static void pr_up_parse_chunked(nl_web_server_t* s, int idx, const char* data, s
 
 // 旁路解析被转发的上游字节（bytes 方向：上游→客户端），判定响应是否完整可复用。
 // 绝不修改 bytes（转发必须字节级原样）。
-static void pr_parse_upstream_bytes(nl_web_server_t* s, int idx, const char* data, size_t len) {
-    if (!s || !s->pr_up_parse || !s->pr_hbuf_out || !data || len == 0) return;
+static void pr_parse_upstream_bytes(nl_web_engine_t* eng, int idx, const char* data, size_t len) {
+    if (!eng || !eng->pr_up_parse || !eng->pr_hbuf_out || !data || len == 0) return;
     size_t pos = 0;
     while (pos < len) {
-        uint8_t st = s->pr_up_parse[idx];
+        uint8_t st = eng->pr_up_parse[idx];
         if (st == PR_UP_DONE || st == PR_UP_EOF) return;  // 终态：停止解析
         if (st == PR_UP_HDR) {
-            char* hb = s->pr_hbuf_out[idx];
-            int* hl = &s->pr_up_hlen[idx];
+            char* hb = eng->pr_hbuf_out[idx];
+            int* hl = &eng->pr_up_hlen[idx];
             int found = 0;
             while (pos < len) {
-                if (*hl >= 8190) { s->pr_up_parse[idx] = PR_UP_EOF; return; }  // 头过大：判不可复用
+                if (*hl >= 8190) { eng->pr_up_parse[idx] = PR_UP_EOF; return; }  // 头过大：判不可复用
                 char c = data[pos++];
                 hb[(*hl)++] = c;
                 if (*hl >= 4 && hb[*hl - 4] == '\r' && hb[*hl - 3] == '\n' &&
                     hb[*hl - 2] == '\r' && hb[*hl - 1] == '\n') { found = 1; break; }
             }
-            if (found) { pr_up_parse_headers(s, idx, hb, *hl); *hl = 0; }
+            if (found) { pr_up_parse_headers(eng, idx, hb, *hl); *hl = 0; }
             continue;
         }
         if (st == PR_UP_CL) {
-            long long rem = s->pr_up_cl[idx];
+            long long rem = eng->pr_up_cl[idx];
             long long take = (long long)(len - pos);
-            if (take >= rem) { pos += (size_t)rem; s->pr_up_cl[idx] = 0; s->pr_up_parse[idx] = PR_UP_DONE; }
-            else { s->pr_up_cl[idx] = rem - take; pos = len; }
+            if (take >= rem) { pos += (size_t)rem; eng->pr_up_cl[idx] = 0; eng->pr_up_parse[idx] = PR_UP_DONE; }
+            else { eng->pr_up_cl[idx] = rem - take; pos = len; }
             continue;
         }
-        if (st == PR_UP_CHUNK) { pr_up_parse_chunked(s, idx, data, &pos, len); continue; }
+        if (st == PR_UP_CHUNK) { pr_up_parse_chunked(eng, idx, data, &pos, len); continue; }
         return;
     }
 }
 
 // 读 route 表，找 path 命中的 route（用于 pr_route_idx 下标定位）
-static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
+// 在路由表里按 path 查找，返回下标；同时（可选）把命中 route 指针写入 *out_r。
+// 一次拿锁同时得到 idx + 指针，避免热路径二次拿锁遍历（P5 锁竞争优化）。
+static int pr_lookup_route(nl_web_server_t* s, const char* path, nl_web_route_t** out_r) {
     int idx = 0;
+    if (out_r) *out_r = NULL;
     pthread_mutex_lock(&s->mutex);
     for (nl_web_route_t* r = s->routes; r; r = r->next, idx++) {
         if (strcmp(r->path, path) == 0) {
+            if (out_r) *out_r = r;
             pthread_mutex_unlock(&s->mutex);
             return idx;
         }
@@ -2599,16 +2674,252 @@ static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
 }
 
 // 把 proxy 连接注册进 epoll：客户端 + 上游双 fd，EAGAIN 自动 re-attach
-static void pr_register(nl_web_server_t* s, int idx, int cfd, int ufd) {
+static void pr_register(nl_web_engine_t* eng, int idx, int cfd, int ufd) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN | EPOLLRDHUP;
     ev.data.u32 = (uint32_t)idx;
-    epoll_ctl(s->epfd, EPOLL_CTL_ADD, cfd, &ev);
+    epoll_ctl(eng->epfd, EPOLL_CTL_ADD, cfd, &ev);
     if (ufd > 0) {
         ev.data.u32 = (uint32_t)idx | 0x40000000u;  // 高位 0x40000000 标记"上游侧"
-        epoll_ctl(s->epfd, EPOLL_CTL_ADD, ufd, &ev);
+        epoll_ctl(eng->epfd, EPOLL_CTL_ADD, ufd, &ev);
     }
+}
+
+// ---- P2: 全异步本地输出辅助函数 ----
+
+// 构造本地响应到 outbuf（header + body 头），设置 pr_phase / pr_body_kind 等。
+// 返回 1=成功（outbuf 已构造，需进入发送流程），0=失败（已直接写错误响应）。
+// redirect 路由：直接构造 302 到 outbuf；
+// content 路由：header + 全部 body 塞进 outbuf（P2 阶段内存整块）；
+// file 路由：header 塞进 outbuf，body 走 fread 分块（PR_BODY_FILE）。
+static int pr_build_local_response(nl_web_engine_t* eng, int idx,
+                                   const nl_web_route_t* r,
+                                   const char* method, const char* path,
+                                   char* out, int out_cap) {
+    (void)method; (void)path;   // P2 本地路由不再读 method/path（FILE 用 r->file_path）
+    int off = 0;
+    int cfd = eng->pr_fd_client[idx];
+
+    if (r->type == NL_ROUTE_TYPE_REDIRECT) {
+        off = snprintf(out, (size_t)out_cap,
+            "HTTP/1.1 302 Found\r\n"
+            "Location: %s\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n",
+            r->redirect_url);
+        if (off <= 0 || off >= out_cap) return 0;
+        eng->pr_role[idx]     = PR_ROLE_LOCAL;
+        eng->pr_phase[idx]    = PR_PHASE_SERVE_OUT;
+        eng->pr_body_kind[idx] = PR_BODY_NONE;
+        eng->pr_body_remain[idx] = 0;
+        memcpy(eng->pr_outbuf[idx], out, (size_t)off);
+        eng->pr_out_len[idx] = off;
+        eng->pr_out_off[idx] = 0;
+        return 1;
+    }
+
+    // content 路由：P3 统一指针拉取 — 只把 header 塞进 outbuf，body 走 pr_body_pull 分块流式
+    // P4: 长度未知（content_size==0 且 content 非空）→ 走 chunked 编码；已知长度 → Content-Length
+    if (r->type == NL_ROUTE_TYPE_CONTENT) {
+        size_t blen = r->content ? r->content_size : 0;
+        int unknown_len = (r->content != NULL && blen == 0);   // P4: 未知长度动态内容
+        // P4: chunked 模式下 content_size 未填，需 strlen 算真实长度喂给 body_remain（分块推进依赖它）
+        if (unknown_len) blen = strlen(r->content);
+        if (unknown_len) {
+            off = snprintf(out, (size_t)out_cap,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: %s\r\n"
+                "Transfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n",
+                r->content_type ? r->content_type : "text/plain");
+        } else {
+            off = snprintf(out, (size_t)out_cap,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n\r\n",
+                r->content_type ? r->content_type : "text/plain", blen);
+        }
+        if (off <= 0 || off >= out_cap) return 0;
+        // outbuf 已持有 header（8KB 足够），仅需把 body 指针存进 pr_body_src
+        memcpy(eng->pr_outbuf[idx], out, (size_t)off);
+        eng->pr_out_len[idx] = off;
+        eng->pr_out_off[idx] = 0;
+        eng->pr_body_src[idx] = (void*)r->content;   // 指向 route->content（引擎持有，不释放）
+        eng->pr_body_remain[idx] = (int64_t)blen;
+        eng->pr_body_kind[idx] = PR_BODY_MEM;
+        eng->pr_use_chunked[idx] = unknown_len ? 1 : 0;   // P4: chunked 标记
+        eng->pr_role[idx]     = PR_ROLE_LOCAL;
+        eng->pr_phase[idx]    = PR_PHASE_SERVE_OUT;
+        return 1;
+    }
+
+    // file 路由：header + fread 分块
+    if (r->type == NL_ROUTE_TYPE_FILE) {
+        FILE* fp = fopen(r->file_path, "rb");
+        if (!fp) {
+            // 404 直接写
+            const char* e404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(cfd, e404, strlen(e404), MSG_NOSIGNAL);
+            return 0;
+        }
+        fseek(fp, 0, SEEK_END);
+        long fsz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (fsz > 0 && fsz <= 10*1024*1024) {
+            off = snprintf(out, (size_t)out_cap,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %ld\r\n"
+                "Connection: close\r\n\r\n",
+                r->content_type ? r->content_type : "application/octet-stream", fsz);
+            if (off <= 0 || off >= out_cap) { fclose(fp); send(cfd, "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n", 58, MSG_NOSIGNAL); return 0; }
+            // outbuf 8KB 默认容量足够放 header；body 阶段走 pr_body_next_chunk 复用式缓冲（不每块 malloc/free）
+            memcpy(eng->pr_outbuf[idx], out, (size_t)off);
+            eng->pr_out_len[idx] = off;
+            eng->pr_out_off[idx] = 0;
+            eng->pr_body_src[idx] = fp;          // 持有 FILE*
+            eng->pr_body_remain[idx] = fsz;
+            eng->pr_body_kind[idx] = PR_BODY_FILE;
+            eng->pr_role[idx]     = PR_ROLE_LOCAL;
+            eng->pr_phase[idx]    = PR_PHASE_SERVE_OUT;
+            return 1;
+        }
+        // 文件太大或无效：500
+        fclose(fp);
+        const char* e500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send(cfd, e500, strlen(e500), MSG_NOSIGNAL);
+        return 0;
+    }
+
+    return 0;
+}
+
+// 全异步发送 outbuf（head/body 已构造在 pr_outbuf[idx]）。
+// 若 EAGAIN 则注册 EPOLLOUT，由事件循环补发。
+// 返回值：1=已全部发出（可进入 FILE 续读或关闭），0=仍有剩余等 EPOLLOUT，-1=错误需关闭。
+static int pr_flush_local_out(nl_web_engine_t* eng, int idx) {
+    int cfd = eng->pr_fd_client[idx];
+    int* out_len = eng->pr_out_len;
+    int* out_off = eng->pr_out_off;
+    char* buf = eng->pr_outbuf[idx];
+    while (out_off[idx] < out_len[idx]) {
+        ssize_t w = send(cfd, buf + out_off[idx], (size_t)(out_len[idx] - out_off[idx]), MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 注册 EPOLLOUT，等下次事件补发
+                struct epoll_event ouv;
+                memset(&ouv, 0, sizeof(ouv));
+                ouv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+                ouv.data.u32 = (uint32_t)idx;
+                epoll_ctl(eng->epfd, EPOLL_CTL_MOD, cfd, &ouv);
+                return 0;
+            }
+            return -1;
+        }
+        if (w == 0) return -1;
+        out_off[idx] += (int)w;
+    }
+    return 1;  // 全部发出
+}
+
+// P3 统一流式 body 推进：按 pr_body_kind 拉取下一块到 outbuf，再 pr_flush_local_out。
+// 在 PR_PHASE_SERVE_FILE 阶段由事件循环调用（outbuf 排空后自动推进）。
+// P4: chunked 模式（pr_use_chunked[idx]）下，每块前加 "%x\r\n" 前缀，body 排空后发 "0\r\n\r\n"。
+// BODY_MEM：pr_body_src 指向 r->content（引擎持有），每次推进指针 + 剩余量。
+//   header 发完后 outbuf 直接复用（不 realloc 循环），body 块拷入同一缓冲。
+// BODY_FILE：pr_body_src 指向 FILE*，fread 64KB 块到独立 body 块缓冲（header 已发完）。
+static int pr_body_next_chunk(nl_web_engine_t* eng, int idx) {
+    int cfd = eng->pr_fd_client[idx];
+    int64_t remain = eng->pr_body_remain[idx];
+    int use_chunked = eng->pr_use_chunked ? eng->pr_use_chunked[idx] : 0;
+
+    if (remain <= 0) {
+        // body 排空
+        if (use_chunked) {
+            // P4: 发终止 chunk "0\r\n\r\n"
+            const char* tail = "0\r\n\r\n";
+            char* buf = eng->pr_outbuf[idx];
+            char* nb = (char*)realloc(buf, 8);
+            if (!nb) return -1;
+            eng->pr_outbuf[idx] = nb;
+            if (buf) free(buf);
+            memcpy(eng->pr_outbuf[idx], tail, 5);
+            eng->pr_out_len[idx] = 5;
+            eng->pr_out_off[idx] = 0;
+        }
+        // 进入完成态，下次 flush 后关闭
+        eng->pr_phase[idx] = PR_PHASE_SERVE_OUT;
+        return 1;
+    }
+    int chunk = 65536;
+    if (remain < chunk) chunk = (int)remain;
+
+    if (eng->pr_body_kind[idx] == PR_BODY_MEM) {
+        // 指针推进：把下一块拷进现有 outbuf
+        // src 直接从 pr_body_src 取（每轮已推进过），不用 pr_out_off 偏移
+        char* buf = eng->pr_outbuf[idx];
+        // P4: chunked 模式下块前需加 "%x\r\n" 前缀，outbuf 需多留前缀空间
+        int prefix_len = use_chunked ? 16 : 0;   // "100000\r\n" 最多 8 字节，留 16
+        // header 块（8KB）发完后 outbuf 容量不足，需扩到 64KB + prefix_len
+        // 只扩一次，后续轮次 outbuf 已是 64KB 直接复用
+        if ((size_t)eng->pr_out_len[idx] < ((size_t)chunk + (size_t)prefix_len) &&
+            eng->pr_out_off[idx] >= eng->pr_out_len[idx]) {
+            // outbuf 已排空（header 发完或上一 body 块发完），扩到 64KB + prefix
+            char* nb = (char*)realloc(eng->pr_outbuf[idx], (size_t)65536 + (size_t)prefix_len + 1);
+            if (!nb) {
+                const char* e500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                send(cfd, e500, strlen(e500), MSG_NOSIGNAL);
+                return -1;
+            }
+            eng->pr_outbuf[idx] = nb;
+            buf = nb;
+        }
+        int off = 0;
+        if (use_chunked) {
+            // P4: 写 chunked 前缀 "%x\r\n"
+            off = snprintf(buf, 16, "%x\r\n", (unsigned)chunk);
+            if (off <= 0) off = 4;
+        }
+        const char* src = (const char*)eng->pr_body_src[idx];
+        memcpy(buf + off, src, (size_t)chunk);
+        eng->pr_out_len[idx] = off + chunk;
+        eng->pr_out_off[idx] = 0;   // 同步置 0，防 flush EAGAIN 时重复发
+        eng->pr_body_src[idx] = (char*)eng->pr_body_src[idx] + chunk;
+        eng->pr_body_remain[idx] -= chunk;
+        eng->pr_phase[idx] = PR_PHASE_SERVE_OUT;
+        return 1;
+    }
+
+    // BODY_FILE：fread 块到复用式 body 缓冲（outbuf 容量够则直接复用，不够 realloc 扩）
+    // 避免 P2 旧版"每块 malloc/free 新 64KB 块"的高频抖动；header 发完后 outbuf 只装 body 块。
+    FILE* fp = (FILE*)eng->pr_body_src[idx];
+    int prefix_len = use_chunked ? 16 : 0;
+    char* buf = eng->pr_outbuf[idx];
+    // outbuf 排空（header 发完或上一块发完）且容量不足 chunk+prefix → realloc 扩到 64KB+prefix
+    if ((size_t)eng->pr_out_len[idx] < ((size_t)chunk + (size_t)prefix_len) &&
+        eng->pr_out_off[idx] >= eng->pr_out_len[idx]) {
+        char* nb = (char*)realloc(buf, (size_t)65536 + (size_t)prefix_len + 1);
+        if (!nb) {
+            const char* e500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(cfd, e500, strlen(e500), MSG_NOSIGNAL);
+            return -1;
+        }
+        eng->pr_outbuf[idx] = nb;
+        buf = nb;
+    }
+    int off = 0;
+    if (use_chunked) {
+        off = snprintf(buf, 16, "%x\r\n", (unsigned)chunk);
+        if (off <= 0) off = 4;
+    }
+    size_t rd = fread(buf + off, 1, (size_t)chunk, fp);
+    eng->pr_out_len[idx] = off + (int)rd;
+    eng->pr_out_off[idx] = 0;
+    eng->pr_body_remain[idx] -= (int64_t)rd;
+    eng->pr_phase[idx] = PR_PHASE_SERVE_OUT;
+    return 1;
 }
 
 // 非阻塞泵：先补发上次未发完的余量（pr_remain），再读新数据转发。
@@ -2617,8 +2928,8 @@ static void pr_register(nl_web_server_t* s, int idx, int cfd, int ufd) {
 // client→upstream 方向用 pr_hbuf[idx]），避免多连接并发时数据串包。
 // 每次 send 后若只发了 w 字节，剩余数据 memmove 前移至 buf[0..remain-w]，
 // 确保下次从 buf[0] 继续发，避免重复发送已发数据。
-static int pr_pump_once(nl_web_server_t* s, int idx, int from, int to, char* buf, size_t cap, int parse_up) {
-    int* remain = s->pr_remain;
+static int pr_pump_once(nl_web_engine_t* eng, int idx, int from, int to, char* buf, size_t cap, int parse_up) {
+    int* remain = eng->pr_remain;
     // 先补发上次未发完的余量
     while (remain && remain[idx] > 0) {
         ssize_t w = send(to, buf, (size_t)remain[idx], MSG_NOSIGNAL);
@@ -2644,7 +2955,7 @@ static int pr_pump_once(nl_web_server_t* s, int idx, int from, int to, char* buf
         return 0;
     }
     // 上游→客户端方向：把新读到的 n 字节旁路喂给 framing 解析器（不修改 buf）
-    if (parse_up) pr_parse_upstream_bytes(s, idx, buf, (size_t)n);
+    if (parse_up) pr_parse_upstream_bytes(eng, idx, buf, (size_t)n);
     remain[idx] = (int)n;
     while (remain[idx] > 0) {
         ssize_t w = send(to, buf, (size_t)remain[idx], MSG_NOSIGNAL);
@@ -2663,20 +2974,28 @@ static int pr_pump_once(nl_web_server_t* s, int idx, int from, int to, char* buf
 
 // 把已收请求首行 + 剩余头构造为上游请求，写入 out，返回字节数（-1=失败）。
 // 调用方负责拿到字节数后用 send 发出；TCP 协议原样转发 raw_hdrs 字节。
-static int pr_build_upstream_http(nl_web_server_t* s, int idx,
+static int pr_build_upstream_http(nl_web_engine_t* eng, int idx,
                                   const char* method, const char* path,
                                   const char* proto,
                                   const char* raw_hdrs, size_t raw_hdrs_len,
                                   char* out, size_t out_cap) {
-    nl_web_route_t* r;
-    pthread_mutex_lock(&s->mutex);
-    int rd = s->pr_route_idx[idx];
-    r = NULL;
-    int cur = 0;
-    for (nl_web_route_t* it = s->routes; it; it = it->next, cur++) {
-        if (cur == rd) { r = it; break; }
+    nl_web_server_t* s = eng->server;
+    // P5: 优先使用缓存的 route 指针（accept 时已赋值），避免每次构造上游请求都拿 s->mutex 遍历路由表
+    nl_web_route_t* r = NULL;
+    if (eng->pr_route_ptr) r = (nl_web_route_t*)eng->pr_route_ptr[idx];
+    if (!r) {
+        // 回退：缓存未命中（理论上不会发生），重新拿锁查
+        pthread_mutex_lock(&s->mutex);
+        int rd = eng->pr_route_idx[idx];
+        if (rd >= 0) {
+            int cur = 0;
+            for (nl_web_route_t* it = s->routes; it; it = it->next, cur++) {
+                if (cur == rd) { r = it; break; }
+            }
+        }
+        pthread_mutex_unlock(&s->mutex);
     }
-    if (rd < 0 || !r) { pthread_mutex_unlock(&s->mutex); return -1; }
+    if (!r) return -1;
     int total = 0;
     if (r->protocol == NL_PROXY_TCP) {
         total = (int)raw_hdrs_len;
@@ -2692,58 +3011,78 @@ static int pr_build_upstream_http(nl_web_server_t* s, int idx,
             total += (int)raw_hdrs_len;
         }
     }
-    pthread_mutex_unlock(&s->mutex);
     return total;
 }
 
 // 事件驱动主循环：在 web_server_thread 中运行（不建 worker 池，单线程泵 N 条连接）
-// 替代原先的 nl_handle_client + worker 池：proxy 路由走 epoll，其它路由走 worker
-void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
-    s->epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (s->epfd < 0) return;
+// P6: ring_cap_override > 0 时按指定容量初始化（多实例时 total_conns/N），否则按 ncpu*64
+void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_override) {
+    nl_web_server_t* s = eng->server;
 
-    // 初始化 ring 容量（按核数动态）
-    int cap = nl_web_proxy_ring_capacity();
-    s->pr_cap = cap;
-    s->pr_fd_client = (int*)calloc((size_t)cap, sizeof(int));
-    s->pr_fd_upstream = (int*)calloc((size_t)cap, sizeof(int));
-    s->pr_route_idx = (int*)calloc((size_t)cap, sizeof(int));
-    s->pr_state = (uint8_t*)calloc((size_t)cap, 1);
-    s->pr_hbuf = (char**)calloc((size_t)cap, sizeof(char*));
-    s->pr_hbuf_out = (char**)calloc((size_t)cap, sizeof(char*));
-    s->pr_up_buf = (char**)calloc((size_t)cap, sizeof(char*));
-    s->pr_hdr_len = (int*)calloc((size_t)cap, sizeof(int));
-    s->pr_remain = (int*)calloc((size_t)cap, sizeof(int));
-    s->pr_free = (int*)malloc((size_t)cap * sizeof(int));
+    eng->epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (eng->epfd < 0) return;
+
+    // 初始化 ring 容量（P6: 多实例时按 ring_cap_override 指定，否则 ncpu*64 自动）
+    int cap = (ring_cap_override > 0) ? ring_cap_override : nl_web_proxy_ring_capacity();
+    eng->cap = cap;
+    eng->count = 0;
+    eng->pr_fd_client = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_fd_upstream = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_route_idx = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_route_ptr = (void**)calloc((size_t)cap, sizeof(void*));   // P5: 缓存命中 route 指针，消除热路径锁竞争
+    eng->pr_state = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_hbuf = (char**)calloc((size_t)cap, sizeof(char*));
+    eng->pr_hbuf_out = (char**)calloc((size_t)cap, sizeof(char*));
+    eng->pr_up_buf = (char**)calloc((size_t)cap, sizeof(char*));
+    eng->pr_hdr_len = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_remain = (int*)calloc((size_t)cap, sizeof(int));
+    eng->free = (int*)malloc((size_t)cap * sizeof(int));
     // 上游 framing 解析 + 连接池相关数组
-    s->pr_up_parse    = (uint8_t*)calloc((size_t)cap, 1);
-    s->pr_up_cl       = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
-    s->pr_chunk_rem   = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
-    s->pr_chunk_state = (uint8_t*)calloc((size_t)cap, 1);
-    s->pr_up_hlen     = (int*)calloc((size_t)cap, sizeof(int));
-    s->pr_req_is_head = (uint8_t*)calloc((size_t)cap, 1);
-    s->pr_up_key      = (char**)calloc((size_t)cap, sizeof(char*));
-    for (int i = 0; i < cap; i++) s->pr_free[i] = cap - 1 - i;
-    s->pr_free_top = cap - 1;
-    s->pr_count = 0;
-    if (!s->pr_fd_client || !s->pr_fd_upstream || !s->pr_route_idx ||
-        !s->pr_state || !s->pr_hbuf || !s->pr_hbuf_out || !s->pr_up_buf || !s->pr_hdr_len ||
-        !s->pr_remain || !s->pr_free || !s->pr_up_parse || !s->pr_up_cl ||
-        !s->pr_chunk_rem || !s->pr_chunk_state || !s->pr_up_hlen ||
-        !s->pr_req_is_head || !s->pr_up_key) {
-        close(s->epfd); s->epfd = -1;
+    eng->pr_up_parse    = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_up_cl       = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
+    eng->pr_chunk_rem   = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
+    eng->pr_chunk_state = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_up_hlen     = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_req_is_head = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_up_key      = (char**)calloc((size_t)cap, sizeof(char*));
+    // P2: 全异步输出数组
+    eng->pr_role        = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_phase       = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_outbuf      = (char**)calloc((size_t)cap, sizeof(char*));
+    eng->pr_out_len     = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_out_off     = (int*)calloc((size_t)cap, sizeof(int));
+    eng->pr_body_src    = (void**)calloc((size_t)cap, sizeof(void*));
+    eng->pr_body_remain = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
+    eng->pr_body_kind   = (uint8_t*)calloc((size_t)cap, 1);
+    // P4: chunked 编码标记
+    eng->pr_use_chunked = (uint8_t*)calloc((size_t)cap, 1);
+    // P7: 空闲超时（slowloris 防护）
+    eng->pr_last_active_ms = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
+    for (int i = 0; i < cap; i++) eng->free[i] = cap - 1 - i;
+    eng->free_top = cap - 1;
+    if (!eng->pr_fd_client || !eng->pr_fd_upstream || !eng->pr_route_idx ||
+        !eng->pr_route_ptr ||
+        !eng->pr_state || !eng->pr_hbuf || !eng->pr_hbuf_out || !eng->pr_up_buf || !eng->pr_hdr_len ||
+        !eng->pr_remain || !eng->free || !eng->pr_up_parse || !eng->pr_up_cl ||
+        !eng->pr_chunk_rem || !eng->pr_chunk_state || !eng->pr_up_hlen ||
+        !eng->pr_req_is_head || !eng->pr_up_key ||
+        !eng->pr_role || !eng->pr_phase || !eng->pr_outbuf ||
+        !eng->pr_out_len || !eng->pr_out_off || !eng->pr_body_src ||
+        !eng->pr_body_remain || !eng->pr_body_kind || !eng->pr_use_chunked ||
+        !eng->pr_last_active_ms) {
+        close(eng->epfd); eng->epfd = -1;
         return;
     }
     // 初始化上游 keep-alive 连接池（单线程持有，无需锁）
-    s->up_pool = (nl_web_upstream_pool_t*)malloc(sizeof(nl_web_upstream_pool_t));
-    if (s->up_pool) pool_init(s->up_pool, 256, 8, 30000);
+    eng->up_pool = (nl_web_upstream_pool_t*)malloc(sizeof(nl_web_upstream_pool_t));
+    if (eng->up_pool) pool_init(eng->up_pool, 256, 8, 30000);
 
     // 注册 listen fd
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
     ev.data.u32 = 0xFFFFFFFFu;  // 哨兵：listen fd
-    epoll_ctl(s->epfd, EPOLL_CTL_ADD, listen_fd, &ev);
+    epoll_ctl(eng->epfd, EPOLL_CTL_ADD, listen_fd, &ev);
 
     // 设 listen fd 非阻塞，避免 accept 阻塞卡住事件循环
     int flags = fcntl(listen_fd, F_GETFL, 0);
@@ -2751,10 +3090,43 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
 
     struct epoll_event events[256];
 
+    // P7: 空闲超时（slowloris 防护）。0=默认 30s；<=0 视为默认
+    int idle_ms = s->idle_timeout_ms;
+    if (idle_ms <= 0) idle_ms = 30000;
+    int64_t last_scan_ms = pr_pool_now_ms();
+
     while (s->running) {
-        int n = epoll_wait(s->epfd, events, 256, 1000);
+        int n = epoll_wait(eng->epfd, events, 256, 1000);
         if (n < 0) { if (errno == EINTR) continue; break; }
-        pool_reap(s->up_pool, pr_pool_now_ms());   // 每轮回收空闲超时上游连接
+        pool_reap(eng->up_pool, pr_pool_now_ms());   // 每轮回收空闲超时上游连接
+        // P7: 空闲连接扫描回收（slowloris 防护）：扫描全部 slot，回收超时连接
+        {
+            int64_t now_ms = pr_pool_now_ms();
+            if (now_ms - last_scan_ms >= 1000) {   // 每秒扫一次，降低开销
+                last_scan_ms = now_ms;
+                for (int si = 0; si < eng->cap; si++) {
+                    if (!(eng->pr_state[si] & PR_ST_ACTIVE)) continue;
+                    int64_t last = eng->pr_last_active_ms[si];
+                    if (last <= 0 || (now_ms - last) >= idle_ms) {
+                        int cfd = eng->pr_fd_client[si];
+                        int ufd = eng->pr_fd_upstream[si];
+                        if (ufd > 0) {
+                            int poolable = (eng->pr_up_parse[si] == PR_UP_DONE &&
+                                            eng->pr_up_key && eng->pr_up_key[si][0] && eng->up_pool);
+                            if (poolable)
+                                pool_put(eng->up_pool, eng->pr_up_key[si], ufd);
+                            else {
+                                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, ufd, NULL);
+                                close(ufd);
+                            }
+                        }
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                        close(cfd);
+                        pr_free_slot(eng, si);
+                    }
+                }
+            }
+        }
         for (int i = 0; i < n; i++) {
             uint32_t ud = events[i].data.u32;
             if (ud == 0xFFFFFFFFu) {
@@ -2763,53 +3135,128 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                 if (cfd < 0) continue;
                 int cf = fcntl(cfd, F_GETFL, 0);
                 fcntl(cfd, F_SETFL, cf | O_NONBLOCK);
-                int idx = pr_alloc_slot(s);
+                int idx = pr_alloc_slot(eng);
                 if (idx < 0) { close(cfd); continue; }  // ring 满：回 503 关闭
-                s->pr_fd_client[idx] = cfd;
-                s->pr_state[idx] = PR_ST_ACTIVE;
-                // 每连接独立 8KB 首包缓冲 + 8KB 上游请求构造缓冲 + 64KB 上游响应缓冲（归还即释放）
-                s->pr_hbuf[idx]     = (char*)malloc(8192);
-                s->pr_hbuf_out[idx] = (char*)malloc(8192);
-                s->pr_up_buf[idx]   = (char*)malloc(PR_PROXY_BUF_SZ);
-                s->pr_up_key[idx]   = (char*)malloc(576);
-                s->pr_hdr_len[idx] = 0;
-                s->pr_remain[idx]  = 0;
-                // 重置上游响应 framing 状态
-                s->pr_up_parse[idx]    = PR_UP_HDR;
-                s->pr_up_cl[idx]       = 0;
-                s->pr_chunk_rem[idx]   = 0;
-                s->pr_chunk_state[idx] = 0;
-                s->pr_up_hlen[idx]     = 0;
-                s->pr_req_is_head[idx] = 0;
-                if (!s->pr_hbuf[idx] || !s->pr_hbuf_out[idx] || !s->pr_up_buf[idx] || !s->pr_up_key[idx]) {
-                    close(cfd);
-                    pr_free_slot(s, idx);
-                    continue;
-                }
-                pr_register(s, idx, cfd, 0);
+                eng->pr_fd_client[idx] = cfd;
+                eng->pr_state[idx] = PR_ST_ACTIVE;
+                // 每连接独立 8KB 首包缓冲 + 8KB 上游请求构造缓冲（pr_up_buf 改为 proxy 路由按需分配，见 P5 内存控制）
+                eng->pr_hbuf[idx]     = (char*)malloc(8192);
+                eng->pr_hbuf_out[idx] = (char*)malloc(8192);
+                eng->pr_up_key[idx]   = (char*)malloc(576);
+            eng->pr_hdr_len[idx] = 0;
+            eng->pr_remain[idx]  = 0;
+            // P2: 本地响应输出缓冲（header 8KB，body 按需扩容）
+            eng->pr_outbuf[idx]   = (char*)malloc(8192);
+            eng->pr_out_len[idx] = 0;
+            eng->pr_out_off[idx] = 0;
+            eng->pr_role[idx]     = PR_ROLE_LOCAL;
+            eng->pr_phase[idx]    = PR_PHASE_READ_REQ;
+            eng->pr_body_src[idx] = NULL;
+            eng->pr_body_remain[idx] = 0;
+            eng->pr_body_kind[idx] = PR_BODY_NONE;
+            eng->pr_use_chunked[idx] = 0;
+            // P7: 空闲超时（slowloris 防护）
+            eng->pr_last_active_ms[idx] = pr_pool_now_ms();
+            // 重置上游响应 framing 状态
+            eng->pr_up_parse[idx]    = PR_UP_HDR;
+            eng->pr_up_cl[idx]       = 0;
+            eng->pr_chunk_rem[idx]   = 0;
+            eng->pr_chunk_state[idx] = 0;
+            eng->pr_up_hlen[idx]     = 0;
+            eng->pr_req_is_head[idx] = 0;
+            // pr_up_buf 改为 proxy 路由按需分配（P5），accept 时不检查
+            if (!eng->pr_hbuf[idx] || !eng->pr_hbuf_out[idx] ||
+                !eng->pr_up_key[idx] || !eng->pr_outbuf[idx]) {
+                close(cfd);
+                pr_free_slot(eng, idx);
+                continue;
+            }
+                pr_register(eng, idx, cfd, 0);
                 continue;
             }
             int idx = (int)(ud & 0x3FFFFFFFu);
             int is_up = (ud >> 30) & 1;
-            int fd = is_up ? s->pr_fd_upstream[idx] : s->pr_fd_client[idx];
-            if (idx < 0 || idx >= s->pr_cap || !s->pr_state[idx]) continue;
+            int fd = is_up ? eng->pr_fd_upstream[idx] : eng->pr_fd_client[idx];
+            if (idx < 0 || idx >= eng->cap || !eng->pr_state[idx]) continue;
 
             if (events[i].events & (EPOLLHUP | EPOLLERR)) {
                 // 连接错误/挂起：清理
-                if (!is_up) { int cf = s->pr_fd_client[idx]; close(cf); }
-                if (s->pr_fd_upstream[idx] > 0) close(s->pr_fd_upstream[idx]);
-                epoll_ctl(s->epfd, EPOLL_CTL_DEL, is_up ? s->pr_fd_client[idx] : fd, NULL);
-                pr_free_slot(s, idx);
+                if (!is_up) { int cf = eng->pr_fd_client[idx]; close(cf); }
+                if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, is_up ? eng->pr_fd_client[idx] : fd, NULL);
+                pr_free_slot(eng, idx);
                 continue;
             }
 
             if (!is_up) {
                 // 客户端可写：补发上游→客户端方向未发完的余量（客户端写慢导致 send EAGAIN）
                 if (events[i].events & EPOLLOUT) {
-                    int* remain = s->pr_remain;
+                    int* remain = eng->pr_remain;
                     int werr = 0;
+
+                    // P3: 本地路由 body 流式推进（pr_role == LOCAL && pr_phase == SERVE_FILE）
+                    if (eng->pr_role[idx] == PR_ROLE_LOCAL && eng->pr_phase[idx] == PR_PHASE_SERVE_FILE) {
+                        // 拉取下一块到 outbuf，再 flush
+                        pr_body_next_chunk(eng, idx);
+                        int fr = pr_flush_local_out(eng, idx);
+                        if (fr > 0) {
+                            // 该块已发完，判断是否还有剩余
+                            if (eng->pr_body_remain[idx] > 0) {
+                                // 还有剩余：等下次 EPOLLOUT 继续（已注册）
+                                continue;
+                            }
+                            // 全部读完：关闭
+                            int cfd = eng->pr_fd_client[idx];
+                            epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                            close(cfd);
+                            pr_free_slot(eng, idx);
+                            continue;
+                        }
+                        if (fr == 0) {
+                            // EAGAIN：已注册 EPOLLOUT，等下次事件
+                            continue;
+                        }
+                        // fr == -1：错误，关闭
+                        int cfd = eng->pr_fd_client[idx];
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                        close(cfd);
+                        pr_free_slot(eng, idx);
+                        continue;
+                    }
+
+                    // P3: 本地路由 outbuf 补发（pr_role == LOCAL && pr_phase == SERVE_OUT）
+                    if (eng->pr_role[idx] == PR_ROLE_LOCAL && eng->pr_phase[idx] == PR_PHASE_SERVE_OUT) {
+                        int fr = pr_flush_local_out(eng, idx);
+                        if (fr > 0) {
+                            // outbuf 全部发出
+                            if (eng->pr_body_remain[idx] > 0) {
+                                // 还有 body 剩余（BODY_MEM/BODY_FILE）：进入 SERVE_FILE 阶段分块流式
+                                eng->pr_phase[idx] = PR_PHASE_SERVE_FILE;
+                                continue;
+                            }
+                            // 无 body 或已读完：关闭
+                            int cfd = eng->pr_fd_client[idx];
+                            epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                            close(cfd);
+                            pr_free_slot(eng, idx);
+                            continue;
+                        }
+                        if (fr == 0) {
+                            // EAGAIN：仍写满，保持 EPOLLOUT 等下次
+                            continue;
+                        }
+                        // fr == -1：写错误，关闭
+                        int cfd = eng->pr_fd_client[idx];
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                        close(cfd);
+                        pr_free_slot(eng, idx);
+                        continue;
+                    }
+
+                    // P1 原有 proxy 路径：补发上游→客户端方向的余量
+                    if (eng->pr_role[idx] == PR_ROLE_PROXY) {
                     while (remain && remain[idx] > 0) {
-                        ssize_t w = send(s->pr_fd_client[idx], s->pr_up_buf[idx], (size_t)remain[idx], MSG_NOSIGNAL);
+                        ssize_t w = send(eng->pr_fd_client[idx], eng->pr_up_buf[idx], (size_t)remain[idx], MSG_NOSIGNAL);
                         if (w < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // 仍写满，保持 EPOLLOUT
                             werr = 1; break;
@@ -2817,17 +3264,17 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                         if (w == 0) break;
                         // 若只发了 w 字节，剩余前移消除空洞（下次 send 从 buf[0] 发新数据）
                         if (w > 0 && w < remain[idx])
-                            memmove(s->pr_up_buf[idx], s->pr_up_buf[idx] + w, (size_t)(remain[idx] - w));
+                            memmove(eng->pr_up_buf[idx], eng->pr_up_buf[idx] + w, (size_t)(remain[idx] - w));
                         remain[idx] -= (int)w;
                     }
                     if (werr) {
                         // 写错误：连接不可用，关闭两端
-                        int ufd = s->pr_fd_upstream[idx];
-                        int cfd = s->pr_fd_client[idx];
-                        if (ufd > 0) { epoll_ctl(s->epfd, EPOLL_CTL_DEL, ufd, NULL); close(ufd); }
-                        epoll_ctl(s->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                        int ufd = eng->pr_fd_upstream[idx];
+                        int cfd = eng->pr_fd_client[idx];
+                        if (ufd > 0) { epoll_ctl(eng->epfd, EPOLL_CTL_DEL, ufd, NULL); close(ufd); }
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
                         close(cfd);
-                        pr_free_slot(s, idx);
+                        pr_free_slot(eng, idx);
                         continue;
                     }
                     if (remain[idx] == 0) {
@@ -2836,65 +3283,73 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                         memset(&rvev, 0, sizeof(rvev));
                         rvev.events = EPOLLIN | EPOLLRDHUP;
                         rvev.data.u32 = (uint32_t)idx;
-                        epoll_ctl(s->epfd, EPOLL_CTL_MOD, s->pr_fd_client[idx], &rvev);
+                        epoll_ctl(eng->epfd, EPOLL_CTL_MOD, eng->pr_fd_client[idx], &rvev);
                         // 排空后立即做池化完成判定（与既有完成分支一致）
-                        if (s->pr_up_parse[idx] == PR_UP_DONE) {
-                            int ufd = s->pr_fd_upstream[idx];
-                            int cfd = s->pr_fd_client[idx];
-                            epoll_ctl(s->epfd, EPOLL_CTL_DEL, ufd, NULL);   // 摘除但不 close
-                            epoll_ctl(s->epfd, EPOLL_CTL_DEL, cfd, NULL);
-                            if (s->up_pool && s->pr_up_key[idx] && s->pr_up_key[idx][0])
-                                pool_put(s->up_pool, s->pr_up_key[idx], ufd);
+                        if (eng->pr_up_parse[idx] == PR_UP_DONE) {
+                            int ufd = eng->pr_fd_upstream[idx];
+                            int cfd = eng->pr_fd_client[idx];
+                            epoll_ctl(eng->epfd, EPOLL_CTL_DEL, ufd, NULL);   // 摘除但不 close
+                            epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                            if (eng->up_pool && eng->pr_up_key[idx] && eng->pr_up_key[idx][0])
+                                pool_put(eng->up_pool, eng->pr_up_key[idx], ufd);
                             else
                                 close(ufd);
                             close(cfd);
-                            pr_free_slot(s, idx);
+                            pr_free_slot(eng, idx);
                             continue;
                         }
                     }
+                    } // end if (PR_ROLE_PROXY)
                     // 本轮若同时有 EPOLLIN，继续走下面收请求逻辑；否则等下次事件
-                    if (!(events[i].events & (EPOLLIN | EPOLLRDHUP))) continue;
+                    if (eng->pr_role[idx] == PR_ROLE_PROXY &&
+                        !(events[i].events & (EPOLLIN | EPOLLRDHUP))) continue;
                 }
                 // 客户端侧：收请求
-                char*  hbuf = s->pr_hbuf[idx];
-                int*   hlen = &s->pr_hdr_len[idx];
+                // P2: 本地路由处于 SERVE_OUT/SERVE_FILE 阶段时，不再读请求（请求已处理完）
+                if (eng->pr_role[idx] == PR_ROLE_LOCAL &&
+                    (eng->pr_phase[idx] == PR_PHASE_SERVE_OUT ||
+                     eng->pr_phase[idx] == PR_PHASE_SERVE_FILE))
+                    continue;
+                char*  hbuf = eng->pr_hbuf[idx];
+                int*   hlen = &eng->pr_hdr_len[idx];
                 // 每连接 8KB 首包缓冲；上限 8KB 足够覆盖绝大多数首行+部分头
                 int maxsz = 8192;
-                ssize_t nread = recv(s->pr_fd_client[idx], hbuf + *hlen,
+                ssize_t nread = recv(eng->pr_fd_client[idx], hbuf + *hlen,
                                       (size_t)(maxsz - *hlen), 0);
                 if (nread <= 0) {
                     if (nread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                    if (s->pr_fd_upstream[idx] > 0) close(s->pr_fd_upstream[idx]);
-                    epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL);
-                    close(s->pr_fd_client[idx]);
-                    pr_free_slot(s, idx);
+                    if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                    epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                    close(eng->pr_fd_client[idx]);
+                    pr_free_slot(eng, idx);
                     continue;
                 }
                 *hlen += (int)nread;
                 hbuf[*hlen] = '\0';  // 始终 null 终止，安全做字符串操作
+                eng->pr_last_active_ms[idx] = pr_pool_now_ms();  // P7: 刷新空闲时间戳
 
                 // 首次：找首行结束符 \r\n（HTTP 首行结束）
-                if (s->pr_fd_upstream[idx] == 0) {
+                if (eng->pr_fd_upstream[idx] == 0) {
                     char* line_end = memchr(hbuf, '\n', (size_t)*hlen);
                     if (!line_end) continue;  // 首行未收齐，等下次 EPOLLIN
                     *line_end = '\0';         // 截断首行，安全字符串化
                     // 解析 method / path / protocol
                     char method[16] = {0}, path[4096] = {0}, proto[32] = {0};
                     char* sp1 = strchr(hbuf, ' ');
-                    if (!sp1) { send_http_error(s->pr_fd_client[idx], 400, "Bad Request"); if (s->pr_fd_upstream[idx] > 0) close(s->pr_fd_upstream[idx]); epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL); close(s->pr_fd_client[idx]); pr_free_slot(s, idx); continue; }
+                    if (!sp1) { send_http_error(eng->pr_fd_client[idx], 400, "Bad Request"); if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]); epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL); close(eng->pr_fd_client[idx]); pr_free_slot(eng, idx); continue; }
                     char* sp2 = strchr(sp1 + 1, ' ');
-                    if (!sp2) { send_http_error(s->pr_fd_client[idx], 400, "Bad Request"); if (s->pr_fd_upstream[idx] > 0) close(s->pr_fd_upstream[idx]); epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL); close(s->pr_fd_client[idx]); pr_free_slot(s, idx); continue; }
+                    if (!sp2) { send_http_error(eng->pr_fd_client[idx], 400, "Bad Request"); if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]); epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL); close(eng->pr_fd_client[idx]); pr_free_slot(eng, idx); continue; }
                     size_t mlen = sp1 - hbuf;
                     size_t plen = sp2 - (sp1 + 1);
                     size_t vlen = line_end - (sp2 + 1);  // line_end 此时指向 '\0'（已截断）
                     if (mlen == 0 || mlen >= sizeof(method) ||
                         plen == 0 || plen >= sizeof(path) ||
                         vlen == 0 || vlen >= sizeof(proto)) {
-                        send_http_error(s->pr_fd_client[idx], 400, "Bad Request");
-                        if (s->pr_fd_upstream[idx] > 0) close(s->pr_fd_upstream[idx]);
-                        epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL);
-                        close(s->pr_fd_client[idx]);
-                        pr_free_slot(s, idx);
+                        send_http_error(eng->pr_fd_client[idx], 400, "Bad Request");
+                        if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                        close(eng->pr_fd_client[idx]);
+                        pr_free_slot(eng, idx);
                         continue;
                     }
                     memcpy(method, hbuf, mlen);
@@ -2905,74 +3360,72 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                     // 重置 *hlen 为 0，后续 body 从 0 起累积
                     *hlen = 0;
 
-                    int ridx = pr_lookup_route_idx(s, path);
+                    // P5: 一次拿锁同时拿到 idx + route 指针，缓存到 pr_route_ptr，热路径不再二次拿锁遍历
                     nl_web_route_t* r = NULL;
-                    pthread_mutex_lock(&s->mutex);
-                    int cur = 0;
-                    for (nl_web_route_t* it = s->routes; it; it = it->next, cur++)
-                        if (cur == ridx) { r = it; break; }
-                    pthread_mutex_unlock(&s->mutex);
+                    int ridx = pr_lookup_route(s, path, &r);
+                    eng->pr_route_idx[idx] = ridx;
+                    if (eng->pr_route_ptr) eng->pr_route_ptr[idx] = r;
                     if (!r) {
-                        send_http_error(s->pr_fd_client[idx], 404, "Not Found");
-                        epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL);
-                        close(s->pr_fd_client[idx]);
-                        pr_free_slot(s, idx);
+                        send_http_error(eng->pr_fd_client[idx], 404, "Not Found");
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                        close(eng->pr_fd_client[idx]);
+                        pr_free_slot(eng, idx);
                         continue;
                     }
                     // 完整路由分发（解决混合路由限制：引擎同时处理 PROXY + CONTENT + FILE + REDIRECT）
-                    // 非 proxy 路由：临时切阻塞（复用 worker 池已验证的 send_http_response / redirect 模板），
-                    // 处理完直接 close + free slot；proxy 路由保持非阻塞走引擎 pump 链路。
+                    // P2: 非 proxy 路由全异步（pr_build_local_response + pr_flush_local_out）；
+                    // proxy 路由保持非阻塞走引擎 pump 链路。
                     if (r->type != NL_ROUTE_TYPE_PROXY) {
-                        int cfd_loc = s->pr_fd_client[idx];
-                        // 临时切阻塞：去掉 O_NONBLOCK
-                        int fl_tmp = fcntl(cfd_loc, F_GETFL, 0);
-                        fcntl(cfd_loc, F_SETFL, fl_tmp & ~O_NONBLOCK);
-
-                        if (r->type == NL_ROUTE_TYPE_REDIRECT) {
-                            char resp[1024];
-                            snprintf(resp, sizeof(resp),
-                                "HTTP/1.1 302 Found\r\n"
-                                "Location: %s\r\n"
-                                "Content-Length: 0\r\n"
-                                "Connection: close\r\n\r\n",
-                                r->redirect_url);
-                            write(cfd_loc, resp, strlen(resp));
-                        }
-                        else if (r->type == NL_ROUTE_TYPE_FILE) {
-                            FILE* fp = fopen(r->file_path, "rb");
-                            if (!fp) {
-                                send_http_error(cfd_loc, 404, "File Not Found");
-                            } else {
-                                fseek(fp, 0, SEEK_END);
-                                long fsz = ftell(fp);
-                                fseek(fp, 0, SEEK_SET);
-                                if (fsz > 0 && fsz <= 10*1024*1024) {
-                                    char* fc = (char*)malloc(fsz + 1);
-                                    if (fc) {
-                                        size_t rs = fread(fc, 1, fsz, fp);
-                                        fc[rs] = '\0';
-                                        send_http_response(cfd_loc, r->content_type, fc, rs);
-                                        free(fc);
-                                    } else {
-                                        send_http_error(cfd_loc, 500, "Memory Error");
-                                    }
-                                } else {
-                                    send_http_error(cfd_loc, 500, "File Too Large");
+                        int built = pr_build_local_response(eng, idx, r, method, path,
+                                                             eng->pr_outbuf[idx], 8192);
+                        if (built) {
+                            // outbuf 已构造，立即尝试全异步发送
+                            int fr = pr_flush_local_out(eng, idx);
+                            if (fr > 0) {
+                                // 全部发出
+                                if (eng->pr_body_remain[idx] > 0) {
+                                    // 还有 body 剩余（BODY_MEM/BODY_FILE）：进入 SERVE_FILE 阶段分块流式
+                                    eng->pr_phase[idx] = PR_PHASE_SERVE_FILE;
+                                    // 注册 EPOLLOUT（此时 outbuf 已发完，等下次可写事件推进 body 块）
+                                    struct epoll_event ouv;
+                                    memset(&ouv, 0, sizeof(ouv));
+                                    ouv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+                                    ouv.data.u32 = (uint32_t)idx;
+                                    epoll_ctl(eng->epfd, EPOLL_CTL_MOD, eng->pr_fd_client[idx], &ouv);
+                                    continue;
                                 }
-                                fclose(fp);
+                                // 无 body 或已读完：关闭连接
+                                int cfd = eng->pr_fd_client[idx];
+                                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                                close(cfd);
+                                pr_free_slot(eng, idx);
+                                continue;
                             }
+                            if (fr == 0) {
+                                // EAGAIN：已注册 EPOLLOUT，等事件补发（不继续读请求）
+                                continue;
+                            }
+                            // fr == -1：写错误，关闭
+                            int cfd = eng->pr_fd_client[idx];
+                            epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                            close(cfd);
+                            pr_free_slot(eng, idx);
+                            continue;
                         }
-                        else { // NL_ROUTE_TYPE_CONTENT
-                            send_http_response(cfd_loc, r->content_type,
-                                              r->content, strlen(r->content));
-                        }
-                        epoll_ctl(s->epfd, EPOLL_CTL_DEL, cfd_loc, NULL);
-                        close(cfd_loc);
-                        pr_free_slot(s, idx);
+                        // built == 0：pr_build_local_response 已直接写错误响应，关闭
+                        int cfd = eng->pr_fd_client[idx];
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                        close(cfd);
+                        pr_free_slot(eng, idx);
                         continue;
                     }
-                    // proxy 路由：连接上游（优先复用池中空闲连接，未命中再新建，阻塞式 + 5s 超时兜底）
-                    s->pr_req_is_head[idx] = (strcmp(method, "HEAD") == 0) ? 1 : 0;
+                    // proxy 路由：标记角色，连接上游
+                    eng->pr_role[idx] = PR_ROLE_PROXY;
+                    eng->pr_phase[idx] = PR_PHASE_PROXY_CONN;
+                    // P5 内存控制：pr_up_buf 只在 proxy 连接按需分配（64KB 是"内存杀手"，本地路由不需要）
+                    if (!eng->pr_up_buf[idx])
+                        eng->pr_up_buf[idx] = (char*)malloc(PR_PROXY_BUF_SZ);
+                    eng->pr_req_is_head[idx] = (strcmp(method, "HEAD") == 0) ? 1 : 0;
                     char up_host[512];
                     int  up_port = 0;
                     {
@@ -2984,30 +3437,30 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                         if (up_port <= 0) up_port = (r->protocol == NL_PROXY_HTTPS) ? 443 : 80;
                     }
                     int ufd = -1;
-                    if (r->protocol != NL_PROXY_TCP && s->up_pool)
-                        ufd = pool_get(s->up_pool, up_host, up_port, (int)r->protocol);
+                    if (r->protocol != NL_PROXY_TCP && eng->up_pool)
+                        ufd = pool_get(eng->up_pool, up_host, up_port, (int)r->protocol);
                     if (ufd < 0) ufd = nl_proxy_connect_upstream(r);
                     if (ufd < 0) {
-                        send_http_error(s->pr_fd_client[idx], 502, "Bad Gateway");
-                        epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL);
-                        close(s->pr_fd_client[idx]);
-                        pr_free_slot(s, idx);
+                        send_http_error(eng->pr_fd_client[idx], 502, "Bad Gateway");
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                        close(eng->pr_fd_client[idx]);
+                        pr_free_slot(eng, idx);
                         continue;
                     }
-                    s->pr_fd_upstream[idx] = ufd;
+                    eng->pr_fd_upstream[idx] = ufd;
                     // 记录池 key（tcp 不参与池，置空），响应完成归还池时使用
-                    if (s->pr_up_key[idx]) {
+                    if (eng->pr_up_key[idx]) {
                         if (r->protocol != NL_PROXY_TCP)
-                            pr_pool_make_key(s->pr_up_key[idx], 576, up_host, up_port, (int)r->protocol);
+                            pr_pool_make_key(eng->pr_up_key[idx], 576, up_host, up_port, (int)r->protocol);
                         else
-                            s->pr_up_key[idx][0] = '\0';
+                            eng->pr_up_key[idx][0] = '\0';
                     }
                     int uf = fcntl(ufd, F_GETFL, 0);
                     fcntl(ufd, F_SETFL, uf | O_NONBLOCK);
-                    s->pr_route_idx[idx] = ridx;
+                    eng->pr_route_idx[idx] = ridx;
                     // 构造上游请求：TCP 透传 / HTTP 重组（输出到本连接独立缓冲）
-                    char* ubuf = s->pr_hbuf_out[idx];
-                    int build_n = pr_build_upstream_http(s, idx, method, path, proto,
+                    char* ubuf = eng->pr_hbuf_out[idx];
+                    int build_n = pr_build_upstream_http(eng, idx, method, path, proto,
                                                           NULL, 0, ubuf, 8192);
                     if (build_n > 0) {
                         // 非阻塞发出上游请求；EAGAIN 则下次 EPOLLOUT 事件再补
@@ -3023,8 +3476,8 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                             memset(&ouv, 0, sizeof(ouv));
                             ouv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
                             ouv.data.u32 = (uint32_t)idx | 0x40000000u;
-                            epoll_ctl(s->epfd, EPOLL_CTL_MOD, ufd, &ouv);
-                            s->pr_state[idx] |= PR_ST_DIR_W | PR_ST_ACTIVE;
+                            epoll_ctl(eng->epfd, EPOLL_CTL_MOD, ufd, &ouv);
+                            eng->pr_state[idx] |= PR_ST_DIR_W | PR_ST_ACTIVE;
                             continue;
                         }
                     }
@@ -3033,102 +3486,135 @@ void nl_web_proxy_engine(nl_web_server_t* s, int listen_fd) {
                     memset(&uev, 0, sizeof(uev));
                     uev.events = EPOLLIN | EPOLLRDHUP;
                     uev.data.u32 = (uint32_t)idx | 0x40000000u;
-                    epoll_ctl(s->epfd, EPOLL_CTL_ADD, ufd, &uev);
-                    s->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
+                    epoll_ctl(eng->epfd, EPOLL_CTL_ADD, ufd, &uev);
+                    eng->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
                     continue;
                 }
 
                 // 后续客户端数据（body 等）→ 非阻塞转发上游（该方向不解析）
-                int rc = pr_pump_once(s, idx, s->pr_fd_client[idx],
-                                       s->pr_fd_upstream[idx], hbuf, 8192, 0);
+                int rc = pr_pump_once(eng, idx, eng->pr_fd_client[idx],
+                                       eng->pr_fd_upstream[idx], hbuf, 8192, 0);
                 if (rc < 0) {
-                    if (s->pr_fd_upstream[idx] > 0) close(s->pr_fd_upstream[idx]);
-                    epoll_ctl(s->epfd, EPOLL_CTL_DEL, s->pr_fd_client[idx], NULL);
-                    close(s->pr_fd_client[idx]);
-                    pr_free_slot(s, idx);
+                    if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                    epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                    close(eng->pr_fd_client[idx]);
+                    pr_free_slot(eng, idx);
                 }
                 continue;
             }
 
             // 上游侧：读响应 → 写客户端（该方向旁路喂 framing 解析器）
-            int rc = pr_pump_once(s, idx, s->pr_fd_upstream[idx], s->pr_fd_client[idx], s->pr_up_buf[idx], PR_PROXY_BUF_SZ, 1);
+            // P5: pr_up_buf 懒分配，proxy 连接若分配失败则直接关闭
+            if (!eng->pr_up_buf[idx]) {
+                if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                close(eng->pr_fd_client[idx]);
+                pr_free_slot(eng, idx);
+                continue;
+            }
+            int rc = pr_pump_once(eng, idx, eng->pr_fd_upstream[idx], eng->pr_fd_client[idx], eng->pr_up_buf[idx], PR_PROXY_BUF_SZ, 1);
             if (rc == 0 || rc < 0) {
                 // 上游 EOF / 错误：连接已不可复用，关闭两端
-                if (rc == 0) s->pr_state[idx] |= PR_ST_UP_EOF;
-                int ufd = s->pr_fd_upstream[idx];
-                int cfd = s->pr_fd_client[idx];
-                epoll_ctl(s->epfd, EPOLL_CTL_DEL, ufd, NULL);
-                epoll_ctl(s->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                if (rc == 0) eng->pr_state[idx] |= PR_ST_UP_EOF;
+                int ufd = eng->pr_fd_upstream[idx];
+                int cfd = eng->pr_fd_client[idx];
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, ufd, NULL);
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
                 close(ufd); close(cfd);
-                pr_free_slot(s, idx);
+                pr_free_slot(eng, idx);
                 continue;
             }
             // 客户端写慢（send EAGAIN）导致仍有未发完的响应余量：
             // 给客户端 fd 补注册 EPOLLOUT，等可写事件唤醒补发（保留 EPOLLIN，避免破坏收请求）
-            if (rc == 1 && s->pr_remain[idx] > 0) {
+            if (rc == 1 && eng->pr_remain[idx] > 0) {
                 struct epoll_event wev;
                 memset(&wev, 0, sizeof(wev));
                 wev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
                 wev.data.u32 = (uint32_t)idx;   // 客户端侧（高位 0x40000000 为 0）
-                epoll_ctl(s->epfd, EPOLL_CTL_MOD, s->pr_fd_client[idx], &wev);
+                epoll_ctl(eng->epfd, EPOLL_CTL_MOD, eng->pr_fd_client[idx], &wev);
             }
             // 响应 framing 判定完成且已全部转发客户端 → 上游归还池，关闭客户端
-            if (s->pr_up_parse[idx] == PR_UP_DONE && s->pr_remain[idx] == 0) {
-                int ufd = s->pr_fd_upstream[idx];
-                int cfd = s->pr_fd_client[idx];
-                epoll_ctl(s->epfd, EPOLL_CTL_DEL, ufd, NULL);   // 摘除但不 close
-                epoll_ctl(s->epfd, EPOLL_CTL_DEL, cfd, NULL);
-                if (s->up_pool && s->pr_up_key[idx] && s->pr_up_key[idx][0])
-                    pool_put(s->up_pool, s->pr_up_key[idx], ufd);
+            if (eng->pr_up_parse[idx] == PR_UP_DONE && eng->pr_remain[idx] == 0) {
+                int ufd = eng->pr_fd_upstream[idx];
+                int cfd = eng->pr_fd_client[idx];
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, ufd, NULL);   // 摘除但不 close
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                if (eng->up_pool && eng->pr_up_key[idx] && eng->pr_up_key[idx][0])
+                    pool_put(eng->up_pool, eng->pr_up_key[idx], ufd);
                 else
                     close(ufd);   // 无池/tcp：退回关闭
                 close(cfd);
-                pr_free_slot(s, idx);
+                pr_free_slot(eng, idx);
             }
         }
     }
 
     // 清理所有活动连接
-    for (int i = 0; i < s->pr_cap; i++) {
-        if (s->pr_state[i] & PR_ST_ACTIVE) {
-            if (s->pr_fd_client[i] > 0) close(s->pr_fd_client[i]);
-            if (s->pr_fd_upstream[i] > 0) close(s->pr_fd_upstream[i]);
-            s->pr_state[i] = 0;
+    for (int i = 0; i < eng->cap; i++) {
+        if (eng->pr_state[i] & PR_ST_ACTIVE) {
+            if (eng->pr_fd_client[i] > 0) close(eng->pr_fd_client[i]);
+            if (eng->pr_fd_upstream[i] > 0) close(eng->pr_fd_upstream[i]);
+            eng->pr_state[i] = 0;
         }
-        if (s->pr_hbuf[i])     free(s->pr_hbuf[i]);
-        if (s->pr_hbuf_out[i]) free(s->pr_hbuf_out[i]);
-        if (s->pr_up_buf[i])   free(s->pr_up_buf[i]);
-        if (s->pr_up_key && s->pr_up_key[i]) free(s->pr_up_key[i]);
+        if (eng->pr_hbuf[i])     free(eng->pr_hbuf[i]);
+        if (eng->pr_hbuf_out[i]) free(eng->pr_hbuf_out[i]);
+        if (eng->pr_up_buf[i])   free(eng->pr_up_buf[i]);
+        if (eng->pr_up_key && eng->pr_up_key[i]) free(eng->pr_up_key[i]);
+        // P2/P3: 本地响应缓冲 + 文件句柄（BODY_MEM 指向 route->content 不 free）
+        if (eng->pr_outbuf[i])   free(eng->pr_outbuf[i]);
+        if (eng->pr_body_src[i]) {
+            if (eng->pr_body_kind[i] == PR_BODY_FILE)
+                fclose((FILE*)eng->pr_body_src[i]);
+        }
     }
     // 销毁上游连接池（关闭全部空闲上游连接）
-    if (s->up_pool) { pool_destroy(s->up_pool); free(s->up_pool); s->up_pool = NULL; }
-    close(s->epfd);
-    s->epfd = -1;
-    free(s->pr_fd_client);   free(s->pr_fd_upstream);   free(s->pr_route_idx);
-    free(s->pr_state);       free(s->pr_hbuf);          free(s->pr_hbuf_out);
-    free(s->pr_up_buf);
-    free(s->pr_hdr_len);     free(s->pr_remain);        free(s->pr_free);
-    free(s->pr_up_parse);    free(s->pr_up_cl);         free(s->pr_chunk_rem);
-    free(s->pr_chunk_state); free(s->pr_up_hlen);       free(s->pr_req_is_head);
-    free(s->pr_up_key);
-    s->pr_fd_client = NULL;
-    s->pr_fd_upstream = NULL;
-    s->pr_route_idx = NULL;
-    s->pr_state = NULL;
-    s->pr_hbuf = NULL;
-    s->pr_hbuf_out = NULL;
-    s->pr_up_buf = NULL;
-    s->pr_hdr_len = NULL;
-    s->pr_remain = NULL;
-    s->pr_free = NULL;
-    s->pr_up_parse = NULL;
-    s->pr_up_cl = NULL;
-    s->pr_chunk_rem = NULL;
-    s->pr_chunk_state = NULL;
-    s->pr_up_hlen = NULL;
-    s->pr_req_is_head = NULL;
-    s->pr_up_key = NULL;
-    s->pr_cap = s->pr_count = 0;
+    if (eng->up_pool) { pool_destroy(eng->up_pool); free(eng->up_pool); eng->up_pool = NULL; }
+    close(eng->epfd);
+    eng->epfd = -1;
+    free(eng->pr_fd_client);   free(eng->pr_fd_upstream);   free(eng->pr_route_idx);
+    free(eng->pr_route_ptr);
+    free(eng->pr_state);       free(eng->pr_hbuf);          free(eng->pr_hbuf_out);
+    free(eng->pr_up_buf);
+    free(eng->pr_hdr_len);     free(eng->pr_remain);        free(eng->free);
+    free(eng->pr_up_parse);    free(eng->pr_up_cl);         free(eng->pr_chunk_rem);
+    free(eng->pr_chunk_state); free(eng->pr_up_hlen);       free(eng->pr_req_is_head);
+    free(eng->pr_up_key);
+    // P2: 全异步输出数组
+    free(eng->pr_role);        free(eng->pr_phase);       free(eng->pr_outbuf);
+    free(eng->pr_out_len);    free(eng->pr_out_off);      free(eng->pr_body_src);
+    free(eng->pr_body_remain); free(eng->pr_body_kind);
+    free(eng->pr_use_chunked);
+    free(eng->pr_last_active_ms);
+    eng->pr_fd_client = NULL;
+    eng->pr_fd_upstream = NULL;
+    eng->pr_route_idx = NULL;
+    eng->pr_route_ptr = NULL;
+    eng->pr_state = NULL;
+    eng->pr_hbuf = NULL;
+    eng->pr_hbuf_out = NULL;
+    eng->pr_up_buf = NULL;
+    eng->pr_hdr_len = NULL;
+    eng->pr_remain = NULL;
+    eng->free = NULL;
+    eng->pr_up_parse = NULL;
+    eng->pr_up_cl = NULL;
+    eng->pr_chunk_rem = NULL;
+    eng->pr_chunk_state = NULL;
+    eng->pr_up_hlen = NULL;
+    eng->pr_req_is_head = NULL;
+    eng->pr_up_key = NULL;
+    // P2
+    eng->pr_role = NULL;
+    eng->pr_phase = NULL;
+    eng->pr_outbuf = NULL;
+    eng->pr_out_len = NULL;
+    eng->pr_out_off = NULL;
+    eng->pr_body_src = NULL;
+    eng->pr_body_remain = NULL;
+    eng->pr_body_kind = NULL;
+    eng->pr_use_chunked = NULL;
+    eng->pr_last_active_ms = NULL;
+    eng->cap = eng->count = 0;
 }
 
 static void nl_handle_client(nl_web_server_t* server, int client) {
@@ -3432,7 +3918,16 @@ nl_web_server_t* nl_web_create(int port) {
     
     server->port = port;
     server->routes = NULL;
-    server->epfd = -1;  // 数据驱动代理引擎初始化为未启用
+    // P1/P6：引擎子结构由 nl_web_start 按需分配，此处仅初始化指针
+    server->engines = NULL;
+    server->engine_count = 0;
+    server->engine_slots = NULL;
+    server->engine_threads = NULL;
+    server->engine_threads_ready = 0;
+    server->engine_threads_cfg = 0;   // 0 = 自动（逻辑核数）
+    server->max_conns_cfg = 0;        // 0 = 自动（ncpu*64）
+    server->idle_timeout_ms = 0;      // 0 = 默认 30s
+    server->force_legacy_pool = 0;    // 0 = 引擎模式（默认）
     pthread_mutex_init(&server->mutex, NULL);
     nl_route_hash_init(server);
     strncpy(server->encoding, "UTF-8", sizeof(server->encoding) - 1);
@@ -3477,67 +3972,173 @@ void nl_web_destroy(nl_web_server_t* server) {
     pthread_mutex_destroy(&server->mutex);
     free(server->route_hash);
     free(server->workers);
+    // P6: 释放引擎子结构（多实例时遍历所有引擎的 pr_* 数组已由各线程自行释放）
+    if (server->engines) { free(server->engines); server->engines = NULL; }
+    if (server->engine_slots) { free(server->engine_slots); server->engine_slots = NULL; }
+    if (server->engine_threads) { free(server->engine_threads); server->engine_threads = NULL; }
     free(server);
 }
 
 // 引擎线程入口：把 nl_web_proxy_engine 适配为 pthread 回调签名
+// 单实例：arg 直接是 nl_web_server_t*（engines[0]）
 static void* nl_web_proxy_engine_thread(void* arg) {
     nl_web_server_t* s = (nl_web_server_t*)arg;
-    nl_web_proxy_engine(s, s->sock);
+    nl_web_engine_t* eng = s->engines;  // engines[0]
+    eng->sock = s->sock;
+    nl_web_proxy_engine(eng, s->sock, 0);
+    return NULL;
+}
+
+// P6: 多实例引擎线程入口（SO_REUSEPORT）
+struct pr_engine_thread_arg {
+    nl_web_server_t* server;
+    int listen_fd;
+    int ring_cap;   // >0 时按指定容量初始化 ring；0 时自动
+    int index;      // 引擎实例序号（定位 engines[index]）
+};
+
+static void* nl_web_proxy_engine_thread_multi(void* arg) {
+    struct pr_engine_thread_arg* a = (struct pr_engine_thread_arg*)arg;
+    nl_web_server_t* s = a->server;
+    nl_web_engine_t* eng = &s->engines[a->index];
+    eng->sock = a->listen_fd;
+    nl_web_proxy_engine(eng, a->listen_fd, a->ring_cap);
+    free(a);   // P6: 线程自释放 arg（start 不持有，避免泄漏）
     return NULL;
 }
 
 int nl_web_start(nl_web_server_t* server) {
     if (!server || server->running) return -1;
     
-    server->sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server->sock < 0) return -1;
-    
     int opt = 1;
-    setsockopt(server->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((unsigned short)server->port);
-    
+
+    // P5/P6: 默认走数据驱动引擎（epoll），除非显式 nl_web_force_legacy_pool(1)
+    // P6: engine_threads_cfg > 1 时走 SO_REUSEPORT 多实例
+    int n_engines = 0;
+    if (server->force_legacy_pool) {
+        n_engines = 0;  // legacy worker 池
+    } else {
+        n_engines = server->engine_threads_cfg;
+        if (n_engines <= 0) n_engines = 1;  // 默认单实例
+        if (n_engines > 1) {
+            // 多实例：N 个 listen socket（SO_REUSEPORT），共享 4 元组，内核均衡
+            int total_conns = server->max_conns_cfg;
+            if (total_conns <= 0) {
+                // 自动：ncpu*64 总量，按 N 均分
+                int auto_cap = nl_web_proxy_ring_capacity();
+                total_conns = auto_cap;
+            }
+            int per_cap = total_conns / n_engines;
+            if (per_cap < 64) per_cap = 64;
+            (void)per_cap;  // 实际 per-cap 在 nl_web_start 内计算
+        }
+    }
+
+    if (n_engines >= 1) {
+        // P6: 多实例 SO_REUSEPORT 分支
+        int listen_fds[256];
+        int sock_cnt = 0;
+        for (int i = 0; i < n_engines && i < 256; i++) {
+            int sk = socket(AF_INET, SOCK_STREAM, 0);
+            if (sk < 0) {
+                for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+                return -1;
+            }
+            setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            // P6: SO_REUSEPORT（多实例共享 4 元组）
+            setsockopt(sk, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+            if (bind(sk, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                close(sk);
+                for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+                return -1;
+            }
+            if (listen(sk, SOMAXCONN) < 0) {
+                close(sk);
+                for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+                return -1;
+            }
+            listen_fds[sock_cnt++] = sk;
+        }
+        // 主 sock 记第一个（兜底 nl_web_stop 清理）
+        server->sock = listen_fds[0];
+        // 其余 sock 由 engines[i].sock 持有（线程内清理）
+        server->engines = (nl_web_engine_t*)malloc(sizeof(nl_web_engine_t) * (size_t)n_engines);
+        if (!server->engines) {
+            for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+            server->sock = -1;
+            return -1;
+        }
+        for (int i = 0; i < n_engines; i++) {
+            memset(&server->engines[i], 0, sizeof(nl_web_engine_t));
+            server->engines[i].server = server;
+            server->engines[i].epfd = -1;
+            server->engines[i].sock = listen_fds[i];
+        }
+        server->engine_count = n_engines;
+        server->engine_slots = (int*)calloc((size_t)n_engines, sizeof(int));
+        // P7: 空闲超时
+        // P6: 总连接预算按 N 均分
+        int total_conns = server->max_conns_cfg;
+        if (total_conns <= 0) total_conns = nl_web_proxy_ring_capacity();
+        int per_cap = total_conns / n_engines;
+        if (per_cap < 64) per_cap = 64;
+        if (per_cap > 4096) per_cap = 4096;
+
+        server->engine_threads = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)n_engines);
+        if (!server->engine_threads) {
+            free(server->engines);
+            for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+            server->sock = -1;
+            return -1;
+        }
+        for (int i = 0; i < n_engines; i++) {
+             struct pr_engine_thread_arg* a = (struct pr_engine_thread_arg*)malloc(sizeof(struct pr_engine_thread_arg));
+             if (!a) {
+                 for (int j = 0; j < i; j++) pthread_join(server->engine_threads[j], NULL);
+                 free(server->engine_threads);
+                 free(server->engines);
+                 for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+                 server->sock = -1;
+                 return -1;
+             }
+             a->server = server;
+             a->listen_fd = listen_fds[i];
+             a->ring_cap = per_cap;
+             a->index = i;
+             int rc = pthread_create(&server->engine_threads[i], NULL,
+                                     (void*(*)(void*))nl_web_proxy_engine_thread_multi, a);
+             if (rc != 0) { free(a); break; }
+             server->engine_threads_ready++;
+         }
+         server->running = 1;
+         // 主线程不 join 单实例（server->thread 未用）；多实例时由 nl_web_stop 遍历 join
+        if (n_engines == 1) {
+            // 单实例：记录到 server->thread（nl_web_stop 通过 server->thread join）
+            server->thread = server->engine_threads[0];
+            server->engine_threads[0] = 0;  // 避免 nl_web_stop 重复 join
+        }
+        return 0;
+    }
+
+    // legacy worker 池分支（P5 回退开关 force_legacy_pool=1）
+    server->sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->sock < 0) return -1;
+    setsockopt(server->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     if (bind(server->sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(server->sock);
         return -1;
     }
-    
     if (listen(server->sock, SOMAXCONN) < 0) {
         close(server->sock);
         return -1;
     }
-    
     server->running = 1;
-
-    // 检测是否存在 proxy 路由：有则走 epoll 数据驱动引擎（单线程泵 N 条连接），
-    // 否则回退到 worker 池（兼容旧行为：static/content/redirect/file 路由）
-    int has_proxy = 0;
-    {
-        pthread_mutex_lock(&server->mutex);
-        for (nl_web_route_t* r = server->routes; r; r = r->next)
-            if (r->type == NL_ROUTE_TYPE_PROXY) { has_proxy = 1; break; }
-        pthread_mutex_unlock(&server->mutex);
-    }
-
-    if (has_proxy) {
-        // 数据驱动引擎：epoll 多路复用，单线程，极低占用（非阻塞 fd + 空闲 1s 退避）
-        pthread_t engine_thread;
-        // 引擎线程运行 nl_web_proxy_engine；nl_web_stop 时通过 running=0 唤醒 epoll_wait 超时退出
-        int rc = pthread_create(&engine_thread, NULL,
-                                (void*(*)(void*))nl_web_proxy_engine_thread, server);
-        server->thread = engine_thread;
-        (void)rc;  // 引擎启动失败时 running=0，nl_web_stop 直接 join 超时退出
-        return 0;
-    }
-
     // 全动态化：worker 池容量按需分配。未显式设置时用 WEB_WORKER_DEFAULT。
-    // 保留 64 上限（线程栈资源上限）防止误配置；worker_count 为 0 时由
-    // web_server_thread 回退到 accept 线程自处理连接。
     int target = server->worker_count > 0 ? server->worker_count : WEB_WORKER_DEFAULT;
     if (target > 64) target = 64;
     if (server->worker_capacity < target) {
@@ -3562,6 +4163,40 @@ int nl_web_set_worker_count(nl_web_server_t* server, int target) {
     return 0;
 }
 
+// P6: 设置引擎线程数（0 = 自动 = 逻辑核数；1 = 单实例）
+// 在 nl_web_start 前调用生效；已 start 的服务器下次重启后生效。
+int nl_web_set_engine_threads(nl_web_server_t* server, int n) {
+    if (!server) return -1;
+    if (n < 0) n = 0;
+    if (n > 128) n = 128;  // 上限保护
+    server->engine_threads_cfg = n;
+    return 0;
+}
+
+// P6: 设置总连接预算（按 engine_count 均分到每实例 ring cap）
+// 0 = 自动（ncpu*64）；在 nl_web_start 前调用生效。
+int nl_web_set_max_conns(nl_web_server_t* server, int total) {
+    if (!server) return -1;
+    if (total < 0) total = 0;
+    server->max_conns_cfg = total;
+    return 0;
+}
+
+// P7: 设置连接空闲超时（ms），防 slowloris；0 = 默认 30s
+int nl_web_set_idle_timeout(nl_web_server_t* server, int ms) {
+    if (!server) return -1;
+    if (ms < 0) ms = 0;
+    server->idle_timeout_ms = ms;
+    return 0;
+}
+
+// P5: 回退到 legacy worker 池（过渡期开关）；enable=1 时 nl_web_start 走 worker 池而非引擎
+int nl_web_force_legacy_pool(nl_web_server_t* server, int enable) {
+    if (!server) return -1;
+    server->force_legacy_pool = enable ? 1 : 0;
+    return 0;
+}
+
 void nl_web_stop(nl_web_server_t* server) {
     if (!server || !server->running) return;
     
@@ -3573,16 +4208,24 @@ void nl_web_stop(nl_web_server_t* server) {
     }
     
     // 数据驱动引擎：epfd 由 nl_web_proxy_engine 自行清理并置 -1
-    // 兜底：若引擎异常未清理，强制关闭
-    if (server->epfd > 0) {
-        close(server->epfd);
-        server->epfd = -1;
+    // P6: 多实例时遍历所有引擎（兜底：若引擎异常未清理，强制关闭）
+    if (server->engines && server->engine_count > 0) {
+        for (int i = 0; i < server->engine_count; i++) {
+            nl_web_engine_t* e = &server->engines[i];
+            if (e->epfd > 0) { close(e->epfd); e->epfd = -1; }
+            if (e->up_pool) { pool_destroy(e->up_pool); free(e->up_pool); e->up_pool = NULL; }
+        }
     }
-    // 兜底：上游连接池（正常已在引擎退出时销毁）
-    if (server->up_pool) {
-        pool_destroy(server->up_pool);
-        free(server->up_pool);
-        server->up_pool = NULL;
+    // P6: join 多实例引擎线程（单实例时 engines[0] 线程已走 server->thread join）
+    if (server->engine_threads && server->engine_count > 1) {
+        for (int i = 0; i < server->engine_count; i++) {
+            if (server->engine_threads[i]) {
+                pthread_join(server->engine_threads[i], NULL);
+                server->engine_threads[i] = 0;
+            }
+        }
+        free(server->engine_threads);
+        server->engine_threads = NULL;
     }
 
     // 清理 worker 线程（兜底：正常情况下 web_server_thread 内已 join）
@@ -4190,6 +4833,9 @@ static void cleanup_all_web_servers(void) {
         
         pthread_mutex_destroy(&server->mutex);
         free(server->route_hash);
+        free(server->workers);
+        if (server->engines) { free(server->engines); server->engines = NULL; }
+        free(server->engine_slots);
         free(server);
         
         pthread_mutex_lock(&g_web_servers_mutex);

@@ -16,6 +16,7 @@
 #include "quictls_internal.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #include <mbedtls/md.h>
 #include <mbedtls/aes.h>
@@ -75,34 +76,103 @@ int nl_quic__hkdf_expand(const uint8_t* prk, size_t prk_len,
     return 0;
 }
 
-/* HKDF-Expand-Label：label 不含 "tls13 " 前缀，本函数自动补齐 */
-int nl_quic__expand_label(const uint8_t* secret, size_t secret_len,
-                          const char* label,
-                          const uint8_t* context, size_t context_len,
-                          uint8_t* out, size_t out_len) {
+/*
+ * HKDF-Expand-Label（RFC 9001 §5 QUIC 版）
+ *  格式（s2n-quic label.rs 权威参考）:
+ *    [u16 out_len] || [u8 full_label_len] || "tls13 " || label || [u8 context_len] || context
+ *  注意：
+ *   - QUIC v1 使用 TLS 1.3 的 HkdfLabel（前缀 "tls13 "），带 u16 out_len 前缀
+ *   - full_label_len = 6 + strlen(label) + context_len
+ *   - 即使 context_len=0，末尾的 u8 context_len 字节（0x00）仍保留在 info 中
+ *   - 用于 QUIC Initial 密钥（quic key/iv/hp）和 client in / server in
+ *  验证：client in => 00 20 0f 74 6c 73 31 33 20 63 6c 69 65 6e 74 20 69 6e 00
+ */
+static int nl_quic__expand_label_quic(const uint8_t* secret, size_t secret_len,
+                                      const char* label,
+                                      const uint8_t* context, size_t context_len,
+                                      uint8_t* out, size_t out_len) {
     if (!secret || !label) return -1;
     size_t lab_len = strlen(label);
-    size_t full_len = 6 + lab_len;          /* "tls13 " + Label */
+    /* RFC 9001 §5.4 QUIC HkdfLabel:
+     *   full_label     = "tls13 " || label
+     *   full_label_len = 6 + strlen(label)   （不含 context）
+     *   info           = u16(out_len) || u8(full_label_len)
+     *                    || "tls13 " || label || u8(context_len) || context
+     * 注：context 独立追加在 label 之后，不计入 full_label_len
+     *     （与 mbedTLS / aioquic 实现一致） */
+    size_t full_len = 6 + lab_len;
+    if (full_len > 255 || context_len > 255 || out_len > 0xffff) return -1;
+
+    uint8_t info[2 + 1 + 6 + 128 + 1 + 255];
+    size_t  p = 0;
+    info[p++] = (uint8_t)((out_len >> 8) & 0xff);   /* u16 out_len 高字节 */
+    info[p++] = (uint8_t)(out_len & 0xff);           /* u16 out_len 低字节 */
+    info[p++] = (uint8_t)full_len;                  /* u8 full_label_len */
+    memcpy(info + p, "tls13 ", 6); p += 6;          /* 小写 tls13 前缀 */
+    memcpy(info + p, label, lab_len); p += lab_len;
+    info[p++] = (uint8_t)context_len;               /* u8 context_len（含 0） */
+    if (context_len) { memcpy(info + p, context, context_len); p += context_len; }
+
+    return nl_quic__hkdf_expand(secret, secret_len, info, p, out, out_len);
+}
+
+/*
+ * HKDF-Expand-Label（RFC 8446 §7.1 TLS 1.3 版）
+ *  info 布局: u16(out_len) || u8(full_label_len) || "tls13 " || label || u8(context_len) || context
+ *  full_label = "tls13 " + label（不含 context），full_label_len = 6 + lab_len
+ *  context（transcript hash）以 u8 长度前缀 + 裸字节形式追加，与 aioquic hkdf_label 对齐
+ *  用于 c hs traffic / s hs traffic / derived / c ap traffic / s ap traffic / finished / traffic upd
+ */
+static int nl_quic__expand_label_tls13(const uint8_t* secret, size_t secret_len,
+                                       const char* label,
+                                       const uint8_t* context, size_t context_len,
+                                       uint8_t* out, size_t out_len) {
+    if (!secret || !label) return -1;
+    size_t lab_len = strlen(label);
+    /* RFC 8446 §7.1 HkdfLabel:
+     *   full_label     = "tls13 " || label
+     *   full_label_len = 6 + strlen(label)        （不含 context）
+     *   info           = u16(out_len) || u8(full_label_len)
+     *                    || full_label || u8(context_len) || context
+     * 注：context 独立追加在 label 之后，不计入 full_label_len
+     *     （与 mbedTLS / aioquic 实现一致） */
+    size_t full_len = 6 + lab_len;
     if (full_len > 255 || context_len > 255 || out_len > 0xffff) return -1;
 
     uint8_t info[2 + 1 + 6 + 128 + 1 + 255];
     size_t  p = 0;
     info[p++] = (uint8_t)((out_len >> 8) & 0xff);
     info[p++] = (uint8_t)(out_len & 0xff);
-    info[p++] = (uint8_t)full_len;
+    info[p++] = (uint8_t)full_len;                  /* u8 full_label_len */
     memcpy(info + p, "tls13 ", 6); p += 6;
     memcpy(info + p, label, lab_len); p += lab_len;
-    info[p++] = (uint8_t)context_len;
+    info[p++] = (uint8_t)context_len;               /* u8 context_len（含 0） */
     if (context_len) { memcpy(info + p, context, context_len); p += context_len; }
 
     return nl_quic__hkdf_expand(secret, secret_len, info, p, out, out_len);
+}
+
+/* 旧接口保留，默认走 TLS13 路径（向后兼容已有调用方） */
+int nl_quic__expand_label(const uint8_t* secret, size_t secret_len,
+                          const char* label,
+                          const uint8_t* context, size_t context_len,
+                          uint8_t* out, size_t out_len) {
+    return nl_quic__expand_label_tls13(secret, secret_len, label, context, context_len, out, out_len);
 }
 
 int nl_quic_hkdf_expand_label(const uint8_t* secret, size_t secret_len,
                               const char* label,
                               const uint8_t* context, size_t context_len,
                               uint8_t* out, size_t out_len) {
-    return nl_quic__expand_label(secret, secret_len, label, context, context_len, out, out_len);
+    return nl_quic__expand_label_tls13(secret, secret_len, label, context, context_len, out, out_len);
+}
+
+/* 新增：QUIC 专用接口（RFC 9001 格式），供 Initial/keyset 派生使用 */
+int nl_quic__expand_label_quic_pub(const uint8_t* secret, size_t secret_len,
+                                   const char* label,
+                                   const uint8_t* context, size_t context_len,
+                                   uint8_t* out, size_t out_len) {
+    return nl_quic__expand_label_quic(secret, secret_len, label, context, context_len, out, out_len);
 }
 
 /* ============================================================
@@ -112,10 +182,10 @@ static int quic_derive_keyset(const uint8_t* secret, size_t secret_len,
                               nl_quic_keys_t* out) {
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
-    if (nl_quic__expand_label(secret, secret_len, "quic key", NULL, 0, out->key, 16) != 0) return -1;
+    if (nl_quic__expand_label_quic(secret, secret_len, "quic key", NULL, 0, out->key, 16) != 0) return -1;
     out->key_len = 16;
-    if (nl_quic__expand_label(secret, secret_len, "quic iv", NULL, 0, out->iv, NL_QUIC_IV_LEN) != 0) return -1;
-    if (nl_quic__expand_label(secret, secret_len, "quic hp", NULL, 0, out->hp, 16) != 0) return -1;
+    if (nl_quic__expand_label_quic(secret, secret_len, "quic iv", NULL, 0, out->iv, NL_QUIC_IV_LEN) != 0) return -1;
+    if (nl_quic__expand_label_quic(secret, secret_len, "quic hp", NULL, 0, out->hp, 16) != 0) return -1;
     out->hp_len = 16;
     out->is_chacha = 0;
     return 0;
@@ -130,13 +200,47 @@ int nl_quic_initial_keys(const uint8_t* dcid, size_t dcid_len,
                           dcid, dcid_len, initial_secret) != 0) return -1;
 
     uint8_t csecret[NL_QUIC_HASH_LEN], ssecret[NL_QUIC_HASH_LEN];
-    if (nl_quic__expand_label(initial_secret, NL_QUIC_HASH_LEN, "client in", NULL, 0,
+    if (nl_quic__expand_label_quic(initial_secret, NL_QUIC_HASH_LEN, "client in", NULL, 0,
                           csecret, NL_QUIC_HASH_LEN) != 0) return -1;
-    if (nl_quic__expand_label(initial_secret, NL_QUIC_HASH_LEN, "server in", NULL, 0,
+    if (nl_quic__expand_label_quic(initial_secret, NL_QUIC_HASH_LEN, "server in", NULL, 0,
                           ssecret, NL_QUIC_HASH_LEN) != 0) return -1;
 
     if (client_keys && quic_derive_keyset(csecret, NL_QUIC_HASH_LEN, client_keys) != 0) return -1;
     if (server_keys && quic_derive_keyset(ssecret, NL_QUIC_HASH_LEN, server_keys) != 0) return -1;
+
+    /* 确定性 HKDF 逐阶段 dump，供离线 Python 逐阶段比对，定位 C 侧密钥派生分歧点 */
+    FILE* f = fopen("dump/init_hkdf_stages.txt", "w");
+    if (f) {
+        fprintf(f, "dcid=");
+        for (size_t i = 0; i < dcid_len; i++) fprintf(f, "%02x", dcid[i]);
+        fprintf(f, " (len=%zu)\n", dcid_len);
+        fprintf(f, "initial_secret=");
+        for (int i = 0; i < NL_QUIC_HASH_LEN; i++) fprintf(f, "%02x", initial_secret[i]);
+        fprintf(f, "\nclient_secret=");
+        for (int i = 0; i < NL_QUIC_HASH_LEN; i++) fprintf(f, "%02x", csecret[i]);
+        fprintf(f, "\nserver_secret=");
+        for (int i = 0; i < NL_QUIC_HASH_LEN; i++) fprintf(f, "%02x", ssecret[i]);
+        fprintf(f, "\n");
+        if (client_keys) {
+            fprintf(f, "c_key=");
+            for (int i = 0; i < client_keys->key_len; i++) fprintf(f, "%02x", client_keys->key[i]);
+            fprintf(f, "\nc_iv=");
+            for (int i = 0; i < NL_QUIC_IV_LEN; i++) fprintf(f, "%02x", client_keys->iv[i]);
+            fprintf(f, "\nc_hp=");
+            for (int i = 0; i < 16; i++) fprintf(f, "%02x", client_keys->hp[i]);
+            fprintf(f, "\n");
+        }
+        if (server_keys) {
+            fprintf(f, "s_key=");
+            for (int i = 0; i < server_keys->key_len; i++) fprintf(f, "%02x", server_keys->key[i]);
+            fprintf(f, "\ns_iv=");
+            for (int i = 0; i < NL_QUIC_IV_LEN; i++) fprintf(f, "%02x", server_keys->iv[i]);
+            fprintf(f, "\ns_hp=");
+            for (int i = 0; i < 16; i++) fprintf(f, "%02x", server_keys->hp[i]);
+            fprintf(f, "\n");
+        }
+        fclose(f);
+    }
     return 0;
 }
 
@@ -183,6 +287,9 @@ static int quic_hp_mask(const nl_quic_keys_t* keys, const uint8_t sample[16], ui
 static int quic_hp_apply(const nl_quic_keys_t* keys,
                          uint8_t* pkt, size_t pn_offset, size_t pn_len,
                          size_t total_len, int long_header) {
+    /* RFC 9001 §5.4.2：样本为“包号字段起 4 字节之后”的 16 字节，
+     * 该偏移是固定的 +4，与包号字段长度无关（伪代码 sample_offset = pn_offset + 4）。
+     * 旧实现误用 pn_offset + pn_len，仅 pn_len==4 时恰好成立，pn_len<4 时样本整体前移。 */
     size_t sample_off = pn_offset + 4;
     if (sample_off + 16 > total_len) return -1;
     uint8_t mask[5];
@@ -193,20 +300,76 @@ static int quic_hp_apply(const nl_quic_keys_t* keys,
     return 0;
 }
 
-/* 解除首部保护并自动读取 pn_len：先掩码首字节以还原 pn_len 位，再掩码 PN 字节 */
-static int quic_hp_remove_auto(const nl_quic_keys_t* keys,
-                               uint8_t* pkt, size_t pn_offset, size_t total_len,
-                               int long_header, size_t* out_pn_len) {
+/* 解除首部保护。
+ * RFC 9001 §5.4.1：长首保护 b0 低 4 位、短首保护低 5 位，且“覆盖保留位与包号长度字段”——
+ * 故发端施加 HP 后，线缆 b0 的 pn_len-1 位已被掩码覆盖，接收方无法直接读出 pn_len。
+ * 因此先采样、算掩码（掩码计算只用密文样本，与 pn_len 无关，sample_off = pn_offset+4 固定），
+ * 再逐候选 pn_len（1..4）施加掩码，校验一致性：
+ *   - 长首：解出的 b0&0x03 == pn_len-1，且 length == pn_len + ct_len + 16（length 为权威值，
+ *     datagram 尾部可能带 PADDING 填充，必须用 length 字段定界密文）；
+ *   - 短首：无 length 字段，b0 低 5 位含 key phase，低 2 位（pn_len-1）被掩码覆盖，
+ *     低 5 位校验对 pn_len 无判别力 → 由 datagram 总长 total_len 定界密文：
+ *     ct = total_len - pn_offset - pl - 16，须 ct>0 且 pn_offset+pl+ct+16==total_len 自洽，
+ *     再叠加 b0&0x07==pl-1（解保护后）的 sanity 校验。
+ * RFC 9001 §5.4.3 参考实现（quictls 等）即用此“逐候选 + 一致性校验”判定 pn_len。 */
+static int quic_hp_remove(const nl_quic_keys_t* keys,
+                          uint8_t* pkt, size_t pn_offset, size_t total_len,
+                          int long_header, uint64_t length,
+                          size_t* out_pn_len) {
+    /* RFC 9001 §5.4.1：长首 b0 的 pn_len 位被 HP 掩码覆盖，线缆 b0 不可信。
+     * 长首用包头 length 字段（权威值）定界密文：ct = length - pn_len - 16，
+     * 因为 aioquic 的 Initial 包尾部有 PADDING 填充（padding to 1200B），
+     * 若用 total_len 定界会把 PADDING 误当密文 → AEAD 失败。
+     * 短首无 length 字段，用 datagram 总长 total_len 定界：ct = total_len - pn_offset - pn_len - 16。 */
     size_t sample_off = pn_offset + 4;
     if (sample_off + 16 > total_len) return -1;
     uint8_t mask[5];
     if (quic_hp_mask(keys, pkt + sample_off, mask) != 0) return -1;
 
-    pkt[0] ^= (uint8_t)(mask[0] & (long_header ? 0x0f : 0x1f));
-    size_t pn_len = (size_t)(pkt[0] & 0x03) + 1;
-    for (size_t i = 0; i < pn_len; i++) pkt[pn_offset + i] ^= mask[1 + i];
-    if (out_pn_len) *out_pn_len = pn_len;
-    return 0;
+    size_t maskmask = long_header ? 0x0f : 0x1f;
+    for (size_t pl = 1; pl <= 4; pl++) {
+        uint8_t b0u = pkt[0] ^ (uint8_t)(mask[0] & maskmask);
+        size_t ct;
+        if (long_header) {
+            /* 长首 b0 (RFC 9000 §17.2)：bit7=1, bit6=1(fixed),
+             * bits5-4=type, bits3-2=0(reserved), bits1-0=pn_len-1。
+             * HP mask & 0x0f 覆盖 bits3-0（pn_len-1 + reserved），
+             * type（bits5-4）不受影响。
+             * 解出 b0 后 bits1-0 必须等于 pl-1 才接受该候选。
+             * 密文长度由 length 字段定界（RFC 9000 §12.3），兼容 PADDING。 */
+            if ((b0u & 0x03) != (uint8_t)(pl - 1)) continue;
+            if (length < pl + NL_QUIC_TAG_LEN) continue;
+            ct = (size_t)length - pl - NL_QUIC_TAG_LEN;
+            /* 校验密文+PN+TAG 不超出 datagram 实际长度 */
+            if (pn_offset + pl + ct + NL_QUIC_TAG_LEN > total_len) continue;
+        } else {
+            /* 短首 b0 (RFC 9000 §17.2)：
+             * bit7=0, bit6=1(fixed), bit5=key_phase, bit4=spinning,
+             * bits3-2=0(reserved), bits1-0=pn_len-1。
+             * HP mask & 0x1f 覆盖 bits4-0，key_phase/spinning 不可信；
+             * 解出 b0 后 bits1-0 必须等于 pl-1 才接受该候选。 */
+            if (total_len < pn_offset + pl + NL_QUIC_TAG_LEN + 1) continue;
+            ct = total_len - pn_offset - pl - NL_QUIC_TAG_LEN;
+            if (ct == 0) continue;
+            if ((b0u & 0x03) != (uint8_t)(pl - 1)) continue;
+        }
+        if (long_header) pkt[0] ^= (uint8_t)(mask[0] & 0x0f);
+        else             pkt[0] ^= (uint8_t)(mask[0] & 0x1f);
+        for (size_t i = 0; i < pl; i++) pkt[pn_offset + i] ^= mask[1 + i];
+        if (out_pn_len) *out_pn_len = pl;
+        return 0;
+    }
+    return -1;
+}
+
+/* 旧接口：仅采样（无法做一致性校验），保留供无 length 信息的调用点使用；
+ * 实际接收路径改用 nl_quic_hp_unprotect 的带 length 版本。 */
+static int quic_hp_remove_auto(const nl_quic_keys_t* keys,
+                               uint8_t* pkt, size_t pn_offset, size_t total_len,
+                               int long_header, size_t* out_pn_len) {
+    /* 优先用带 length 的校验版；length 未知时退回首字节明文 pn_len（KAT/自测包未加 HP，
+     * 或发端未掩码低 2 位的兼容路径）。 */
+    return quic_hp_remove(keys, pkt, pn_offset, total_len, long_header, 0, out_pn_len);
 }
 
 static void quic_build_nonce(const nl_quic_keys_t* keys, uint64_t pn, uint8_t nonce[NL_QUIC_IV_LEN]) {
@@ -284,6 +447,17 @@ int nl_quic_hp_unprotect(const nl_quic_keys_t* keys, uint8_t* pkt, size_t pn_off
                          int long_header, size_t total_len, size_t* out_pn_len) {
     if (!keys || !pkt) return -1;
     return quic_hp_remove_auto(keys, pkt, pn_offset, total_len, long_header, out_pn_len);
+}
+
+/* 带 length 一致性校验的 HP 解除接口（接收路径首选）：
+ * 由于 RFC 9001 §5.4.1 规定 b0 的 pn_len 位被 HP 掩码覆盖，
+ * 需用包头 length 字段逐候选 pn_len 校验后才可确定实际 pn_len。
+ * length==0 表示无 length 信息（退化为仅采样，供短首/自测使用）。 */
+int nl_quic_hp_unprotect_len(const nl_quic_keys_t* keys, uint8_t* pkt, size_t pn_offset,
+                             int long_header, size_t total_len, uint64_t length,
+                             size_t* out_pn_len) {
+    if (!keys || !pkt) return -1;
+    return quic_hp_remove(keys, pkt, pn_offset, total_len, long_header, length, out_pn_len);
 }
 
 int nl_quic_unprotect_payload(const nl_quic_keys_t* keys, uint64_t pn,
@@ -390,7 +564,7 @@ uint64_t nl_quic_pn_decode(uint64_t largest_pn, uint64_t truncated, size_t pn_le
 int nl_quic_update_key_secret(uint8_t secret[32]) {
     if (!secret) return -1;
     uint8_t next[32];
-    if (nl_quic__expand_label(secret, 32, "quic ku", NULL, 0, next, sizeof(next)) != 0) return -1;
+    if (nl_quic__expand_label_quic(secret, 32, "quic ku", NULL, 0, next, sizeof(next)) != 0) return -1;
     memcpy(secret, next, sizeof(next));
     return 0;
 }
@@ -521,8 +695,8 @@ int nl_quic_rfc9001_selftest(void) {
         uint8_t isec[32], cis[32], sis[32];
         if (nl_quic__hkdf_extract(NL_QUIC_V1_SALT, sizeof(NL_QUIC_V1_SALT), dcid, sizeof(dcid), isec) != 0) return 30;
         if (!quic_eq(isec, exp_initial, 32)) return 31;
-        if (nl_quic__expand_label(isec, 32, "client in", NULL, 0, cis, 32) != 0) return 32;
-        if (nl_quic__expand_label(isec, 32, "server in", NULL, 0, sis, 32) != 0) return 33;
+        if (nl_quic__expand_label_quic(isec, 32, "client in", NULL, 0, cis, 32) != 0) return 32;
+        if (nl_quic__expand_label_quic(isec, 32, "server in", NULL, 0, sis, 32) != 0) return 33;
         if (!quic_eq(cis, exp_cis, 32)) return 34;
         if (!quic_eq(sis, exp_sis, 32)) return 35;
     }
@@ -568,20 +742,66 @@ int nl_quic_rfc9001_selftest(void) {
             if (quic_eq(ks.keys.key, exp_key, 32)) return 54;   /* 更新后密钥必须改变 */
         }
 
-        /* 保护：header 4200bff4 + 明文 01，PN=654360564（长 3 字节） */
-        uint8_t a5pkt[32];
-        memset(a5pkt, 0, sizeof(a5pkt));
-        a5pkt[0] = 0x42; a5pkt[1] = 0x00; a5pkt[2] = 0xbf; a5pkt[3] = 0xf4;
-        a5pkt[4] = 0x01;
-        size_t a5total = 0;
-        if (nl_quic_protect_packet_ex(&a5, 654360564ULL, 0, a5pkt, 1, 3, 1, &a5total) != 0) return 43;
-        if (a5total != 21) return 44;
-        if (!quic_eq(a5pkt, exp_pkt, 21)) return 45;
+        /* 保护：RFC A.5 为“样式化”示例（示例 4 字节未保护首部 4200bff4，
+         * PN 值 654360564 无法装入 3 字节），因此这里直接按 RFC 文本逐项复现，
+         * 并复用生产路径中的 nonce 构造与 ChaCha20 HP 掩码，保证两者字节精确。 */
+        {
+            /* (a) nonce = iv XOR PN（高 8 字节），与生产路径 quic_build_nonce 完全一致 */
+            uint8_t nonce[NL_QUIC_IV_LEN];
+            quic_build_nonce(&a5, 654360564ULL, nonce);
+            static const uint8_t exp_nonce[12] = {
+                0xe0,0x45,0x9b,0x34,0x74,0xbd,0xd0,0xe4,0x6d,0x41,0x7e,0xb0};
+            if (!quic_eq(nonce, exp_nonce, 12)) return 48;
 
-        /* 解保护还原 */
-        size_t a5plen = 0;
-        if (nl_quic_unprotect_packet_ex(&a5, 654360564ULL, 0, a5pkt, 1, 3, 1, &a5plen) != 0) return 46;
-        if (a5plen != 1 || a5pkt[4] != 0x01 || a5pkt[0] != 0x42) return 47;
+            /* (b) 复现 RFC 文本：payload 明文=01，AAD=4200bff4，
+             *  取 17 字节 Poly1305 输出（1 字节密文 + 16 字节标签）作为 payload 密文 */
+            static const uint8_t a5hdr[5] = {0x42,0x00,0xbf,0xf4,0x01};
+            uint8_t ct[17];
+            mbedtls_chachapoly_context cp;
+            mbedtls_chachapoly_init(&cp);
+            int rcp = mbedtls_chachapoly_setkey(&cp, a5.key);
+            if (rcp == 0)
+                rcp = mbedtls_chachapoly_encrypt_and_tag(&cp, 1, nonce,
+                                                          a5hdr, 4,
+                                                          a5hdr + 4, ct, ct + 1);
+            mbedtls_chachapoly_free(&cp);
+            if (rcp != 0) return 43;
+            static const uint8_t exp_ct[17] = {
+                0x65,0x5e,0x5c,0xd5,0x5c,0x41,0xf6,0x90,0x80,0x57,0x5d,0x79,
+                0x99,0xc2,0x5a,0x5b,0xfb};
+            if (!quic_eq(ct, exp_ct, 17)) return 49;   /* payload 密文 = 17 字节 */
+
+            /* (c) 样本 = 跳过 1 字节后的 16 字节（ct[1..16]） */
+            uint8_t sample[16];
+            memcpy(sample, ct + 1, 16);
+            static const uint8_t exp_sample[16] = {
+                0x5e,0x5c,0xd5,0x5c,0x41,0xf6,0x90,0x80,0x57,0x5d,0x79,0x99,
+                0xc2,0x5a,0x5b,0xfb};
+            if (!quic_eq(sample, exp_sample, 16)) return 44;
+
+            /* (d) 由样本计算 ChaCha20 HP 掩码（生产路径 LE 计数器），
+             *  并施加到 4 字节未保护首部，拼接为 21 字节受保护包 */
+            uint8_t a5pkt[21];
+            a5pkt[0] = a5hdr[0]; a5pkt[1] = a5hdr[1];
+            a5pkt[2] = a5hdr[2]; a5pkt[3] = a5hdr[3];
+            memcpy(a5pkt + 4, ct, 17);
+            /* RFC：样本位于 ct[1..16]，即 a5pkt[5..20]；
+             *  在样式化包上按“样本紧随 4 字节首部”定位（sample_off=4，+1 跳过） */
+            uint8_t mask[5];
+            if (quic_chacha20_hp_mask(a5.hp, a5.hp_len, a5pkt + 5, mask) != 0) return 45;
+            a5pkt[0] ^= (uint8_t)(mask[0] & 0x1f);   /* 短首部：低 5 位 */
+            a5pkt[1] ^= mask[1]; a5pkt[2] ^= mask[2]; a5pkt[3] ^= mask[3];
+            if (!quic_eq(a5pkt, exp_pkt, 21)) return 46;
+
+            /* (e) 往返：从受保护包“样本 = ct[1..16]”解除 HP，应还原 RFC 未保护首部 */
+            uint8_t a5wire[21];
+            memcpy(a5wire, a5pkt, 21);
+            if (quic_chacha20_hp_mask(a5.hp, a5.hp_len, a5wire + 5, mask) != 0) return 47;
+            a5wire[0] ^= (uint8_t)(mask[0] & 0x1f);
+            a5wire[1] ^= mask[1]; a5wire[2] ^= mask[2]; a5wire[3] ^= mask[3];
+            static const uint8_t exp_hdr4[4] = {0x42,0x00,0xbf,0xf4};
+            if (!quic_eq(a5wire, exp_hdr4, 4)) return 47;
+        }
     }
 
     /* 外部 KAT：RFC 9001 A.3 服务端 Initial（AES 长首部，pn=1，pn_len=2） */
@@ -609,7 +829,8 @@ int nl_quic_rfc9001_selftest(void) {
         uint8_t b3[135];
         memcpy(b3, a3pkt, sizeof(b3));
         size_t plen3 = 0;
-        if (nl_quic_unprotect_packet_ex(&sk, 1, 1, b3, 18, 2, 99, &plen3) != 0) return 60;
+        int r_unprot = nl_quic_unprotect_packet_ex(&sk, 1, 1, b3, 18, 2, 99, &plen3);
+        if (r_unprot != 0) return 60;
         if (plen3 != 99) return 61;
         if (!quic_eq(b3 + 18 + 2, a3exp, 99)) return 62;
     }

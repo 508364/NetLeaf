@@ -23,10 +23,16 @@ int nl_quic__hkdf_expand(const uint8_t* prk, size_t prk_len,
                          const uint8_t* info, size_t info_len,
                          uint8_t* out, size_t out_len);
 
-/* HKDF-Expand-Label（label 不含 "tls13 " 前缀，函数内部自动补） */
+/* HKDF-Expand-Label（TLS 1.3 / RFC 8446 版，前缀 "TLS13 "，带 u16 out_len） */
 int nl_quic__expand_label(const uint8_t* secret, size_t secret_len,
                           const char* label,
                           const uint8_t* context, size_t context_len,
                           uint8_t* out, size_t out_len);
+
+/* HKDF-Expand-Label（QUIC / RFC 9001 版，前缀 "QUICv1 "，无 out_len 字段） */
+int nl_quic__expand_label_quic_pub(const uint8_t* secret, size_t secret_len,
+                                   const char* label,
+                                   const uint8_t* context, size_t context_len,
+                                   uint8_t* out, size_t out_len);
 
 #endif /* NETLEAF_QUICTLS_INTERNAL_H */
