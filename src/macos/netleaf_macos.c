@@ -722,9 +722,10 @@ int nl_server_start(nl_server_t* server) {
         return NL_ERROR;
     }
     
-    if (pool_created) {
-        server->running = 1;
-    }
+    // P0 修复：running 必须无条件置位。UDP 等无 worker pool 的协议
+    // pool_created 恒为 0，若包在 if 内，listener_thread 的 while(server->running)
+    // 会立即退出，事件循环永远进不去（UDP 收包 0）。与 Windows 版行为对齐。
+    server->running = 1;
     if (pthread_create(&server->thread_id, NULL, listener_thread, server) != 0) {
         server->running = 0;
         if (pool_created) stop_worker_pool(server);
