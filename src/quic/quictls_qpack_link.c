@@ -13,10 +13,10 @@
  *   - 解码端联动（nl_h3_qpack_link_decode）：
  *       先应用对端编码器流指令（enc）到动态表，再解码字段块（field）。
  *
- * 依赖：netleaf_quictls.h（公共接口）；链表访问全部经由公共 API。
+ * 依赖：netleaf_quic.h（公共接口）；链表访问全部经由公共 API。
  */
 
-#include "netleaf_quictls.h"
+#include "netleaf_quic.h"
 
 #include <string.h>
 #include <stdint.h>

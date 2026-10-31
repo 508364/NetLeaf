@@ -20,10 +20,10 @@
  *   - 不支持霍夫曼编码（H=1）；遇到 H=1 的名称/值直接返回 -1。
  *   - 动态表通过不透明的 nl_h3_qpack_dt_t + 公共 API 访问。
  *
- * 依赖：netleaf_quictls.h（公共接口）、quictls_qpack.c（动态表 / 静态表实现）。
+ * 依赖：netleaf_quic.h（公共接口）、quictls_qpack.c（动态表 / 静态表实现）。
  */
 
-#include "netleaf_quictls.h"
+#include "netleaf_quic.h"
 
 #include <string.h>
 #include <stdlib.h>

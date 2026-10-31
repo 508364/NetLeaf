@@ -33,7 +33,7 @@ NL_AUTOCOMPLETE_API char* nl_autocomplete_strncasestr(const char* haystack, cons
 #ifdef NL_VERSION
 #define NL_AUTOCOMPLETE_VERSION NL_VERSION
 #else
-#define NL_AUTOCOMPLETE_VERSION "2.4.2"
+#define NL_AUTOCOMPLETE_VERSION "3.0.0"
 #endif
 
 // =========================================

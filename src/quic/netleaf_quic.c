@@ -1,7 +1,10 @@
 /**
- * @file netleaf_quictls.c
- * @brief 自研 QUIC-TLS（RFC 9001）扩展实现
+ * @file netleaf_quic.c
+ * @brief QUIC 扩展实现（自研 QUIC-TLS（RFC 9001）+ 原主库 H3/QUIC 纯逻辑）
  * @version 0.1.0
+ *
+ * 原 quictls 扩展，与主库迁出的 H3/QUIC 纯逻辑（quic_h3_legacy.c）合并为
+ * quic 扩展（暂不再开发，仅做结构合并）。
  *
  * 在 mbedTLS 原语（HMAC-SHA256 / AES-GCM / AES-ECB）之上自研实现：
  *   - HKDF-Extract / HKDF-Expand / HKDF-Expand-Label（RFC 8446 §7.1）
@@ -12,7 +15,7 @@
  * 不依赖 mbedTLS 的 TLS 记录层（mbedTLS 3.6 无 QUIC API）。
  */
 
-#include "netleaf_quictls.h"
+#include "netleaf_quic.h"
 #include "quictls_internal.h"
 
 #include <string.h>
@@ -903,16 +906,16 @@ int nl_quictls_selftest_all(void) {
  * 模块 / 扩展接入
  * ============================================================ */
 NL_MODULE_DEFINE_LAZY(
-    NL_MODULE_QUICTLS, quictls, NL_QUICTLS_VERSION,
+    NL_MODULE_QUICTLS, quic, NL_QUICTLS_VERSION,
     NL_CAP_SERVER | NL_CAP_CLIENT | NL_CAP_ASYNC | NL_CAP_PLATFORM_ALL |
         NL_CAP_EXT_SYSTEM | NL_CAP_QUIC,
     1, 1, 1,
     nl_quictls_init, NULL, nl_quictls_is_available, nl_quictls_version,
-    "Self-implemented QUIC-TLS (RFC 9001) packet protection for HTTP/3",
+    "QUIC extension: self-implemented RFC 9001 packet protection + legacy HTTP/3 pure logic",
     "NetLeaf Team", NULL, NULL);
 
 int nl_quictls_init(void) {
-    return nl_module_register(NL_MODULE_GET_INFO(quictls));
+    return nl_module_register(NL_MODULE_GET_INFO(quic));
 }
 
 int nl_quictls_is_available(void) {
@@ -923,14 +926,15 @@ const char* nl_quictls_version(void) {
     return NL_QUICTLS_VERSION;
 }
 
-NL_EXTENSION_DEFINE(quictls,
-    "QUIC-TLS Extension",
+NL_EXTENSION_DEFINE(quic,
+    "NetLeaf QUIC Extension",
     NL_QUICTLS_VERSION,
     "NetLeaf",
-    "Self-implemented QUIC-TLS (RFC 9001) extension: HKDF key schedule and "
-    "QUIC packet protection (AEAD + header protection) built on mbedTLS "
-    "primitives, targeting HTTP/3 over QUIC. Reference: picotls/quicly, "
-    "ngtcp2/nghttp3, lsquic.",
+    "QUIC extension (merged from the former quictls extension and legacy "
+    "HTTP/3 pure logic moved out of the core library): self-implemented "
+    "RFC 9001 packet protection (AEAD + header protection) built on mbedTLS "
+    "primitives, plus zero-key demo HTTP/3 frame/stream handling. "
+    "Reference: picotls/quicly, ngtcp2/nghttp3, lsquic.",
     "all",
     NL_CAP_QUIC,
     nl_quictls_init,
@@ -939,6 +943,6 @@ NL_EXTENSION_DEFINE(quictls,
     nl_quictls_version
 );
 
-nl_extension_info_t* nl_quictls_get_extension_info(void) {
-    return NL_EXTENSION_GET_INFO(quictls);
+nl_extension_info_t* nl_quic_get_extension_info(void) {
+    return NL_EXTENSION_GET_INFO(quic);
 }

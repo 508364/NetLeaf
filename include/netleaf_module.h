@@ -53,7 +53,7 @@ extern "C" {
 /**
  * @brief NL扩展系统版本号
  */
-#define NL_MODULE_VERSION "2.4.2"
+#define NL_MODULE_VERSION "3.0.0"
 
 /**
  * @brief NL扩展系统名称

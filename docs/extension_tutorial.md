@@ -1,6 +1,6 @@
 # NetLeaf NL 扩展系统开发教程
 
-> 版本：对应 NetLeaf `2.4.2` / NL 扩展系统 `NL_MODULE_VERSION = 2.4.2`
+> 版本：对应 NetLeaf `3.0.0` / NL 扩展系统 `NL_MODULE_VERSION = 3.0.0`
 > 头文件：[include/netleaf_module.h](../include/netleaf_module.h)、[include/netleaf_lang.h](../include/netleaf_lang.h)
 > 配套示例：[examples/extension_showcase/](../examples/extension_showcase/)
 > 示例 API 使用指南：[docs/extension_showcase_api_guide.md](extension_showcase_api_guide.md)

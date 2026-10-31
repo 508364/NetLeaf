@@ -11,7 +11,7 @@
  * 说明：同一对象同时维护"发送侧（对端上限）"与"接收侧（本地窗口）"两组状态，便于自测。
  */
 
-#include "netleaf_quictls.h"
+#include "netleaf_quic.h"
 
 #include <string.h>
 #include <stdlib.h>

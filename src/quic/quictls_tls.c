@@ -8,7 +8,7 @@
  * 参考范式：picotls（TLS 1.3 密钥调度分层）、ngtcp2（QUIC 密钥映射）。
  */
 
-#include "netleaf_quictls.h"
+#include "netleaf_quic.h"
 #include "quictls_internal.h"
 
 #include <string.h>

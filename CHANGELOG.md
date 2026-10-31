@@ -1,5 +1,115 @@
 # NetLeaf 版本历史
 
+## v3.0.0
+
+> 本版本为大版本升级（2.4.2 → 3.0.0），涵盖 Web 引擎全异步重构（P1-P12）、HTTP/2 协议层补完、HTTPS/2、Windows 通用服务器全 IOCP 化等。版本号升级同步 19 个文件（CMakeLists、netleaf.h、9 个模块头 15 处版本宏、3 个内部头副本、docs/*.md、PROJECT_STRUCTURE.md）。
+
+### Web 引擎（P1-P12，全异步重构）
+
+**引擎架构（P1-P7，Linux 主实现，macOS/Windows 对齐）:**
+- 新增 `nl_web_engine_t` 全异步引擎：数据驱动事件循环 + 每连接状态机，输出全部走 outbuf + EPOLLOUT（Linux）/ kevent（macOS）/ IOCP（Windows）异步续写
+- 流式 body：MEM/FILE 均 64KB 分块发送，未知长度内容走 chunked 编码，本地路由不再整块分配 64KB 输出缓冲
+- P6 多实例：Linux/macOS `SO_REUSEPORT` 多引擎（每引擎独立事件循环与连接池），Windows 为多 IOCP 消费线程
+- P7 空闲超时扫描：默认 30s 空闲连接回收（slowloris 防护），500ms 节流扫描
+- `force_legacy_pool` 保留为回退开关：有 PROXY 路由时走引擎，无 proxy 路由或强制时回退 worker 池（Windows 通用服务器 `nl_server_*` 路径已彻底退役 worker 池，见下）
+
+**P8 压测基线（bench_web，三模式对比）:**
+- 修复引擎多实例 running flag 竞态（QPS 1-2 → 19048，engineN 4 线程）
+- 修复 `realpath()` 缓冲区溢出（`abs_path[512]` → `PATH_MAX`，glibc `_FORTIFY_SOURCE` 崩溃）
+- 修复 bench 工具慢读模式 recv 覆盖 bug
+- 结论：engineN 在 PROXY 场景超过 legacy 池（11044 vs 10638 QPS），10MB 文件场景 RSS 从 165MB 降至 4.3MB（-97%）
+
+**P10 sendfile 零拷贝:**
+- 文件路由 BODY_SENDFILE 零拷贝：Linux `sendfile()` / macOS BSD `sendfile()` / Windows `TransmitFile`；文件 0<sz≤10MB 走零拷贝，>10MB 返回 500
+- EAGAIN 时记录偏移注册可写事件续传；chunked 模式强制回落分块
+- 实测（FILE 1MB：engine1 4.8x / engineN 3.3x；FILE 10MB：engine1 5.9x / engineN 4.9x 提升）
+- 修复 SERVE_FILE EAGAIN 时 outbuf 未排空即拉新块覆写未发数据的 bug
+
+**P11 macOS/Windows 引擎对齐:**
+- macOS（+543/-306）：引擎子结构抽取、SO_REUSEPORT 多实例、空闲扫描、BSD sendfile、stop 释放路径防 double-close
+- Windows（+251/-104）：P7 空闲扫描、conn_id 竞态防护（slot 复用时丢弃过期完成）、TransmitFile、多 IOCP 消费线程（`pr_loop_cs` 临界区串行化）
+
+**P12 测试体系:**
+- 新增 9 个集成用例（`test/test_web_engine.c`）：CONTENT / FILE / REDIRECT / PROXY / HEAD / 404 / 连续请求 / slowloris / 客户端断开
+- Linux 修复 4 处：HEAD RFC 7231 body 抑制、pr_body_offset 内存泄漏、`nl_web_stop` 先 join 再 close(epfd)、TSan running 读改 `__atomic_load_n` 三处
+- Windows 修复 2 处：IOCP 引擎与 worker 池双路径 CONTENT/HEAD 响应修复
+- 验证：ASan/TSan 23/23 通过（0 泄漏 0 竞争）、Windows 17/17、ctest 回归全过
+
+**API 补齐（基线遗留）:**
+- Linux/macOS 补齐：`nl_web_validate_encoding` / `nl_web_set_redirect_type` / `nl_web_get_redirect_type`
+- Windows 补齐：`nl_web_add_html_file` / `nl_web_add_redirect_302`
+
+### HTTP/2 协议层补完
+
+- RFC 7541 Huffman 编解码完整实现
+- HPACK 双向动态表（编码/解码各一张），修复 `hpack_decode_header` 字面量长度混读 BUG
+- 流状态机 `NL_H2_ST_*`，新增 `h2_send_rst_stream` / `h2_send_goaway`
+- 修复 `h2_connection_cleanup` HPACK 动态表泄漏
+- `test_http_frames` 扩至 47 断言全部通过
+
+### HTTPS/2（TLS 服务端 + H2 over TLS）
+
+- 新增 `nlh_tls_server_*` 系列 API：TLS 服务端 + ALPN 协商，h2 命名协议分流至 HTTP/2 处理路径
+- 修复 enable_tls 配置越界写
+
+### Windows 通用服务器全 IOCP 化（worker 池彻底废弃）
+
+- `nl_server_*`（TCP/HTTP/WEBSOCKET）改为 AcceptEx 预 post + 每连接 OVERLAPPED WSARecv + `GetQueuedCompletionStatus` 完成线程驱动
+- 连接槽位状态机 `FREE→ACTIVE→PROCESSING→FREE`（`CLOSING` 等 aborted 完成回收），上限 1024 连接，30s 空闲断开
+- `NL_OPT_CONCURRENCY` / `nl_server_set_concurrency` 语义改为 **IOCP 完成线程数**（1..64，默认 4；Linux/macOS 仍为 worker 池）
+- UDP 改为 **16 槽 IOCP 接收环**（多条 outstanding WSARecvFrom）：handler 同步执行期间其余槽位仍由内核异步填充，消除 handler 慢时突发丢包；槽位内存活到 closesocket 之后释放
+- 修复 AcceptEx 地址缓冲传 NULL+0 / lpBytesReceived 指向栈变量导致的 10014 (WSAEFAULT) 与栈损坏
+
+### 其它
+
+- QUIC/H3 拆出独立 `quic` 扩展（`BUILD_QUIC` 默认 OFF），主库只保留 HTTP/1.1 + HTTP/2
+
+## v2.4.2
+
+**新增:**
+- HTTPS 拆出独立库 `netleaf_https`（纯 HTTP 的 `netleaf_http` 不依赖 TLS）
+- TLS 扩展拆分：`netleaf_tls2`（mbedTLS 2.28.10）与 `netleaf_tls3`（mbedTLS 3.x，TLS 1.2/1.3）
+- MQTT 默认开启：`BUILD_MQTT` / `BUILD_MQTT_SERVER` 默认 `OFF → ON`
+- 平台无关公共工具层 `nl_util`；HTTP 短名转接层 `nlh_*`
+- MQTT 服务端 + 回环回归测试
+
+**变更:**
+- 测试 CMake 拆分至 `test/CMakeLists.txt`；三平台公共 HTTP 逻辑去重（`netleaf_http_common.c`）
+- 扩展注册自动依赖检查；`netleaf_lang` 软依赖解耦
+- LTO 选项 `NETLEAF_ENABLE_LTO`；H2 动态表指针化（每连接削减 ≈4.7 MB）
+
+**修复:**
+- QUIC varint 编码 8 字节档缺上界溢出；H2 帧协议补全 END_HEADERS/CONTINUATION/PUSH_PROMISE
+- QUIC 传输层帧补全（RFC 9000）；mbedTLS 3.6 API 移植（12 处）
+- HTTP 写完不关 fd → CLOSE-WAIT；UDP handler 缺对端地址（新增 `nl_udp_message_handler_v2`）
+
+## v2.4.1
+
+**Lang 模块增强:**
+- 错误码接入多语言：`NL_ERROR_BEGIN/NL_ERROR/NL_ERROR_END` 宏与 `nl_lang_register_errors()`
+- 动态变量：`nl_lang_var_set_provider()` / `nl_lang_var_is_dynamic()`
+- 外部变量：`nl_lang_var_bind_env()` / `nl_lang_var_load_env()` / `nl_lang_var_load_file()`
+
+**质量与构建:**
+- 清理编译告警，修复 MQTT 报文 ID 未初始化等隐患
+- 一键脚本全平台交叉编译：Windows(x64/x86/arm64)、Linux(13 架构)、macOS(x86_64/arm64)
+
+## v2.4.0
+
+**Lang 模块增强:**
+- 变量替换 `nl_lang_var_*`，模板语法 `{{VAR_NAME}}`，条件表达式（`== != >= <= > <`）
+- 脚本引擎回调 `nl_lang_register_script_engine` / `nl_lang_execute_script`（可接入 Lua/Python/JS）
+
+**TLS/SSL 扩展:**
+- 内置 mbedTLS 2.28.10 LTS；`nl_tls_*` 通用 API；TLS 1.0-1.3；MQTT TLS 集成；`-DBUILD_TLS=ON`
+
+**MQTT v5.0:**
+- 完整协议支持（CONNECT/PUBLISH/SUBSCRIBE/UNSUBSCRIBE，QoS 0/1/2，5.0 属性编解码，主题通配符，遗嘱消息）
+
+**扩展系统:**
+- 生命周期/状态/信息查询、批量操作、搜索过滤、热重载、元数据管理 API
+- `nl_module_register` 等补 `NL_API` 导出装饰符，修复扩展链接找不到符号
+
 ## v2.2.2
 
 **平台支持:**

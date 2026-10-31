@@ -6,7 +6,13 @@
 
 // DLL export/import macros
 #ifdef _WIN32
-    #ifdef NL_EXPORTS
+    #if defined(NL_HTTP_STATIC)
+        /* 静态/源码级包含（如 test_http_frames 直接包含
+         * netleaf_http_common.c）：符号在本 TU 内定义，
+         * 不得标 dllimport，否则 MinGW 对定义处报
+         * "redeclared without dllimport attribute" 告警。 */
+        #define NL_API
+    #elif defined(NL_EXPORTS)
         #define NL_API __declspec(dllexport)
     #else
         #define NL_API __declspec(dllimport)
@@ -18,7 +24,7 @@
 /* ============================================================
  * 短名转接层（向后兼容）
  *
- * 原长名接口（nl_http_* / nl_http2_* / nl_http3_*）标记为 deprecated，
+ * 原长名接口（nl_http_* / nl_http2_*）标记为 deprecated，
  * 直接调用时编译器产生告警但仍可编译运行；一一对应的短名（nlh_*）
  * 为推荐用法，无告警。短名实现见 src/http/netleaf_http_shortnames.c，
  * 随核心库 netleaf_core 导出，签名与原长名完全一致。
@@ -62,7 +68,6 @@ typedef struct nl_http_request nl_http_request_t;
 typedef struct nl_http_response nl_http_response_t;
 typedef struct nl_http_server nl_http_server_t;
 typedef struct nl_http2_server nl_http2_server_t;
-typedef struct nl_http3_server nl_http3_server_t;
 typedef struct nl_http2_stream nl_http2_stream_t;
 
 // ============================================================
@@ -97,15 +102,37 @@ typedef struct nl_http_tls_client_cfg {
 
 /**
  * 启动 HTTPS 服务端（在已有 nl_http_server_t 上附加 TLS 层）。
- * 调用后 server_thread 中每次 accept 完成后先执行 TLS 握手。
- * 需在 nl_http_server_start() 之前调用。
- * 仅在构建时定义 NL_HTTPS_ENABLE（链接 netleaf_tls）时可用，
- * 否则直接返回 NL_HTTP_TLS_UNAVAILABLE。
- * @return 0 = 成功；负数 = 错误（含 TLS 不可用）
- * @deprecated 推荐使用短名 nlh_server_enable_tls（签名一致，无告警）。
+ * @deprecated 自 v3.1.0 起本接口不再工作：核心库 nl_http_server_t 的
+ * accept 线程不感知 TLS（扩展与核心库的结构体布局不一致，历史实现会
+ * 越界写）。服务端 TLS / HTTPS 2 请改用 nlh_tls_server_*（见下），
+ * 本接口保留仅为维持符号兼容，固定返回 NL_HTTP_TLS_UNAVAILABLE。
+ * @return 恒为 NL_HTTP_TLS_UNAVAILABLE。
  */
 NL_API NL_HTTP_DEPRECATED int nl_http_server_enable_tls(nl_http_server_t* server,
                                      const nl_http_tls_server_cfg_t* cfg);
+
+/* ============================================================
+ * TLS 服务端（HTTPS / HTTPS-2，由 netleaf_https 扩展导出）
+ *
+ * 独立于核心库 nl_http_server_t 的完整 TLS 服务端：
+ *  - accept 后对每个连接执行 TLS 握手；
+ *  - 通过 ALPN 协商协议：开启 HTTP/2（默认）时提供 "h2" 与
+ *    "http/1.1"，协商结果为 h2 的连接走 HTTP/2 帧循环（TLS 收发），
+ *    否则走 HTTP/1.1（TLS 收发）；
+ *  - 需链接 netleaf_https（NL_HTTPS_ENABLE 构建），否则符号缺失。
+ * ============================================================ */
+typedef struct nlh_tls_server nlh_tls_server_t;
+
+/** 创建 TLS 服务端（内部复制 cert/key 等路径字符串，调用后 cfg 可失效）。 */
+NL_API nlh_tls_server_t* nlh_tls_server_create(int port, const nl_http_tls_server_cfg_t* cfg);
+/** enable=1（默认）时 ALPN 提供 "h2"，协商为 h2 的连接走 HTTP/2 over TLS；0 = 仅 HTTP/1.1。 */
+NL_API void nlh_tls_server_enable_http2(nlh_tls_server_t* srv, int enable);
+/** 启动 accept 线程。 @return 0 = 成功；负数 = 错误 */
+NL_API int  nlh_tls_server_start(nlh_tls_server_t* srv);
+/** 停止服务端（关闭监听句柄并回收 accept 线程）。 */
+NL_API void nlh_tls_server_stop(nlh_tls_server_t* srv);
+/** 销毁服务端（须先 stop）；srv 为 NULL 时安全返回。 */
+NL_API void nlh_tls_server_destroy(nlh_tls_server_t* srv);
 
 /**
  * 创建 HTTPS 客户端连接并完成 TLS 握手。
@@ -170,96 +197,6 @@ typedef enum {
     NL_H2_FRAME_CONTINUATION = 0x9
 } nl_h2_frame_type_t;
 
-// HTTP/3 (QUIC) related definitions
-typedef enum {
-    NL_H3_FRAME_DATA = 0x0,
-    NL_H3_FRAME_HEADERS = 0x1,
-    NL_H3_FRAME_CANCEL_PUSH = 0x3,
-    NL_H3_FRAME_SETTINGS = 0x4,
-    NL_H3_FRAME_PUSH_PROMISE = 0x5,
-    NL_H3_FRAME_GOAWAY = 0x7,
-    NL_H3_FRAME_MAX_PUSH_ID = 0xD
-} nl_h3_frame_type_t;
-
-// QUIC packet types
-typedef enum {
-    NL_QUIC_PACKET_INITIAL = 0x0,
-    NL_QUIC_PACKET_0RTT = 0x1,
-    NL_QUIC_PACKET_HANDSHAKE = 0x2,
-    NL_QUIC_PACKET_RETRY = 0x3,
-    NL_QUIC_PACKET_VERSION_NEGOTIATION = 0x4,
-    NL_QUIC_PACKET_SHORT = 0x5
-} nl_quic_packet_type_t;
-
-// QUIC error codes
-typedef enum {
-    NL_QUIC_NO_ERROR = 0x0,
-    NL_QUIC_INTERNAL_ERROR = 0x1,
-    NL_QUIC_CONNECTION_REFUSED = 0x2,
-    NL_QUIC_FLOW_CONTROL_ERROR = 0x3,
-    NL_QUIC_STREAM_LIMIT_ERROR = 0x4,
-    NL_QUIC_STREAM_STATE_ERROR = 0x5,
-    NL_QUIC_FINAL_SIZE_ERROR = 0x6,
-    NL_QUIC_FRAME_ENCODING_ERROR = 0x7,
-    NL_QUIC_TRANSPORT_PARAMETER_ERROR = 0x8,
-    NL_QUIC_CONNECTION_ID_LIMIT_ERROR = 0x9,
-    NL_QUIC_PROTOCOL_VIOLATION = 0xA,
-    NL_QUIC_INVALID_TOKEN = 0xB,
-    NL_QUIC_APPLICATION_ERROR = 0xC,
-    NL_QUIC_CRYPTO_BUFFER_EXCEEDED = 0xD,
-    NL_QUIC_KEY_UPDATE_ERROR = 0xE,
-    NL_QUIC_AEAD_LIMIT_REACHED = 0xF
-} nl_quic_error_code_t;
-
-// QUIC transport parameter IDs
-typedef enum {
-    NL_QUIC_PARAM_ORIGINAL_DESTINATION_CONNECTION_ID = 0x0,
-    NL_QUIC_PARAM_MAX_IDLE_TIMEOUT = 0x1,
-    NL_QUIC_PARAM_STATELESS_RESET_TOKEN = 0x2,
-    NL_QUIC_PARAM_MAX_UDP_PAYLOAD_SIZE = 0x3,
-    NL_QUIC_PARAM_INITIAL_MAX_DATA = 0x4,
-    NL_QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL = 0x5,
-    NL_QUIC_PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE = 0x6,
-    NL_QUIC_PARAM_INITIAL_MAX_STREAM_DATA_UNI = 0x7,
-    NL_QUIC_PARAM_INITIAL_MAX_STREAMS_BIDI = 0x8,
-    NL_QUIC_PARAM_INITIAL_MAX_STREAMS_UNI = 0x9,
-    NL_QUIC_PARAM_ACK_DELAY_EXPONENT = 0xA,
-    NL_QUIC_PARAM_MAX_ACK_DELAY = 0xB,
-    NL_QUIC_PARAM_DISABLE_ACTIVE_MIGRATION = 0xC,
-    NL_QUIC_PARAM_PREFERRED_ADDRESS = 0xD,
-    NL_QUIC_PARAM_ACTIVE_CONNECTION_ID_LIMIT = 0xE,
-    NL_QUIC_PARAM_INITIAL_SOURCE_CONNECTION_ID = 0xF,
-    NL_QUIC_PARAM_RETRY_SOURCE_CONNECTION_ID = 0x10
-} nl_quic_transport_param_t;
-
-// QUIC frame types
-typedef enum {
-    NL_QUIC_FRAME_PADDING = 0x0,
-    NL_QUIC_FRAME_PING = 0x1,
-    NL_QUIC_FRAME_ACK = 0x2,
-    NL_QUIC_FRAME_ACK_ECN = 0x3,
-    NL_QUIC_FRAME_RESET_STREAM = 0x4,
-    NL_QUIC_FRAME_STOP_SENDING = 0x5,
-    NL_QUIC_FRAME_CRYPTO = 0x6,
-    NL_QUIC_FRAME_NEW_TOKEN = 0x7,
-    NL_QUIC_FRAME_STREAM = 0x8,
-    NL_QUIC_FRAME_STREAM_FIN = 0x9,
-    NL_QUIC_FRAME_MAX_DATA = 0x10,
-    NL_QUIC_FRAME_MAX_STREAM_DATA = 0x11,
-    NL_QUIC_FRAME_MAX_STREAMS_BIDI = 0x12,
-    NL_QUIC_FRAME_MAX_STREAMS_UNI = 0x13,
-    NL_QUIC_FRAME_DATA_BLOCKED = 0x14,
-    NL_QUIC_FRAME_STREAM_DATA_BLOCKED = 0x15,
-    NL_QUIC_FRAME_STREAMS_BLOCKED_BIDI = 0x16,
-    NL_QUIC_FRAME_STREAMS_BLOCKED_UNI = 0x17,
-    NL_QUIC_FRAME_NEW_CONNECTION_ID = 0x18,
-    NL_QUIC_FRAME_RETIRE_CONNECTION_ID = 0x19,
-    NL_QUIC_FRAME_PATH_CHALLENGE = 0x1A,
-    NL_QUIC_FRAME_PATH_RESPONSE = 0x1B,
-    NL_QUIC_FRAME_CONNECTION_CLOSE = 0x1C,
-    NL_QUIC_FRAME_HANDSHAKE_DONE = 0x1E
-} nl_quic_frame_type_t;
-
 typedef enum {
     NL_H2_SETTINGS_HEADER_TABLE_SIZE = 0x1,
     NL_H2_SETTINGS_ENABLE_PUSH = 0x2,
@@ -288,6 +225,9 @@ typedef enum {
 
 typedef void (*nl_http_handler)(const nl_http_request_t* req, nl_http_response_t* resp, void* user_data);
 
+/** 设置 TLS 服务端请求处理器（语义同 nl_http_handler；须在 nlh_tls_server_start 前调用）。 */
+NL_API void nlh_tls_server_set_handler(nlh_tls_server_t* srv, nl_http_handler handler, void* user_data);
+
 /* 以下原长名接口均标记 NL_HTTP_DEPRECATED：调用仍可用但产生告警，
  * 推荐使用下方一一对应的 nlh_* 短名（签名一致、无告警）。 */
 NL_API NL_HTTP_DEPRECATED nl_http_server_t* nl_http_server_create(int port);
@@ -296,19 +236,12 @@ NL_API NL_HTTP_DEPRECATED int nl_http_server_start(nl_http_server_t* server);
 NL_API NL_HTTP_DEPRECATED void nl_http_server_stop(nl_http_server_t* server);
 NL_API NL_HTTP_DEPRECATED void nl_http_server_set_handler(nl_http_server_t* server, nl_http_handler handler, void* user_data);
 NL_API NL_HTTP_DEPRECATED void nl_http_server_enable_http2(nl_http_server_t* server, int enable);
-NL_API NL_HTTP_DEPRECATED void nl_http_server_enable_http3(nl_http_server_t* server, int enable);
 
 NL_API NL_HTTP_DEPRECATED nl_http2_server_t* nl_http2_server_create(int port);
 NL_API NL_HTTP_DEPRECATED void nl_http2_server_destroy(nl_http2_server_t* server);
 NL_API NL_HTTP_DEPRECATED int nl_http2_server_start(nl_http2_server_t* server);
 NL_API NL_HTTP_DEPRECATED void nl_http2_server_stop(nl_http2_server_t* server);
 NL_API NL_HTTP_DEPRECATED void nl_http2_server_set_handler(nl_http2_server_t* server, nl_http_handler handler, void* user_data);
-
-NL_API NL_HTTP_DEPRECATED nl_http3_server_t* nl_http3_server_create(int port);
-NL_API NL_HTTP_DEPRECATED void nl_http3_server_destroy(nl_http3_server_t* server);
-NL_API NL_HTTP_DEPRECATED int nl_http3_server_start(nl_http3_server_t* server);
-NL_API NL_HTTP_DEPRECATED void nl_http3_server_stop(nl_http3_server_t* server);
-NL_API NL_HTTP_DEPRECATED void nl_http3_server_set_handler(nl_http3_server_t* server, nl_http_handler handler, void* user_data);
 
 NL_API NL_HTTP_DEPRECATED nlh_http_method_t nl_http_request_get_method(const nl_http_request_t* req);
 NL_API NL_HTTP_DEPRECATED nl_http_version_t nl_http_request_get_version(const nl_http_request_t* req);
@@ -333,19 +266,12 @@ NL_API int nlh_server_start(nl_http_server_t* server);
 NL_API void nlh_server_stop(nl_http_server_t* server);
 NL_API void nlh_server_set_handler(nl_http_server_t* server, nl_http_handler handler, void* user_data);
 NL_API void nlh_server_enable_http2(nl_http_server_t* server, int enable);
-NL_API void nlh_server_enable_http3(nl_http_server_t* server, int enable);
 
 NL_API nl_http2_server_t* nlh_h2_create(int port);
 NL_API void nlh_h2_destroy(nl_http2_server_t* server);
 NL_API int nlh_h2_start(nl_http2_server_t* server);
 NL_API void nlh_h2_stop(nl_http2_server_t* server);
 NL_API void nlh_h2_set_handler(nl_http2_server_t* server, nl_http_handler handler, void* user_data);
-
-NL_API nl_http3_server_t* nlh_h3_create(int port);
-NL_API void nlh_h3_destroy(nl_http3_server_t* server);
-NL_API int nlh_h3_start(nl_http3_server_t* server);
-NL_API void nlh_h3_stop(nl_http3_server_t* server);
-NL_API void nlh_h3_set_handler(nl_http3_server_t* server, nl_http_handler handler, void* user_data);
 
 NL_API nlh_http_method_t nlh_req_method(const nl_http_request_t* req);
 NL_API nl_http_version_t nlh_req_version(const nl_http_request_t* req);

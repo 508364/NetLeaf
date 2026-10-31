@@ -367,3 +367,46 @@ NL_API int nl_once_init(int index, void (*init_fn)(void)) {
 NL_API int nl_once_run(int index, void (*work_fn)(void)) {
     return nl_once_execute(index, work_fn);
 }
+
+/* ============================================================
+ * 内部：编码名校验
+ * ============================================================ */
+
+/**
+ * 校验 Web 层支持的字符编码名（大小写不敏感，纯字符串白名单）。
+ * 三平台共用：netleaf_core 中编译一次，Linux/macOS/Windows 均可链接。
+ */
+NL_API int nl_web_validate_encoding(const char* encoding) {
+    if (!encoding || !*encoding) return 0;
+
+    /* 静态白名单：规范化名 + 常见别名 */
+    static const char* const k_supported[] = {
+        "utf-8",       "utf8",
+        "gbk",         "cp936",
+        "gb2312",      "gb-2312",
+        "gb18030",     "gb-18030",
+        "big5",        "big-5",       "cp950",
+        "iso-8859-1",  "latin1",
+        "ascii",       "us-ascii",
+        "utf-16",      "utf16",
+        "utf-32",      "utf32",
+        "shift_jis",   "shift-jis",   "sjis",   "cp932",
+        "euc-jp",
+        "euc-kr",      "cp949",
+        NULL
+    };
+
+    /* 小写化比较（不修改调用方缓冲，栈上最多 31 字符，超出直接判否） */
+    char lower[32];
+    size_t i;
+    for (i = 0; encoding[i] && i < sizeof(lower) - 1; i++) {
+        lower[i] = (char)nl_tolower((unsigned char)encoding[i]);
+    }
+    if (encoding[i] != '\0') return 0; /* 过长，不在白名单内 */
+    lower[i] = '\0';
+
+    for (i = 0; k_supported[i]; i++) {
+        if (strcmp(lower, k_supported[i]) == 0) return 1;
+    }
+    return 0;
+}

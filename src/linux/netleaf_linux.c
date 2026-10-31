@@ -2,6 +2,7 @@
 #include <sys/epoll.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/sendfile.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -2156,9 +2157,10 @@ typedef struct {
     char**    pr_outbuf;      // [idx] -> 本地响应输出缓冲（头+body 当前块）
     int*      pr_out_len;     // [idx] -> outbuf 有效长度
     int*      pr_out_off;     // [idx] -> 已发出偏移
-    void**    pr_body_src;    // [idx] -> 当前读取位置（BODY_FILE 时指向 FILE*）
+    void**    pr_body_src;    // [idx] -> 当前读取位置（BODY_FILE 时指向 FILE*，BODY_SENDFILE 时为 fd）
     int64_t*  pr_body_remain; // [idx] -> body 剩余字节数
-    uint8_t*  pr_body_kind;   // [idx] -> BODY_MEM / BODY_FILE / BODY_NONE
+    uint8_t*  pr_body_kind;   // [idx] -> BODY_MEM / BODY_FILE / BODY_SENDFILE / BODY_NONE
+    int64_t*  pr_body_offset; // [idx] -> BODY_SENDFILE 时的文件偏移
     // P4: chunked 编码（未知长度动态内容边生成边发）
     uint8_t*  pr_use_chunked; // [idx] -> 是否 chunked 分块发送（每块 %x\r\n 前缀 + 末尾 0\r\n\r\n）
     // P7: 空闲超时（slowloris 防护）
@@ -2202,6 +2204,7 @@ struct nl_web_server {
     int max_conns_cfg;          // P6: 总连接预算（0=自动=ncpu*64；按 N 均分到每实例 ring cap）
     int idle_timeout_ms;        // P7: 空闲超时（ms），防 slowloris；0=默认 30s
     int force_legacy_pool;      // P5: 回退 legacy worker 池开关（1=旧行为，默认 0=引擎）
+    nl_redirect_type_t redirect_type; // 重定向默认类型（301/302），set/get_redirect_type 控制
 };
 
 // 数据驱动 ring 容量：按"逻辑核数 × 64"动态定，1 核=64、8 核=512、16 核=1024，
@@ -2422,6 +2425,7 @@ static int nl_proxy_connect_upstream(const nl_web_route_t* route) {
 #define PR_BODY_NONE  0
 #define PR_BODY_MEM   1  // 内存内容（content 路由）
 #define PR_BODY_FILE  2  // 文件流式（file 路由，fread 块）
+#define PR_BODY_SENDFILE 3  // P10: sendfile 零拷贝（file 路由，Linux 专用）
 
 // 给 proxy 连接分配 ring 槽（O(1) 取回收栈顶），失败返回 -1
 static int pr_alloc_slot(nl_web_engine_t* eng) {
@@ -2445,6 +2449,8 @@ static void pr_free_slot(nl_web_engine_t* eng, int idx) {
     if (eng->pr_body_src[idx]) {
         if (eng->pr_body_kind[idx] == PR_BODY_FILE)
             fclose((FILE*)eng->pr_body_src[idx]);
+        else if (eng->pr_body_kind[idx] == PR_BODY_SENDFILE)
+            close((int)(intptr_t)eng->pr_body_src[idx]);  /* P10: sendfile fd */
         eng->pr_body_src[idx] = NULL;
     }
     eng->pr_state[idx] = 0;
@@ -2467,6 +2473,7 @@ static void pr_free_slot(nl_web_engine_t* eng, int idx) {
     if (eng->pr_out_len) eng->pr_out_len[idx] = 0;
     if (eng->pr_out_off) eng->pr_out_off[idx] = 0;
     if (eng->pr_body_remain) eng->pr_body_remain[idx] = 0;
+    if (eng->pr_body_offset) eng->pr_body_offset[idx] = 0;
     if (eng->pr_body_kind) eng->pr_body_kind[idx] = PR_BODY_NONE;
     if (eng->pr_use_chunked) eng->pr_use_chunked[idx] = 0;
     eng->free[++(eng->free_top)] = idx;
@@ -2697,17 +2704,24 @@ static int pr_build_local_response(nl_web_engine_t* eng, int idx,
                                    const nl_web_route_t* r,
                                    const char* method, const char* path,
                                    char* out, int out_cap) {
-    (void)method; (void)path;   // P2 本地路由不再读 method/path（FILE 用 r->file_path）
+    (void)path;   // P2 本地路由不再读 path（FILE 用 r->file_path）
+    // RFC 7231: HEAD 响应必须与 GET 相同的头（含 Content-Length），但不得带 body。
+    // P12 测试补齐时发现：本地 CONTENT/FILE 路由此前对 HEAD 也发 body，此处统一抑制。
+    int is_head = (method && strcmp(method, "HEAD") == 0);
     int off = 0;
     int cfd = eng->pr_fd_client[idx];
 
     if (r->type == NL_ROUTE_TYPE_REDIRECT) {
+        // redirect_type 由 nl_web_set_redirect_type 控制（默认 302）
+        int rcode = (eng->server && eng->server->redirect_type == NL_REDIRECT_PERMANENT)
+                        ? 301 : 302;
+        const char* rtext = (rcode == 301) ? "Moved Permanently" : "Found";
         off = snprintf(out, (size_t)out_cap,
-            "HTTP/1.1 302 Found\r\n"
+            "HTTP/1.1 %d %s\r\n"
             "Location: %s\r\n"
             "Content-Length: 0\r\n"
             "Connection: close\r\n\r\n",
-            r->redirect_url);
+            rcode, rtext, r->redirect_url);
         if (off <= 0 || off >= out_cap) return 0;
         eng->pr_role[idx]     = PR_ROLE_LOCAL;
         eng->pr_phase[idx]    = PR_PHASE_SERVE_OUT;
@@ -2747,7 +2761,7 @@ static int pr_build_local_response(nl_web_engine_t* eng, int idx,
         eng->pr_out_len[idx] = off;
         eng->pr_out_off[idx] = 0;
         eng->pr_body_src[idx] = (void*)r->content;   // 指向 route->content（引擎持有，不释放）
-        eng->pr_body_remain[idx] = (int64_t)blen;
+        eng->pr_body_remain[idx] = is_head ? 0 : (int64_t)blen;   // HEAD 只发头
         eng->pr_body_kind[idx] = PR_BODY_MEM;
         eng->pr_use_chunked[idx] = unknown_len ? 1 : 0;   // P4: chunked 标记
         eng->pr_role[idx]     = PR_ROLE_LOCAL;
@@ -2755,39 +2769,43 @@ static int pr_build_local_response(nl_web_engine_t* eng, int idx,
         return 1;
     }
 
-    // file 路由：header + fread 分块
+    // file 路由：header + body
+    // P10: Linux 下优先用 sendfile 零拷贝（open + sendfile，不经过用户态缓冲）
     if (r->type == NL_ROUTE_TYPE_FILE) {
-        FILE* fp = fopen(r->file_path, "rb");
-        if (!fp) {
-            // 404 直接写
+        int ffd = open(r->file_path, O_RDONLY);
+        if (ffd < 0) {
             const char* e404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send(cfd, e404, strlen(e404), MSG_NOSIGNAL);
             return 0;
         }
-        fseek(fp, 0, SEEK_END);
-        long fsz = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
+        struct stat fst;
+        if (fstat(ffd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+            close(ffd);
+            const char* e404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send(cfd, e404, strlen(e404), MSG_NOSIGNAL);
+            return 0;
+        }
+        off_t fsz = fst.st_size;
         if (fsz > 0 && fsz <= 10*1024*1024) {
             off = snprintf(out, (size_t)out_cap,
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: %s\r\n"
-                "Content-Length: %ld\r\n"
+                "Content-Length: %lld\r\n"
                 "Connection: close\r\n\r\n",
-                r->content_type ? r->content_type : "application/octet-stream", fsz);
-            if (off <= 0 || off >= out_cap) { fclose(fp); send(cfd, "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n", 58, MSG_NOSIGNAL); return 0; }
-            // outbuf 8KB 默认容量足够放 header；body 阶段走 pr_body_next_chunk 复用式缓冲（不每块 malloc/free）
+                r->content_type ? r->content_type : "application/octet-stream", (long long)fsz);
+            if (off <= 0 || off >= out_cap) { close(ffd); send(cfd, "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n", 58, MSG_NOSIGNAL); return 0; }
             memcpy(eng->pr_outbuf[idx], out, (size_t)off);
             eng->pr_out_len[idx] = off;
             eng->pr_out_off[idx] = 0;
-            eng->pr_body_src[idx] = fp;          // 持有 FILE*
-            eng->pr_body_remain[idx] = fsz;
-            eng->pr_body_kind[idx] = PR_BODY_FILE;
+            eng->pr_body_src[idx]    = (void*)(intptr_t)ffd;  /* P10: 存 fd */
+            eng->pr_body_remain[idx] = is_head ? 0 : fsz;     /* HEAD 只发头（fd 由 pr_free_slot 兜底关闭） */
+            eng->pr_body_kind[idx]   = PR_BODY_SENDFILE;
+            eng->pr_body_offset[idx] = 0;                     /* P10: sendfile 起始偏移 */
             eng->pr_role[idx]     = PR_ROLE_LOCAL;
             eng->pr_phase[idx]    = PR_PHASE_SERVE_OUT;
             return 1;
         }
-        // 文件太大或无效：500
-        fclose(fp);
+        close(ffd);
         const char* e500 = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send(cfd, e500, strlen(e500), MSG_NOSIGNAL);
         return 0;
@@ -2888,6 +2906,38 @@ static int pr_body_next_chunk(nl_web_engine_t* eng, int idx) {
         eng->pr_out_off[idx] = 0;   // 同步置 0，防 flush EAGAIN 时重复发
         eng->pr_body_src[idx] = (char*)eng->pr_body_src[idx] + chunk;
         eng->pr_body_remain[idx] -= chunk;
+        eng->pr_phase[idx] = PR_PHASE_SERVE_OUT;
+        return 1;
+    }
+
+    // P10: BODY_SENDFILE —— sendfile() 零拷贝（Linux 专用）。
+    // 内核直接把页缓存数据送进 socket，不经过用户态缓冲（省去 fread + memcpy + send 三步）。
+    // 文件路由固定 Content-Length（非 chunked），无需 chunk 前缀。
+    // pr_body_src 存 fd（intptr_t 转换），pr_body_offset 记录文件偏移（sendfile 自动推进）。
+    if (eng->pr_body_kind[idx] == PR_BODY_SENDFILE) {
+        int ffd = (int)(intptr_t)eng->pr_body_src[idx];
+        // 一次事件内循环发送直到 EAGAIN 或发完，减少 epoll 事件往返开销
+        while (eng->pr_body_remain[idx] > 0) {
+            size_t want = (size_t)eng->pr_body_remain[idx];
+            if (want > 1048576u) want = 1048576u;   // 单次上限 1MB，防长时间占用事件循环
+            ssize_t ns = sendfile(cfd, ffd, (off_t*)&eng->pr_body_offset[idx], want);
+            if (ns < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // socket 写满：注册 EPOLLOUT，等下次可写事件续传
+                    struct epoll_event ouv;
+                    memset(&ouv, 0, sizeof(ouv));
+                    ouv.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+                    ouv.data.u32 = (uint32_t)idx;
+                    epoll_ctl(eng->epfd, EPOLL_CTL_MOD, cfd, &ouv);
+                    return 0;   // 有剩余，等 EPOLLOUT
+                }
+                return -1;      // 硬错误，调用方关闭
+            }
+            if (ns == 0) return -1;  // 文件被截断等异常（remain>0 但 sendfile 得 0）
+            eng->pr_body_remain[idx] -= ns;
+        }
+        // 全部发出：进入排空态（flush 返回 1 → remain==0 → 关闭，fd 由 pr_free_slot 关闭）
         eng->pr_phase[idx] = PR_PHASE_SERVE_OUT;
         return 1;
     }
@@ -3054,6 +3104,7 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     eng->pr_body_src    = (void**)calloc((size_t)cap, sizeof(void*));
     eng->pr_body_remain = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
     eng->pr_body_kind   = (uint8_t*)calloc((size_t)cap, 1);
+    eng->pr_body_offset = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
     // P4: chunked 编码标记
     eng->pr_use_chunked = (uint8_t*)calloc((size_t)cap, 1);
     // P7: 空闲超时（slowloris 防护）
@@ -3068,7 +3119,7 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
         !eng->pr_req_is_head || !eng->pr_up_key ||
         !eng->pr_role || !eng->pr_phase || !eng->pr_outbuf ||
         !eng->pr_out_len || !eng->pr_out_off || !eng->pr_body_src ||
-        !eng->pr_body_remain || !eng->pr_body_kind || !eng->pr_use_chunked ||
+        !eng->pr_body_remain || !eng->pr_body_kind || !eng->pr_body_offset || !eng->pr_use_chunked ||
         !eng->pr_last_active_ms) {
         close(eng->epfd); eng->epfd = -1;
         return;
@@ -3095,7 +3146,9 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     if (idle_ms <= 0) idle_ms = 30000;
     int64_t last_scan_ms = pr_pool_now_ms();
 
-    while (s->running) {
+    // P12 TSan 修复：nl_web_stop 以原子写清零 running，此处必须原子读配对，
+    // 否则 volatile 读与原子写构成数据竞争（TSan 报告）。
+    while (__atomic_load_n(&s->running, __ATOMIC_RELAXED)) {
         int n = epoll_wait(eng->epfd, events, 256, 1000);
         if (n < 0) { if (errno == EINTR) continue; break; }
         pool_reap(eng->up_pool, pr_pool_now_ms());   // 每轮回收空闲超时上游连接
@@ -3196,8 +3249,19 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
 
                     // P3: 本地路由 body 流式推进（pr_role == LOCAL && pr_phase == SERVE_FILE）
                     if (eng->pr_role[idx] == PR_ROLE_LOCAL && eng->pr_phase[idx] == PR_PHASE_SERVE_FILE) {
-                        // 拉取下一块到 outbuf，再 flush
-                        pr_body_next_chunk(eng, idx);
+                        // 仅 outbuf 排空后才拉下一块（上一块 EAGAIN 部分发送时先补发，防覆写未发数据）
+                        if (eng->pr_out_off[idx] >= eng->pr_out_len[idx]) {
+                            int nc = pr_body_next_chunk(eng, idx);
+                            if (nc < 0) {
+                                // 拉块失败（sendfile 硬错误/realloc 失败）：关闭
+                                int cfd = eng->pr_fd_client[idx];
+                                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, cfd, NULL);
+                                close(cfd);
+                                pr_free_slot(eng, idx);
+                                continue;
+                            }
+                        }
+                        // flush outbuf（SENDFILE 模式下 outbuf 为空，直接返回 1）
                         int fr = pr_flush_local_out(eng, idx);
                         if (fr > 0) {
                             // 该块已发完，判断是否还有剩余
@@ -3583,7 +3647,7 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     free(eng->pr_role);        free(eng->pr_phase);       free(eng->pr_outbuf);
     free(eng->pr_out_len);    free(eng->pr_out_off);      free(eng->pr_body_src);
     free(eng->pr_body_remain); free(eng->pr_body_kind);
-    free(eng->pr_use_chunked);
+    free(eng->pr_body_offset); free(eng->pr_use_chunked);   /* P10 遗漏补释放（P12 ASan 发现） */
     free(eng->pr_last_active_ms);
     eng->pr_fd_client = NULL;
     eng->pr_fd_upstream = NULL;
@@ -3612,6 +3676,7 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     eng->pr_body_src = NULL;
     eng->pr_body_remain = NULL;
     eng->pr_body_kind = NULL;
+    eng->pr_body_offset = NULL;
     eng->pr_use_chunked = NULL;
     eng->pr_last_active_ms = NULL;
     eng->cap = eng->count = 0;
@@ -3684,16 +3749,18 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
     }
     if (route) {
         if (route->type == NL_ROUTE_TYPE_REDIRECT) {
-                // Send 302 redirect
+                // Send redirect（类型由 redirect_type 决定，默认 302）
+                int rcode = (server->redirect_type == NL_REDIRECT_PERMANENT) ? 301 : 302;
+                const char* rtext = (rcode == 301) ? "Moved Permanently" : "Found";
                 pthread_mutex_unlock(&server->mutex);
                 char redirect_response[1024];
                 snprintf(redirect_response, sizeof(redirect_response),
-                    "HTTP/1.1 302 Found\r\n"
+                    "HTTP/1.1 %d %s\r\n"
                     "Location: %s\r\n"
                     "Content-Length: 0\r\n"
                     "Connection: close\r\n"
                     "\r\n",
-                    route->redirect_url);
+                    rcode, rtext, route->redirect_url);
                 if (write(client, redirect_response, strlen(redirect_response)) < 0) { /* best-effort */ }
                 close(client);
                 return;
@@ -3848,7 +3915,8 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
 
 static void* nl_worker_thread(void* arg) {
     nl_web_server_t* server = (nl_web_server_t*)arg;
-    while (server->running) {
+    // P12 TSan 修复：与 nl_web_stop 的原子写配对（同引擎循环）。
+    while (__atomic_load_n(&server->running, __ATOMIC_RELAXED)) {
         int client = accept(server->sock, NULL, NULL);
         if (client < 0) {
             usleep(10000);
@@ -3886,7 +3954,8 @@ static void* web_server_thread(void* arg) {
     }
 
     // 回退：worker 未启动（启动失败或 worker_count=0），accept 线程自己承担主 accept 循环
-    while (server->running) {
+    // P12 TSan 修复：与 nl_web_stop 的原子写配对。
+    while (__atomic_load_n(&server->running, __ATOMIC_RELAXED)) {
         int client = accept(server->sock, NULL, NULL);
         if (client < 0) {
             usleep(10000);
@@ -3928,6 +3997,7 @@ nl_web_server_t* nl_web_create(int port) {
     server->max_conns_cfg = 0;        // 0 = 自动（ncpu*64）
     server->idle_timeout_ms = 0;      // 0 = 默认 30s
     server->force_legacy_pool = 0;    // 0 = 引擎模式（默认）
+    server->redirect_type = NL_REDIRECT_TEMPORARY; // 默认 302
     pthread_mutex_init(&server->mutex, NULL);
     nl_route_hash_init(server);
     strncpy(server->encoding, "UTF-8", sizeof(server->encoding) - 1);
@@ -3977,16 +4047,6 @@ void nl_web_destroy(nl_web_server_t* server) {
     if (server->engine_slots) { free(server->engine_slots); server->engine_slots = NULL; }
     if (server->engine_threads) { free(server->engine_threads); server->engine_threads = NULL; }
     free(server);
-}
-
-// 引擎线程入口：把 nl_web_proxy_engine 适配为 pthread 回调签名
-// 单实例：arg 直接是 nl_web_server_t*（engines[0]）
-static void* nl_web_proxy_engine_thread(void* arg) {
-    nl_web_server_t* s = (nl_web_server_t*)arg;
-    nl_web_engine_t* eng = s->engines;  // engines[0]
-    eng->sock = s->sock;
-    nl_web_proxy_engine(eng, s->sock, 0);
-    return NULL;
 }
 
 // P6: 多实例引擎线程入口（SO_REUSEPORT）
@@ -4096,6 +4156,7 @@ int nl_web_start(nl_web_server_t* server) {
             server->sock = -1;
             return -1;
         }
+        server->running = 1;  // P6: 先置 running，再创建线程（引擎循环检查 s->running）
         for (int i = 0; i < n_engines; i++) {
              struct pr_engine_thread_arg* a = (struct pr_engine_thread_arg*)malloc(sizeof(struct pr_engine_thread_arg));
              if (!a) {
@@ -4104,6 +4165,7 @@ int nl_web_start(nl_web_server_t* server) {
                  free(server->engines);
                  for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
                  server->sock = -1;
+                 server->running = 0;
                  return -1;
              }
              a->server = server;
@@ -4115,7 +4177,6 @@ int nl_web_start(nl_web_server_t* server) {
              if (rc != 0) { free(a); break; }
              server->engine_threads_ready++;
          }
-         server->running = 1;
          // 主线程不 join 单实例（server->thread 未用）；多实例时由 nl_web_stop 遍历 join
         if (n_engines == 1) {
             // 单实例：记录到 server->thread（nl_web_stop 通过 server->thread join）
@@ -4198,25 +4259,19 @@ int nl_web_force_legacy_pool(nl_web_server_t* server, int enable) {
 }
 
 void nl_web_stop(nl_web_server_t* server) {
-    if (!server || !server->running) return;
-    
-    server->running = 0;
-    
+    if (!server || !__atomic_load_n(&server->running, __ATOMIC_RELAXED)) return;
+
+    __atomic_store_n(&server->running, 0, __ATOMIC_RELAXED);
+
     if (server->thread) {
         pthread_join(server->thread, NULL);
         server->thread = 0;
     }
-    
-    // 数据驱动引擎：epfd 由 nl_web_proxy_engine 自行清理并置 -1
-    // P6: 多实例时遍历所有引擎（兜底：若引擎异常未清理，强制关闭）
-    if (server->engines && server->engine_count > 0) {
-        for (int i = 0; i < server->engine_count; i++) {
-            nl_web_engine_t* e = &server->engines[i];
-            if (e->epfd > 0) { close(e->epfd); e->epfd = -1; }
-            if (e->up_pool) { pool_destroy(e->up_pool); free(e->up_pool); e->up_pool = NULL; }
-        }
-    }
-    // P6: join 多实例引擎线程（单实例时 engines[0] 线程已走 server->thread join）
+
+    // P6: join 多实例引擎线程（单实例时 engines[0] 线程已走 server->thread join）。
+    // P12 TSan 修复：必须先 join 引擎线程，再兜底清理 epfd/up_pool——
+    // 原先先 close(epfd)/pool_destroy 再 join，引擎线程仍在 epoll_ctl/pool_reap，
+    // 属 use-after-free 竞争（TSan 报 7 处均由此顺序错误 + running 非原子引起）。
     if (server->engine_threads && server->engine_count > 1) {
         for (int i = 0; i < server->engine_count; i++) {
             if (server->engine_threads[i]) {
@@ -4226,6 +4281,15 @@ void nl_web_stop(nl_web_server_t* server) {
         }
         free(server->engine_threads);
         server->engine_threads = NULL;
+    }
+    // 数据驱动引擎：epfd 由 nl_web_proxy_engine 自行清理并置 -1
+    // P6: 多实例时遍历所有引擎（兜底：若引擎异常未清理，强制关闭）
+    if (server->engines && server->engine_count > 0) {
+        for (int i = 0; i < server->engine_count; i++) {
+            nl_web_engine_t* e = &server->engines[i];
+            if (e->epfd > 0) { close(e->epfd); e->epfd = -1; }
+            if (e->up_pool) { pool_destroy(e->up_pool); free(e->up_pool); e->up_pool = NULL; }
+        }
     }
 
     // 清理 worker 线程（兜底：正常情况下 web_server_thread 内已 join）
@@ -4437,9 +4501,9 @@ void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json
 // Add HTML from external file (hot reload support)
 int nl_web_add_html_file(nl_web_server_t* server, const char* path, const char* file_path) {
     if (!server || !path || !file_path) return NL_EINVAL;
-    
-    // Get absolute path
-    char abs_path[512];
+
+    // Get absolute path（realpath 要求缓冲区 >= PATH_MAX）
+    char abs_path[PATH_MAX];
     if (realpath(file_path, abs_path) == NULL) {
         strncpy(abs_path, file_path, sizeof(abs_path) - 1);
     }
@@ -4481,8 +4545,8 @@ int nl_web_add_html_file(nl_web_server_t* server, const char* path, const char* 
 // Add Vue from external file (hot reload support)
 int nl_web_add_vue_file(nl_web_server_t* server, const char* path, const char* file_path) {
     if (!server || !path || !file_path) return NL_EINVAL;
-    
-    char abs_path[512];
+
+    char abs_path[PATH_MAX];
     if (realpath(file_path, abs_path) == NULL) {
         strncpy(abs_path, file_path, sizeof(abs_path) - 1);
     }
@@ -4523,8 +4587,8 @@ int nl_web_add_vue_file(nl_web_server_t* server, const char* path, const char* f
 // Add JSON from external file (hot reload support)
 int nl_web_add_json_file(nl_web_server_t* server, const char* path, const char* file_path) {
     if (!server || !path || !file_path) return NL_EINVAL;
-    
-    char abs_path[512];
+
+    char abs_path[PATH_MAX];
     if (realpath(file_path, abs_path) == NULL) {
         strncpy(abs_path, file_path, sizeof(abs_path) - 1);
     }
@@ -4589,6 +4653,26 @@ void nl_web_add_redirect_302(nl_web_server_t* server, const char* path, const ch
     pthread_mutex_unlock(&server->mutex);
     
     printf("Added redirect: %s -> %s (302)\n", path, target_url);
+}
+
+void nl_web_set_redirect_type(nl_web_server_t* server, nl_redirect_type_t type) {
+    if (!server) return;
+    if (type != NL_REDIRECT_PERMANENT && type != NL_REDIRECT_TEMPORARY) {
+        printf("nl_web_set_redirect_type: invalid type %d, keeping %d\n",
+               (int)type, (int)server->redirect_type);
+        return;
+    }
+    pthread_mutex_lock(&server->mutex);
+    server->redirect_type = type;
+    pthread_mutex_unlock(&server->mutex);
+}
+
+nl_redirect_type_t nl_web_get_redirect_type(nl_web_server_t* server) {
+    if (!server) return NL_REDIRECT_TEMPORARY;
+    pthread_mutex_lock(&server->mutex);
+    nl_redirect_type_t t = server->redirect_type;
+    pthread_mutex_unlock(&server->mutex);
+    return t;
 }
 
 // 解析 upstream 字符串为 host + port + protocol（支持 scheme 前缀或默认端口）

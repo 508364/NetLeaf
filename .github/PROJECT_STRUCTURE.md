@@ -1,7 +1,7 @@
 # NetLeaf 项目目录结构
 
 **整理时间**: 2026-10-01
-**版本**: v2.4.2
+**版本**: v3.0.0
 
 ---
 
@@ -34,7 +34,7 @@ flowchart TD
     subgraph SRCDIR["src/"]
         S1["netleaf_module.c"]
         S2["autocomplete/  autoroute/  errorpage/  ipc/  lang/  linkagg/  vue/"]
-        S3["tls/  mqtt/"]
+        S3["tls/  mqtt/  quic/  (quic 扩展含 QUIC/H3，开发暂缓)"]
         S4["windows/  linux/  macos/  (各含 optimize/)"]
     end
 

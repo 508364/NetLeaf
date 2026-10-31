@@ -13,10 +13,10 @@
 #include "netleaf_module.h"
 
 // Version macros
-#define NETLEAF_VERSION "2.4.2"
-#define NETLEAF_VERSION_MAJOR 2
-#define NETLEAF_VERSION_MINOR 4
-#define NETLEAF_VERSION_PATCH 2
+#define NETLEAF_VERSION "3.0.0"
+#define NETLEAF_VERSION_MAJOR 3
+#define NETLEAF_VERSION_MINOR 0
+#define NETLEAF_VERSION_PATCH 0
 
 // Network types
 typedef enum {
@@ -167,7 +167,9 @@ typedef enum {
     NL_OPT_SO_REUSEADDR,
     NL_OPT_SO_REUSEPORT,
     NL_OPT_SO_BROADCAST,
-    NL_OPT_CONCURRENCY      /**< Worker pool size (1..64), default 4; TCP only */
+    NL_OPT_CONCURRENCY      /**< 并发度 (1..64), default 4; TCP/HTTP/WEBSOCKET.
+                                 Windows: IOCP 完成线程数（worker 池已废弃）；
+                                 Linux/macOS: worker 池大小 */
 } nl_socket_option_t;
 
 // Server handle
@@ -286,6 +288,11 @@ NL_API void nl_server_set_handler(nl_server_t* server, nl_request_handler handle
 
 /**
  * @brief Set UDP message handler for server
+ *
+ * Windows 实现说明：接收路径为 16 槽 IOCP 接收环（多条 outstanding
+ * WSARecvFrom），handler 同步执行期间其余槽位仍由内核异步填充，
+ * 突发 datagram 吸收上限 = 16 个已缓冲包 + socket 队列，显著降低
+ * handler 慢时的丢包概率。Linux/macOS 仍为单线程 recvfrom 循环。
  */
 NL_API void nl_server_set_udp_handler(nl_server_t* server, nl_udp_message_handler handler, void* user_data);
 
@@ -307,7 +314,11 @@ NL_API void nl_server_set_udp_handler_v2(nl_server_t* server, nl_udp_message_han
 NL_API int nl_server_set_option(nl_server_t* server, nl_socket_option_t option, int value);
 
 /**
- * @brief Set concurrency level for server (worker pool size)
+ * @brief Set concurrency level for server
+ * @details Windows (TCP/HTTP/WEBSOCKET): IOCP 完成线程数（listener 线程自身
+ *          即线程 0，故总完成线程数 = concurrency）；worker 池已彻底废弃。
+ *          Linux/macOS: worker 池大小。
+ *          合法范围 1..64，默认 4。UDP 不受此项影响（接收环固定 16 槽）。
  */
 NL_API int nl_server_set_concurrency(nl_server_t* server, int concurrency);
 
@@ -832,6 +843,14 @@ NL_API void nl_web_destroy(nl_web_server_t* server);
 NL_API void nl_web_set_encoding(nl_web_server_t* server, const char* encoding);
 
 /**
+ * @brief Validate whether an encoding name is supported by the web layer
+ * @param encoding Encoding name, e.g. "UTF-8" / "GBK" / "GB2312" / "GB18030" / "BIG5"
+ *                 (case-insensitive; NULL returns 0)
+ * @return 1 if supported, 0 otherwise
+ */
+NL_API int nl_web_validate_encoding(const char* encoding);
+
+/**
  * @brief Get route count
  */
 NL_API int nl_web_get_route_count(nl_web_server_t* server);
@@ -909,6 +928,11 @@ NL_API void nl_web_add_html(nl_web_server_t* server, const char* path, const cha
 NL_API void nl_web_add_redirect_302(nl_web_server_t* server, const char* path, const char* target_url);
 
 /**
+ * @brief Add HTTP redirect (alias of nl_web_add_redirect_302, 三平台可用)
+ */
+NL_API void nl_web_add_redirect(nl_web_server_t* server, const char* path, const char* target_url);
+
+/**
  * @brief Add Vue content to web server
  */
 NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char* vue_code);
@@ -917,6 +941,15 @@ NL_API void nl_web_add_vue(nl_web_server_t* server, const char* path, const char
  * @brief Add JSON content to web server
  */
 NL_API void nl_web_add_json(nl_web_server_t* server, const char* path, const char* json);
+
+/**
+ * @brief Add HTML content from external file (hot reload)
+ * @param server Web server handle
+ * @param path URL path (e.g. "/index")
+ * @param file_path Path to HTML file
+ * @return NL_OK on success, NL_EINVAL/NL_EFILE/NL_ENOMEM on error
+ */
+NL_API int nl_web_add_html_file(nl_web_server_t* server, const char* path, const char* file_path);
 
 /**
  * @brief Add a data-driven reverse proxy route (http/https/tcp upstream) — **Beta**

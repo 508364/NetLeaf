@@ -1,6 +1,6 @@
 # NetLeaf Android 构建指南
 
-NetLeaf v2.4.2 支持 Android（Bionic）交叉编译。复用 Linux/epoll 风格的 POSIX 源，
+NetLeaf v3.0.0 支持 Android（Bionic）交叉编译。复用 Linux/epoll 风格的 POSIX 源，
 CMake 通过 `elseif(ANDROID)` 分支自动切换编译选项、源文件列表与核心库链接。
 
 > **范围说明**：Android 目前覆盖**核心库**（`netleaf_core`，含 TCP/UDP、HTTP、
@@ -98,8 +98,8 @@ Android 的 Bionic libc 与 glibc 差异已在代码层处理：
 
 - `netleaf_sysinfo_linux.c`：`__GLIBC__`/`__GLIBC_MINOR__` 在 Bionic 未定义，
   已加 `__ANDROID__` 分支显示为 "Bionic (NDK)"。
-- `netleaf_http_linux.c`：Bionic 不提供 `getrandom()`/`<sys/random.h>`，
-  QUIC 连接 ID 生成在 `__ANDROID__` 下改为直接读 `/dev/urandom`，含 `rand()` 兜底。
+- `netleaf_http_linux.c`：Bionic 不提供 `getrandom()`/`<sys/random.h>`（v3.0.0 起
+  QUIC/H3 已拆分至独立 `quic` 扩展，其连接 ID 生成改用 mbedTLS CTR_DRBG，主库不再含 QUIC 代码）。
 - 核心库链接：`dl`/`iconv` 在 Bionic 已并入 libc，`ANDROID` 分支仅显式链
   `Threads::Threads` 与 `log`（Bionic `__android_log` 由 liblog 提供）。
 - `epoll_create1`（API 21+）/`flock`/`/proc/cpuinfo` 均受 Bionic 支持。

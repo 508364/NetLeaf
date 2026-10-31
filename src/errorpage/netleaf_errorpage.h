@@ -24,7 +24,7 @@ extern "C" {
 #ifdef NL_VERSION
 #define NL_ERRORPAGE_VERSION NL_VERSION
 #else
-#define NL_ERRORPAGE_VERSION "2.4.2"
+#define NL_ERRORPAGE_VERSION "3.0.0"
 #endif
 
 // =========================================

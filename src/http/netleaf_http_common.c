@@ -1,11 +1,11 @@
 /*
- * NetLeaf HTTP/2/3 公共逻辑（平台无关）。
+ * NetLeaf HTTP/2 公共逻辑（平台无关）。
  *
- * 本文件实现 nl_http_parse_request / hpack_* / h2_* / quic_* / h3_* /
+ * 本文件实现 nl_http_parse_request / hpack_* / h2_* /
  * 请求响应访问器等纯逻辑函数，原先在 linux/macos/windows 三份
  * netleaf_http_*.c 中重复出现，现统一抽到这里，仅保留一份。
  *
- * 平台相关的 I/O（TCP 写 h2 帧、UDP 发报文）通过 nl_http_io_t 函数表
+ * 平台相关的 I/O（TCP 写 h2 帧）通过 nl_http_io_t 函数表
  * 注入，使本文件不直接依赖 <sys/socket.h> / <pthread.h> / <winsock2.h>。
  */
 #include "netleaf_http_internal.h"
@@ -242,6 +242,286 @@ void nl_http_generate_response_http1(nl_http_response_t* resp, char** out, size_
  * HPACK
  * ============================================================ */
 
+/* ------------------------------------------------------------
+ * Huffman 编解码（RFC 7541 Appendix B）
+ *
+ * 码表与 quic 扩展的 quictls_huffman.c 同源（同一 RFC 附录），
+ * 但扩展与主库不共享符号，故主库独立实现一份（HPACK 解码端
+ * 必须支持 Huffman，否则无法解析主流客户端的头块）。
+ * ------------------------------------------------------------ */
+
+/* RFC 7541 Appendix B 霍夫曼码表（code, bits）；最后一项为 EOS */
+static const struct { uint32_t code; uint8_t bits; } hpack_huff_code[257] = {
+    { 0x1ff8, 13 }, { 0x7fffd8, 23 }, { 0xfffffe2, 28 }, { 0xfffffe3, 28 },
+    { 0xfffffe4, 28 }, { 0xfffffe5, 28 }, { 0xfffffe6, 28 }, { 0xfffffe7, 28 },
+    { 0xfffffe8, 28 }, { 0xffffea, 24 }, { 0x3ffffffc, 30 }, { 0xfffffe9, 28 },
+    { 0xfffffea, 28 }, { 0x3ffffffd, 30 }, { 0xfffffeb, 28 }, { 0xfffffec, 28 },
+    { 0xfffffed, 28 }, { 0xfffffee, 28 }, { 0xfffffef, 28 }, { 0xffffff0, 28 },
+    { 0xffffff1, 28 }, { 0xffffff2, 28 }, { 0x3ffffffe, 30 }, { 0xffffff3, 28 },
+    { 0xffffff4, 28 }, { 0xffffff5, 28 }, { 0xffffff6, 28 }, { 0xffffff7, 28 },
+    { 0xffffff8, 28 }, { 0xffffff9, 28 }, { 0xffffffa, 28 }, { 0xffffffb, 28 },
+    { 0x14, 6 }, { 0x3f8, 10 }, { 0x3f9, 10 }, { 0xffa, 12 },
+    { 0x1ff9, 13 }, { 0x15, 6 }, { 0xf8, 8 }, { 0x7fa, 11 },
+    { 0x3fa, 10 }, { 0x3fb, 10 }, { 0xf9, 8 }, { 0x7fb, 11 },
+    { 0xfa, 8 }, { 0x16, 6 }, { 0x17, 6 }, { 0x18, 6 },
+    { 0x0, 5 }, { 0x1, 5 }, { 0x2, 5 }, { 0x19, 6 },
+    { 0x1a, 6 }, { 0x1b, 6 }, { 0x1c, 6 }, { 0x1d, 6 },
+    { 0x1e, 6 }, { 0x1f, 6 }, { 0x5c, 7 }, { 0xfb, 8 },
+    { 0x7ffc, 15 }, { 0x20, 6 }, { 0xffb, 12 }, { 0x3fc, 10 },
+    { 0x1ffa, 13 }, { 0x21, 6 }, { 0x5d, 7 }, { 0x5e, 7 },
+    { 0x5f, 7 }, { 0x60, 7 }, { 0x61, 7 }, { 0x62, 7 },
+    { 0x63, 7 }, { 0x64, 7 }, { 0x65, 7 }, { 0x66, 7 },
+    { 0x67, 7 }, { 0x68, 7 }, { 0x69, 7 }, { 0x6a, 7 },
+    { 0x6b, 7 }, { 0x6c, 7 }, { 0x6d, 7 }, { 0x6e, 7 },
+    { 0x6f, 7 }, { 0x70, 7 }, { 0x71, 7 }, { 0x72, 7 },
+    { 0xfc, 8 }, { 0x73, 7 }, { 0xfd, 8 }, { 0x1ffb, 13 },
+    { 0x7fff0, 19 }, { 0x1ffc, 13 }, { 0x3ffc, 14 }, { 0x22, 6 },
+    { 0x7ffd, 15 }, { 0x3, 5 }, { 0x23, 6 }, { 0x4, 5 },
+    { 0x24, 6 }, { 0x5, 5 }, { 0x25, 6 }, { 0x26, 6 },
+    { 0x27, 6 }, { 0x6, 5 }, { 0x74, 7 }, { 0x75, 7 },
+    { 0x28, 6 }, { 0x29, 6 }, { 0x2a, 6 }, { 0x7, 5 },
+    { 0x2b, 6 }, { 0x76, 7 }, { 0x2c, 6 }, { 0x8, 5 },
+    { 0x9, 5 }, { 0x2d, 6 }, { 0x77, 7 }, { 0x78, 7 },
+    { 0x79, 7 }, { 0x7a, 7 }, { 0x7b, 7 }, { 0x7ffe, 15 },
+    { 0x7fc, 11 }, { 0x3ffd, 14 }, { 0x1ffd, 13 }, { 0xffffffc, 28 },
+    { 0xfffe6, 20 }, { 0x3fffd2, 22 }, { 0xfffe7, 20 }, { 0xfffe8, 20 },
+    { 0x3fffd3, 22 }, { 0x3fffd4, 22 }, { 0x3fffd5, 22 }, { 0x7fffd9, 23 },
+    { 0x3fffd6, 22 }, { 0x7fffda, 23 }, { 0x7fffdb, 23 }, { 0x7fffdc, 23 },
+    { 0x7fffdd, 23 }, { 0x7fffde, 23 }, { 0xffffeb, 24 }, { 0x7fffdf, 23 },
+    { 0xffffec, 24 }, { 0xffffed, 24 }, { 0x3fffd7, 22 }, { 0x7fffe0, 23 },
+    { 0xffffee, 24 }, { 0x7fffe1, 23 }, { 0x7fffe2, 23 }, { 0x7fffe3, 23 },
+    { 0x7fffe4, 23 }, { 0x1fffdc, 21 }, { 0x3fffd8, 22 }, { 0x7fffe5, 23 },
+    { 0x3fffd9, 22 }, { 0x7fffe6, 23 }, { 0x7fffe7, 23 }, { 0xffffef, 24 },
+    { 0x3fffda, 22 }, { 0x1fffdd, 21 }, { 0xfffe9, 20 }, { 0x3fffdb, 22 },
+    { 0x3fffdc, 22 }, { 0x7fffe8, 23 }, { 0x7fffe9, 23 }, { 0x1fffde, 21 },
+    { 0x7fffea, 23 }, { 0x3fffdd, 22 }, { 0x3fffde, 22 }, { 0xfffff0, 24 },
+    { 0x1fffdf, 21 }, { 0x3fffdf, 22 }, { 0x7fffeb, 23 }, { 0x7fffec, 23 },
+    { 0x1fffe0, 21 }, { 0x1fffe1, 21 }, { 0x3fffe0, 22 }, { 0x1fffe2, 21 },
+    { 0x7fffed, 23 }, { 0x3fffe1, 22 }, { 0x7fffee, 23 }, { 0x7fffef, 23 },
+    { 0xfffea, 20 }, { 0x3fffe2, 22 }, { 0x3fffe3, 22 }, { 0x3fffe4, 22 },
+    { 0x7ffff0, 23 }, { 0x3fffe5, 22 }, { 0x3fffe6, 22 }, { 0x7ffff1, 23 },
+    { 0x3ffffe0, 26 }, { 0x3ffffe1, 26 }, { 0xfffeb, 20 }, { 0x7fff1, 19 },
+    { 0x3fffe7, 22 }, { 0x7ffff2, 23 }, { 0x3fffe8, 22 }, { 0x1ffffec, 25 },
+    { 0x3ffffe2, 26 }, { 0x3ffffe3, 26 }, { 0x3ffffe4, 26 }, { 0x7ffffde, 27 },
+    { 0x7ffffdf, 27 }, { 0x3ffffe5, 26 }, { 0xfffff1, 24 }, { 0x1ffffed, 25 },
+    { 0x7fff2, 19 }, { 0x1fffe3, 21 }, { 0x3ffffe6, 26 }, { 0x7ffffe0, 27 },
+    { 0x7ffffe1, 27 }, { 0x3ffffe7, 26 }, { 0x7ffffe2, 27 }, { 0xfffff2, 24 },
+    { 0x1fffe4, 21 }, { 0x1fffe5, 21 }, { 0x3ffffe8, 26 }, { 0x3ffffe9, 26 },
+    { 0xffffffd, 28 }, { 0x7ffffe3, 27 }, { 0x7ffffe4, 27 }, { 0x7ffffe5, 27 },
+    { 0xfffec, 20 }, { 0xfffff3, 24 }, { 0xfffed, 20 }, { 0x1fffe6, 21 },
+    { 0x3fffe9, 22 }, { 0x1fffe7, 21 }, { 0x1fffe8, 21 }, { 0x7ffff3, 23 },
+    { 0x3fffea, 22 }, { 0x3fffeb, 22 }, { 0x1ffffee, 25 }, { 0x1ffffef, 25 },
+    { 0xfffff4, 24 }, { 0xfffff5, 24 }, { 0x3ffffea, 26 }, { 0x7ffff4, 23 },
+    { 0x3ffffeb, 26 }, { 0x7ffffe6, 27 }, { 0x3ffffec, 26 }, { 0x3ffffed, 26 },
+    { 0x7ffffe7, 27 }, { 0x7ffffe8, 27 }, { 0x7ffffe9, 27 }, { 0x7ffffea, 27 },
+    { 0x7ffffeb, 27 }, { 0xffffffe, 28 }, { 0x7ffffec, 27 }, { 0x7ffffed, 27 },
+    { 0x7ffffee, 27 }, { 0x7ffffef, 27 }, { 0x7fffff0, 27 }, { 0x3ffffee, 26 },
+    { 0x3fffffff, 30 }
+};
+
+/* 解码树（懒构建）：内部节点 symbol=-1；构建内容确定幂等，
+ * 并发首次调用最多重复写入相同值，无正确性影响。 */
+struct hpack_huff_node { int child[2]; int symbol; };
+static struct hpack_huff_node hpack_huff_tree[514]; /* 257 叶 + 内部节点 ≤ 256 */
+static int hpack_huff_tree_nodes = 0;
+static int hpack_huff_built = 0;
+
+static void hpack_huffman_build(void) {
+    if (hpack_huff_built) return;
+
+    hpack_huff_tree[0].child[0] = -1;
+    hpack_huff_tree[0].child[1] = -1;
+    hpack_huff_tree[0].symbol = -1;
+    hpack_huff_tree_nodes = 1;
+
+    for (int s = 0; s < 257; s++) {
+        uint32_t code = hpack_huff_code[s].code;
+        int bits = hpack_huff_code[s].bits;
+        int node = 0;
+        for (int b = bits - 1; b >= 0; b--) {
+            int bit = (int)((code >> b) & 1u);
+            if (b == 0) {
+                int leaf = hpack_huff_tree_nodes++;
+                hpack_huff_tree[leaf].child[0] = -1;
+                hpack_huff_tree[leaf].child[1] = -1;
+                hpack_huff_tree[leaf].symbol = s;
+                hpack_huff_tree[node].child[bit] = leaf;
+            } else {
+                int next = hpack_huff_tree[node].child[bit];
+                if (next < 0) {
+                    next = hpack_huff_tree_nodes++;
+                    hpack_huff_tree[next].child[0] = -1;
+                    hpack_huff_tree[next].child[1] = -1;
+                    hpack_huff_tree[next].symbol = -1;
+                    hpack_huff_tree[node].child[bit] = next;
+                }
+                node = next;
+            }
+        }
+    }
+    hpack_huff_built = 1;
+}
+
+/* Huffman 编码（MSB-first 位流，末尾以 EOS 前缀位填充）。成功返回 0。 */
+static int hpack_huffman_encode(const uint8_t* in, size_t in_len, uint8_t* out, size_t cap, size_t* out_len) {
+    uint64_t acc = 0;
+    int nbits = 0;
+    size_t op = 0;
+
+    for (size_t i = 0; i < in_len; i++) {
+        uint32_t code = hpack_huff_code[in[i]].code;
+        int bits = hpack_huff_code[in[i]].bits;
+        acc = (acc << bits) | (uint64_t)code;
+        nbits += bits;
+        while (nbits >= 8) {
+            nbits -= 8;
+            if (op >= cap) return -1;
+            out[op++] = (uint8_t)(acc >> nbits);
+        }
+        acc &= (nbits > 0) ? (((uint64_t)1 << nbits) - 1) : 0;
+    }
+
+    if (nbits > 0) {
+        int pad = 8 - nbits;
+        acc = (acc << pad) | (((uint64_t)1 << pad) - 1);
+        if (op >= cap) return -1;
+        out[op++] = (uint8_t)acc;
+    }
+
+    *out_len = op;
+    return 0;
+}
+
+/* Huffman 解码（解码树逐位匹配）。末尾允许 <=7 位全 1 填充（EOS 前缀）；
+ * 出现 EOS 码字或非法路径返回 -1。成功返回 0。 */
+static int hpack_huffman_decode(const uint8_t* in, size_t in_len, uint8_t* out, size_t cap, size_t* out_len) {
+    hpack_huffman_build();
+
+    int node = 0;
+    int depth = 0;       /* 自上个完整符号以来的位深 */
+    int all_ones = 1;    /* 该位段是否全为 1（EOS 前缀填充校验） */
+    size_t op = 0;
+
+    for (size_t i = 0; i < in_len; i++) {
+        for (int k = 7; k >= 0; k--) {
+            int bit = (in[i] >> k) & 1;
+            int next = hpack_huff_tree[node].child[bit];
+            if (next < 0) return -1;
+            node = next;
+            depth++;
+            if (!bit) all_ones = 0;
+
+            if (hpack_huff_tree[node].symbol >= 0) {
+                int sym = hpack_huff_tree[node].symbol;
+                if (sym == 256) return -1;   /* EOS 不允许出现在码流中 */
+                if (op >= cap) return -1;
+                out[op++] = (uint8_t)sym;
+                node = 0;
+                depth = 0;
+                all_ones = 1;
+            }
+        }
+    }
+
+    /* 残留位：要么恰好停在符号边界（node==0），要么是 <=7 位全 1 填充 */
+    if (node != 0 && (depth > 7 || !all_ones)) return -1;
+
+    *out_len = op;
+    return 0;
+}
+
+/* ------------------------------------------------------------
+ * HPACK 动态表（RFC 7541 §2.3.2 / §4）
+ * ------------------------------------------------------------ */
+
+/* 条目计费（RFC 7541 §4.1）：32 字节开销 + 名 + 值 */
+static size_t hpack_entry_size(const char* name, const char* value) {
+    return 32 + strlen(name) + strlen(value);
+}
+
+/* 淘汰最旧条目直至满足上限（表尾为最旧） */
+static void hpack_table_evict(struct hpack_context* ctx) {
+    while (ctx->dynamic_table_count > 0 && ctx->dynamic_table_size > ctx->max_dynamic_table_size) {
+        struct hpack_dynamic_entry* last = &ctx->dynamic_table[ctx->dynamic_table_count - 1];
+        ctx->dynamic_table_size -= (int)hpack_entry_size(last->name, last->value);
+        ctx->dynamic_table_count--;
+    }
+}
+
+/* 新条目插入表头（最近使用在前：HPACK 索引 62 → dynamic_table[0]）。
+ * 单条目超上限：按 RFC 清空整表并丢弃该条目。分配失败安全降级（不插入）。 */
+static int hpack_table_insert(struct hpack_context* ctx, const char* name, const char* value) {
+    size_t esz = hpack_entry_size(name, value);
+
+    if (esz > (size_t)ctx->max_dynamic_table_size) {
+        ctx->dynamic_table_count = 0;
+        ctx->dynamic_table_size = 0;
+        return 0;
+    }
+
+    if (ctx->dynamic_table_count + 1 > ctx->dynamic_table_cap) {
+        int newcap = ctx->dynamic_table_cap ? ctx->dynamic_table_cap * 2 : 16;
+        int hard = ctx->max_dynamic_table_size / 32 + 1; /* 最小条目 32 字节，不可能超过 */
+        if (newcap > hard) newcap = hard;
+        if (newcap < ctx->dynamic_table_count + 1) newcap = ctx->dynamic_table_count + 1;
+        struct hpack_dynamic_entry* p = realloc(ctx->dynamic_table, (size_t)newcap * sizeof(*p));
+        if (!p) return -1;
+        ctx->dynamic_table = p;
+        ctx->dynamic_table_cap = newcap;
+    }
+
+    memmove(&ctx->dynamic_table[1], &ctx->dynamic_table[0],
+            (size_t)ctx->dynamic_table_count * sizeof(ctx->dynamic_table[0]));
+    snprintf(ctx->dynamic_table[0].name, MAX_HEADER_NAME, "%s", name);
+    snprintf(ctx->dynamic_table[0].value, MAX_HEADER_VALUE, "%s", value);
+    ctx->dynamic_table_count++;
+    ctx->dynamic_table_size += (int)esz;
+    hpack_table_evict(ctx);
+    return 0;
+}
+
+/* 动态表索引查找（index >= 62；value 可为 NULL 表示只取名字） */
+static int hpack_find_dynamic(struct hpack_context* ctx, uint64_t index, char* name, char* value) {
+    size_t pos = (size_t)(index - 62);
+    if (pos >= (size_t)ctx->dynamic_table_count) return -1;
+    snprintf(name, MAX_HEADER_NAME, "%s", ctx->dynamic_table[pos].name);
+    if (value) snprintf(value, MAX_HEADER_VALUE, "%s", ctx->dynamic_table[pos].value);
+    return 0;
+}
+
+/* 动态表容量变更（对端 SETTINGS 的 HEADER_TABLE_SIZE）。收缩时立即淘汰。 */
+static void hpack_set_max_size(struct hpack_context* ctx, uint32_t max_size) {
+    if (!ctx) return;
+    ctx->max_dynamic_table_size = (int)max_size;
+    hpack_table_evict(ctx);
+}
+
+/* 读取一个字符串字面量（RFC 7541 §5.2）：7 位前缀长度（最高位为 H 标志），
+ * H=1 时内容为 Huffman 编码。输出按 cap 截断。成功返回 0。 */
+static int hpack_read_string(const uint8_t* data, size_t len, char* out, size_t cap, size_t* consumed) {
+    uint64_t n;
+    size_t c;
+    if (len == 0 || cap == 0) return -1;
+    if (hpack_read_varint(data, len, 7, &n, &c) != 0) return -1;
+    if (c + n > len) return -1;
+
+    if (data[0] & 0x80) {
+        /* Huffman 编码内容：先解到临时缓冲再截断拷贝 */
+        uint8_t tmp[MAX_HEADER_VALUE];
+        size_t dn = 0;
+        if (hpack_huffman_decode(data + c, (size_t)n, tmp, sizeof(tmp) - 1, &dn) != 0) return -1;
+        tmp[dn] = '\0';
+        snprintf(out, cap, "%s", (char*)tmp);
+    } else {
+        size_t ncpy = (size_t)n < cap - 1 ? (size_t)n : cap - 1;
+        memcpy(out, data + c, ncpy);
+        out[ncpy] = '\0';
+    }
+
+    *consumed = c + (size_t)n;
+    return 0;
+}
+
 int hpack_read_varint(const uint8_t* data, size_t len, uint8_t prefix_bits, uint64_t* value, size_t* consumed) {
     if (len == 0) return -1;
 
@@ -311,6 +591,8 @@ void hpack_free(struct hpack_context* ctx) {
     free(ctx->dynamic_table);
     ctx->dynamic_table = NULL;
     ctx->dynamic_table_size = 0;
+    ctx->dynamic_table_count = 0;
+    ctx->dynamic_table_cap = 0;
 }
 
 int hpack_find_static(const char* name, const char* value) {
@@ -330,123 +612,145 @@ int hpack_find_static(const char* name, const char* value) {
 }
 
 int hpack_decode_header(struct hpack_context* ctx, const uint8_t* data, size_t len, char* name, char* value, size_t* consumed) {
-    (void)ctx;
     if (len == 0) return -1;
 
     *consumed = 0;
 
     if (data[0] & 0x80) {
+        /* 索引型 header 字段（RFC 7541 §6.1）：静态表 1..61，动态表 62.. */
         uint64_t index;
         size_t c;
         if (hpack_read_varint(data, len, 7, &index, &c) != 0) return -1;
         *consumed = c;
 
-        if (index > 0 && index <= 61) {
+        if (index == 0) return -1; /* 索引 0 非法 */
+        if (index <= 61) {
             snprintf(name, MAX_HEADER_NAME, "%s", hpack_static_table[index - 1][0]);
             snprintf(value, MAX_HEADER_VALUE, "%s", hpack_static_table[index - 1][1]);
             return 0;
         }
-    } else if ((data[0] & 0xC0) == 0x40) {
-        return -1;
-    } else if ((data[0] & 0xF0) == 0) {
+        if (hpack_find_dynamic(ctx, index, name, value) != 0) return -1;
+        return 0;
+    }
+
+    if ((data[0] & 0xC0) == 0x40 || (data[0] & 0xF0) == 0x00 || (data[0] & 0xF0) == 0x10) {
+        /* 字面量三种形态（RFC 7541 §6.2）：
+         *   0x40 增量索引（6 位前缀）/ 0x00 无索引（4 位前缀）/ 0x10 永不索引（4 位前缀）。
+         * name_index==0 表示新名字（随后是 name 字符串本身）。 */
+        int incremental = (data[0] & 0xC0) == 0x40;
+        uint8_t prefix_bits = incremental ? 6 : 4;
+        uint8_t mask = (uint8_t)((1u << prefix_bits) - 1);
         uint64_t name_index = 0;
         size_t c = 0;
 
-        if (data[0] & 0x0F) {
-            if (hpack_read_varint(data, len, 4, &name_index, &c) != 0) return -1;
+        if (data[0] & mask) {
+            if (hpack_read_varint(data, len, prefix_bits, &name_index, &c) != 0) return -1;
             *consumed = c;
         } else {
             *consumed = 1;
         }
 
-        uint64_t value_len;
-        if (hpack_read_varint(data + *consumed, len - *consumed, 7, &value_len, &c) != 0) return -1;
-        *consumed += c;
-
-        if (*consumed + value_len > len) return -1;
-
-        if (name_index > 0 && name_index <= 61) {
+        if (name_index == 0) {
+            if (hpack_read_string(data + *consumed, len - *consumed, name, MAX_HEADER_NAME, &c) != 0) return -1;
+            *consumed += c;
+        } else if (name_index <= 61) {
             snprintf(name, MAX_HEADER_NAME, "%s", hpack_static_table[name_index - 1][0]);
         } else {
-            memcpy(name, (const char*)(data + *consumed), value_len < MAX_HEADER_NAME ? value_len : MAX_HEADER_NAME - 1);
+            if (hpack_find_dynamic(ctx, name_index, name, NULL) != 0) return -1;
         }
-        name[MAX_HEADER_NAME - 1] = '\0';
 
-        memcpy(value, (const char*)(data + *consumed), value_len < MAX_HEADER_VALUE ? value_len : MAX_HEADER_VALUE - 1);
-        value[MAX_HEADER_VALUE - 1] = '\0';
-        *consumed += value_len;
-
-        return 0;
-    } else if ((data[0] & 0xF0) == 0x10) {
-        uint64_t name_index = 0;
-        size_t c = 0;
-
-        if (hpack_read_varint(data, len, 4, &name_index, &c) != 0) return -1;
-        *consumed = c;
-
-        uint64_t value_len;
-        if (hpack_read_varint(data + *consumed, len - *consumed, 7, &value_len, &c) != 0) return -1;
+        if (hpack_read_string(data + *consumed, len - *consumed, value, MAX_HEADER_VALUE, &c) != 0) return -1;
         *consumed += c;
 
-        if (*consumed + value_len > len) return -1;
-
-        if (name_index > 0 && name_index <= 61) {
-            snprintf(name, MAX_HEADER_NAME, "%s", hpack_static_table[name_index - 1][0]);
-        } else {
-            memcpy(name, (const char*)(data + *consumed), value_len < MAX_HEADER_NAME ? value_len : MAX_HEADER_NAME - 1);
-        }
-        name[MAX_HEADER_NAME - 1] = '\0';
-
-        memcpy(value, (const char*)(data + *consumed), value_len < MAX_HEADER_VALUE ? value_len : MAX_HEADER_VALUE - 1);
-        value[MAX_HEADER_VALUE - 1] = '\0';
-        *consumed += value_len;
-
+        if (incremental) hpack_table_insert(ctx, name, value);
         return 0;
     }
 
     return -1;
 }
 
+/* 写入一个字符串字面量（RFC 7541 §5.2）：Huffman 编码更短时置 H 位用之。
+ * 返回写入字节数；缓冲不足或编码失败返回 0（空串的原始编码至少 1 字节，无歧义）。 */
+static size_t hpack_literal_string(const uint8_t* src, size_t slen, uint8_t* dst, size_t cap) {
+    uint8_t huff[MAX_HEADER_VALUE * 2];
+    size_t hlen = 0;
+
+    if (slen > 0 && hpack_huffman_encode(src, slen, huff, sizeof(huff), &hlen) == 0 && hlen < slen) {
+        size_t w = hpack_write_varint(dst, cap, 7, hlen, 0x80);
+        if (w == 0 || w + hlen > cap) return 0;
+        memcpy(dst + w, huff, hlen);
+        return w + hlen;
+    }
+
+    size_t w = hpack_write_varint(dst, cap, 7, slen, 0x00);
+    if (w == 0 || w + slen > cap) return 0;
+    memcpy(dst + w, src, slen);
+    return w + slen;
+}
+
 int hpack_encode_header(struct hpack_context* ctx, uint8_t* data, size_t len, const char* name, const char* value) {
-    (void)ctx;
+    size_t offset = 0;
+
+    /* 1) 完全匹配（name+value）：先静态表，再动态表 → 索引型（0x80） */
     int idx = hpack_find_static(name, value);
     if (idx > 0) {
-        return hpack_write_varint(data, len, 7, idx, 0x80);
+        return hpack_write_varint(data, len, 7, (uint64_t)idx, 0x80);
     }
-
-    size_t offset = 0;
-    size_t name_len = strlen(name);
-    size_t value_len = strlen(value);
-
-    if (idx < 0) {
-        /* 索引名 literal（RFC 7541 §6.2.1）：name index 用 4 位前缀 0x10 编码。
-         * 旧实现误用 6 位前缀 0x00，会把索引写成 "索引型 header"，客户端 HPACK
-         * 解析错乱 → 连接能建但无响应。此处按 4 位前缀写，索引 >15 时退化为
-         * 全字面形式（0x00 + name_len + 名字）。 */
-        idx = -idx;
-        if (idx <= 15) {
-            offset += hpack_write_varint(data + offset, len - offset, 4, idx, 0x10);
-        } else {
-            data[offset++] = 0x00;
-            offset += hpack_write_varint(data + offset, len - offset, 7, name_len, 0x00);
-            if (offset + name_len > len) return 0;
-            memcpy(data + offset, name, name_len);
-            offset += name_len;
+    for (int i = 0; i < ctx->dynamic_table_count; i++) {
+        if (strcmp(ctx->dynamic_table[i].name, name) == 0 &&
+            strcmp(ctx->dynamic_table[i].value, value) == 0) {
+            return hpack_write_varint(data, len, 7, (uint64_t)(62 + i), 0x80);
         }
-    } else {
-        data[offset++] = 0x00;
-        offset += hpack_write_varint(data + offset, len - offset, 7, name_len, 0x00);
-        if (offset + name_len > len) return 0;
-        memcpy(data + offset, name, name_len);
-        offset += name_len;
     }
 
-    offset += hpack_write_varint(data + offset, len - offset, 7, value_len, 0x00);
-    if (offset + value_len > len) return 0;
-    memcpy(data + offset, value, value_len);
-    offset += value_len;
+    /* 2) 名字匹配：静态表（负索引）或动态表（62+i） */
+    uint64_t name_index = 0;
+    if (idx < 0) {
+        name_index = (uint64_t)(-idx);
+    } else {
+        for (int i = 0; i < ctx->dynamic_table_count; i++) {
+            if (strcmp(ctx->dynamic_table[i].name, name) == 0) {
+                name_index = (uint64_t)(62 + i);
+                break;
+            }
+        }
+    }
 
-    return offset;
+    /* 3) 字面量：容量允许则增量索引（0x40，同步动态表），
+     *    否则无索引（0x00）。编码端插入必须与解码端严格同步，故只在
+     *    确定写 0x40 时才插入。 */
+    size_t esz = hpack_entry_size(name, value);
+    int use_indexing = (ctx->max_dynamic_table_size > 0) &&
+                       (esz <= (size_t)ctx->max_dynamic_table_size);
+
+    uint8_t prefix_bits = use_indexing ? 6 : 4;
+    uint8_t prefix_flag = use_indexing ? 0x40 : 0x00;
+    uint64_t limit = ((uint64_t)1 << prefix_bits);
+
+    if (name_index > 0 && name_index < limit) {
+        offset += hpack_write_varint(data + offset, len - offset, prefix_bits, name_index, prefix_flag);
+    } else {
+        /* 无名字索引，或索引超出前缀容量：退化为新名字全字面量 */
+        if (offset >= len) return 0;
+        data[offset++] = prefix_flag;
+        name_index = 0;
+    }
+
+    if (name_index == 0) {
+        size_t w = hpack_literal_string((const uint8_t*)name, strlen(name), data + offset, len - offset);
+        if (w == 0) return 0;
+        offset += w;
+    }
+
+    {
+        size_t w = hpack_literal_string((const uint8_t*)value, strlen(value), data + offset, len - offset);
+        if (w == 0) return 0;
+        offset += w;
+    }
+
+    if (use_indexing) hpack_table_insert(ctx, name, value);
+
+    return (int)offset;
 }
 
 /* ============================================================
@@ -557,6 +861,42 @@ int h2_send_window_update(struct nl_http_io* io, nl_http_handle_t fd, struct nl_
     return io->write_h2_frame(io, fd, frame, 13);
 }
 
+int h2_send_rst_stream(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_connection* conn, uint32_t stream_id, uint32_t error_code) {
+    (void)conn;
+    uint8_t frame[13];
+    struct nl_h2_frame_header header = {0};
+    header.length = 4;
+    header.type = NL_H2_FRAME_RST_STREAM;
+    header.flags = 0;
+    header.stream_id = stream_id;
+    h2_frame_header_write(frame, &header);
+    frame[9] = (uint8_t)((error_code >> 24) & 0xFF);
+    frame[10] = (uint8_t)((error_code >> 16) & 0xFF);
+    frame[11] = (uint8_t)((error_code >> 8) & 0xFF);
+    frame[12] = (uint8_t)(error_code & 0xFF);
+    return io->write_h2_frame(io, fd, frame, 13);
+}
+
+int h2_send_goaway(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_connection* conn, uint32_t last_stream_id, uint32_t error_code) {
+    (void)conn;
+    uint8_t frame[17];
+    struct nl_h2_frame_header header = {0};
+    header.length = 8;
+    header.type = NL_H2_FRAME_GOAWAY;
+    header.flags = 0;
+    header.stream_id = 0;  /* GOAWAY 作用于连接，流 ID 恒为 0 */
+    h2_frame_header_write(frame, &header);
+    frame[9] = (uint8_t)((last_stream_id >> 24) & 0x7F);
+    frame[10] = (uint8_t)((last_stream_id >> 16) & 0xFF);
+    frame[11] = (uint8_t)((last_stream_id >> 8) & 0xFF);
+    frame[12] = (uint8_t)(last_stream_id & 0xFF);
+    frame[13] = (uint8_t)((error_code >> 24) & 0xFF);
+    frame[14] = (uint8_t)((error_code >> 16) & 0xFF);
+    frame[15] = (uint8_t)((error_code >> 8) & 0xFF);
+    frame[16] = (uint8_t)(error_code & 0xFF);
+    return io->write_h2_frame(io, fd, frame, 17);
+}
+
 int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_connection* conn, struct nl_http2_stream* stream, nl_http_response_t* resp) {
     /* 单一堆缓冲复用：前段写 HEADERS 头块（offset），后段 [9+chunk..9+chunk+chunk]
      * 作为 DATA 分块帧体，避免原 16KB(header_block) + 16KB(frame) ≈32KB 双栈占用。
@@ -569,20 +909,33 @@ int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_
 
     char status[8];
     snprintf(status, sizeof(status), "%d", resp->status);
-    offset += hpack_encode_header(&conn->hpack, header_block + offset, H2_MAX_FRAME_SIZE - offset, ":status", status);
+    /* 响应头用编码表（hpack_enc，与对端解码端同步的方向独立表） */
+    offset += hpack_encode_header(&conn->hpack_enc, header_block + offset, H2_MAX_FRAME_SIZE - offset, ":status", status);
 
     for (int i = 0; i < resp->header_count; i++) {
-        offset += hpack_encode_header(&conn->hpack, header_block + offset, H2_MAX_FRAME_SIZE - offset,
-                                     resp->headers[i].name, resp->headers[i].value);
+        /* RFC 7540 §8.1.2：h2 字段名必须全小写。公共 API 按 HTTP/1 习惯
+         * 允许 "Content-Type" 等混合大小写，编码前在此转换（截断保护）。 */
+        char lname[128];
+        size_t n = 0;
+        for (; resp->headers[i].name[n] != '\0' && n + 1 < sizeof(lname); n++) {
+            char c = resp->headers[i].name[n];
+            lname[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+        }
+        lname[n] = '\0';
+        offset += hpack_encode_header(&conn->hpack_enc, header_block + offset, H2_MAX_FRAME_SIZE - offset,
+                                     lname, resp->headers[i].value);
     }
 
     /* 头块过长（超出 H2 单帧上限）截断以保护帧结构；正常响应头远小于此值。 */
     if (offset > H2_MAX_FRAME_SIZE) offset = H2_MAX_FRAME_SIZE;
 
+    int has_body = (resp->body && resp->body_size > 0);
+
     struct nl_h2_frame_header frame_header = {0};
     frame_header.length = offset;
     frame_header.type = NL_H2_FRAME_HEADERS;
-    frame_header.flags = 0x04;
+    /* 无响应体：HEADERS 直接携带 END_STREAM，流随即关闭 */
+    frame_header.flags = has_body ? 0x04 : (0x04 | 0x01);
     frame_header.stream_id = stream->id;
 
     h2_frame_header_write(data_frame, &frame_header);
@@ -591,12 +944,25 @@ int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_
     int result = io->write_h2_frame(io, fd, data_frame, 9 + offset);
     if (result < 0) { free(frame); return -1; }
 
-    if (resp->body && resp->body_size > 0) {
+    if (!has_body) {
+        stream->state = NL_H2_ST_CLOSED;
+    } else {
+        if (stream->state == NL_H2_ST_IDLE || stream->state == NL_H2_ST_OPEN) {
+            stream->state = NL_H2_ST_HALF_CLOSED_LOCAL;
+        }
+
+        /* DATA 分块上限遵从远端 SETTINGS_MAX_FRAME_SIZE（RFC 7540 §6.5.2） */
+        size_t max_chunk = H2_MAX_FRAME_SIZE;
+        if (conn->remote_settings.max_frame_size > 0 &&
+            conn->remote_settings.max_frame_size < max_chunk) {
+            max_chunk = conn->remote_settings.max_frame_size;
+        }
+
         size_t remaining = resp->body_size;
         const char* body_ptr = resp->body;
 
         while (remaining > 0) {
-            size_t chunk_size = remaining < H2_MAX_FRAME_SIZE ? remaining : H2_MAX_FRAME_SIZE;
+            size_t chunk_size = remaining < max_chunk ? remaining : max_chunk;
             uint8_t flags = (remaining == chunk_size) ? 0x01 : 0x00;
 
             frame_header.length = chunk_size;
@@ -612,6 +978,13 @@ int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_
 
             body_ptr += chunk_size;
             remaining -= chunk_size;
+
+            if (flags & 0x01) {
+                /* 已发 END_STREAM */
+                stream->state = (stream->state == NL_H2_ST_HALF_CLOSED_REMOTE)
+                                    ? NL_H2_ST_CLOSED
+                                    : NL_H2_ST_HALF_CLOSED_LOCAL;
+            }
         }
     }
 
@@ -708,6 +1081,8 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
                             break;
                     }
                 }
+                /* 远端调小动态表上限时须同步收缩编码表，保持与对端解码端一致 */
+                hpack_set_max_size(&conn->hpack_enc, conn->remote_settings.header_table_size);
                 h2_send_settings_ack(io, fd, conn);
             }
             break;
@@ -717,6 +1092,13 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
             if (!stream) return -1;
 
             stream->request.version = NL_HTTP_VERSION_2;
+
+            /* 流状态机（服务端视角）：IDLE→OPEN；END_STREAM 表示客户端
+             * 不再发 DATA，置 HALF_CLOSED_REMOTE。 */
+            if (stream->state == NL_H2_ST_IDLE)
+                stream->state = NL_H2_ST_OPEN;
+            if (header.flags & 0x01)  /* END_STREAM */
+                stream->state = NL_H2_ST_HALF_CLOSED_REMOTE;
 
             /* END_HEADERS(0x04) 置位：头块完整于本帧；未置位：后续由 CONTINUATION 续帧。 */
             int end_headers = (header.flags & 0x04) != 0;
@@ -833,6 +1215,9 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
 
             h2_send_window_update(io, fd, conn, header.stream_id, header.length);
             h2_send_window_update(io, fd, conn, 0, header.length);
+
+            if (header.flags & 0x01)  /* END_STREAM：请求体收完 */
+                stream->state = NL_H2_ST_HALF_CLOSED_REMOTE;
             break;
         }
 
@@ -863,10 +1248,32 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
             }
             break;
 
-        case NL_H2_FRAME_RST_STREAM:
+        case NL_H2_FRAME_PRIORITY:
+            /* RFC 7540 §6.3：服务端可安全忽略优先级信息，仅需消费帧 */
             break;
+
+        case NL_H2_FRAME_RST_STREAM: {
+            /* 仅搜索已有流，不创建（对未知流的 RST 无需理会） */
+            struct nl_http2_stream* stream = conn->streams;
+            while (stream && stream->id != header.stream_id) stream = stream->next;
+            if (stream) {
+                stream->state = NL_H2_ST_CLOSED;
+                if (stream->request.body) {
+                    free(stream->request.body);
+                    stream->request.body = NULL;
+                    stream->request.body_size = 0;
+                }
+            }
+            break;
+        }
 
         case NL_H2_FRAME_GOAWAY:
+            /* 收到 GOAWAY：对端不再接受新流，置 draining（仍处理已开的流） */
+            conn->draining = 1;
+            if (header.length >= 8) {
+                conn->goaway_last_stream = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+                                           ((uint32_t)payload[2] << 8) | payload[3];
+            }
             break;
     }
 
@@ -874,467 +1281,7 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
 }
 
 /* ============================================================
- * QUIC varint + HTTP/3
- * ============================================================ */
-
-size_t quic_read_varint(const uint8_t* data, size_t len, uint64_t* value) {
-    if (len < 1) return 0;
-
-    uint8_t first_byte = data[0];
-    uint8_t prefix = (first_byte >> 6) & 0x03;
-
-    if (prefix == 0 && len >= 1) {
-        *value = first_byte & 0x3F;
-        return 1;
-    } else if (prefix == 1 && len >= 2) {
-        *value = ((uint64_t)(first_byte & 0x3F) << 8) | data[1];
-        return 2;
-    } else if (prefix == 2 && len >= 4) {
-        *value = ((uint64_t)(first_byte & 0x3F) << 24) |
-                 ((uint64_t)data[1] << 16) |
-                 ((uint64_t)data[2] << 8) |
-                 data[3];
-        return 4;
-    } else if (prefix == 3 && len >= 8) {
-        *value = ((uint64_t)(first_byte & 0x3F) << 56) |
-                 ((uint64_t)data[1] << 48) |
-                 ((uint64_t)data[2] << 40) |
-                 ((uint64_t)data[3] << 32) |
-                 ((uint64_t)data[4] << 24) |
-                 ((uint64_t)data[5] << 16) |
-                 ((uint64_t)data[6] << 8) |
-                 data[7];
-        return 8;
-    }
-
-    return 0;
-}
-
-size_t quic_write_varint(uint8_t* data, size_t len, uint64_t value) {
-    if (value < 64 && len >= 1) {
-        data[0] = (uint8_t)value;
-        return 1;
-    } else if (value < 16384 && len >= 2) {
-        data[0] = 0x40 | (uint8_t)(value >> 8);
-        data[1] = (uint8_t)(value & 0xFF);
-        return 2;
-    } else if (value < 1073741824 && len >= 4) {
-        data[0] = 0x80 | (uint8_t)(value >> 24);
-        data[1] = (uint8_t)((value >> 16) & 0xFF);
-        data[2] = (uint8_t)((value >> 8) & 0xFF);
-        data[3] = (uint8_t)(value & 0xFF);
-        return 4;
-    } else if (value < (1ULL << 62) && len >= 8) {
-        /* 8 字节档：QUIC varint 实际可表示 0..2^62-1（prefix=3 占用 2 位） */
-        data[0] = 0xC0 | (uint8_t)(value >> 56);
-        data[1] = (uint8_t)((value >> 48) & 0xFF);
-        data[2] = (uint8_t)((value >> 40) & 0xFF);
-        data[3] = (uint8_t)((value >> 32) & 0xFF);
-        data[4] = (uint8_t)((value >> 24) & 0xFF);
-        data[5] = (uint8_t)((value >> 16) & 0xFF);
-        data[6] = (uint8_t)((value >> 8) & 0xFF);
-        data[7] = (uint8_t)(value & 0xFF);
-        return 8;
-    }
-    return 0;
-}
-
-struct nl_http3_stream* h3_find_or_create_stream(struct nl_http3_connection* conn, uint64_t stream_id) {
-    struct nl_http3_stream* stream = conn->streams;
-    while (stream) {
-        if (stream->id == stream_id) return stream;
-        stream = stream->next;
-    }
-
-    stream = calloc(1, sizeof(*stream));
-    if (!stream) return NULL;
-    stream->id = stream_id;
-    stream->state = NL_QUIC_STREAM_STATE_IDLE;
-    stream->recv_window = QUIC_INITIAL_MAX_STREAM_DATA;
-    stream->send_window = QUIC_INITIAL_MAX_STREAM_DATA;
-    stream->next = conn->streams;
-    conn->streams = stream;
-
-    return stream;
-}
-
-void h3_stream_free(struct nl_http3_stream* stream) {
-    if (stream) {
-        if (stream->recv_buffer) free(stream->recv_buffer);
-        if (stream->request.body) free(stream->request.body);
-        if (stream->response.body) free(stream->response.body);
-        free(stream);
-    }
-}
-
-int h3_process_stream_frame(struct nl_http_io* io, struct nl_http3_connection* conn, struct nl_http3_stream* stream,
-                           const uint8_t* data, size_t len, nl_http_handler handler, void* user_data) {
-    (void)user_data;
-    if (len < 1) return -1;
-
-    uint8_t frame_type = data[0];
-    size_t offset = 1;
-
-    uint64_t frame_length = 0;
-    size_t varint_len = quic_read_varint(data + offset, len - offset, &frame_length);
-    if (varint_len == 0) return -1;
-    offset += varint_len;
-
-    if (offset + frame_length > len) return -1;
-
-    switch (frame_type) {
-        case NL_H3_FRAME_DATA: {
-            /* 数据帧：追加到 recv_buffer（动态扩容） */
-            if (frame_length > 0) {
-                if (!stream->recv_buffer) {
-                    stream->recv_buffer_size = 8192;
-                    stream->recv_buffer = calloc(1, stream->recv_buffer_size);
-                }
-
-                if (stream->recv_buffer_len + frame_length > stream->recv_buffer_size) {
-                    size_t new_size = stream->recv_buffer_size ? stream->recv_buffer_size : 8192;
-                    while (new_size < stream->recv_buffer_len + frame_length) new_size *= 2;
-                    uint8_t* new_buffer = realloc(stream->recv_buffer, new_size);
-                    if (new_buffer) {
-                        stream->recv_buffer = new_buffer;
-                        stream->recv_buffer_size = new_size;
-                    }
-                }
-
-                if (stream->recv_buffer) {
-                    memcpy(stream->recv_buffer + stream->recv_buffer_len, data + offset, frame_length);
-                    stream->recv_buffer_len += frame_length;
-                    stream->recv_offset += frame_length;
-                }
-            }
-            break;
-        }
-
-        case NL_H3_FRAME_HEADERS: {
-            /* 头部帧：简化 hpack 静态表解析 + 调用 handler + 回响应 */
-            stream->request.version = NL_HTTP_VERSION_3;
-            stream->request.method = NL_HTTP_GET; /* 默认方法 */
-
-            size_t header_offset = 0;
-            while (header_offset < frame_length) {
-                uint64_t index = 0;
-                size_t index_len = quic_read_varint(data + offset + header_offset, frame_length - header_offset, &index);
-                if (index_len == 0) break;
-
-                if (index < 61) {
-                    const char* name = hpack_static_table[index][0];
-                    const char* value = hpack_static_table[index][1];
-
-                    if (strcmp(name, ":method") == 0 && strlen(value) > 0) {
-                        stream->request.method = nl_http_parse_method(value);
-                    } else if (strcmp(name, ":path") == 0 && strlen(value) > 0) {
-                        snprintf(stream->request.path, NL_HTTP_MAX_PATH, "%s", value);
-                    } else if (name[0] != ':' && stream->request.header_count < MAX_HEADERS) {
-                        snprintf(stream->request.headers[stream->request.header_count].name, MAX_HEADER_NAME, "%s", name);
-                        snprintf(stream->request.headers[stream->request.header_count].value, MAX_HEADER_VALUE, "%s", value);
-                        stream->request.header_count++;
-                    }
-                }
-
-                header_offset += index_len;
-            }
-
-            /* 默认路径 */
-            if (stream->request.path[0] == '\0') {
-                snprintf(stream->request.path, NL_HTTP_MAX_PATH, "/");
-            }
-
-            /* 调用 handler 并回包 */
-            if (handler) {
-                nl_http_response_t resp = {0};
-                resp.status = 200;
-                handler(&stream->request, &resp, user_data);
-
-                /* 用连接的堆 send_buffer 组装回包（原先两次 64KB 栈缓冲
-                 * 合并复用，削减每请求 128KB 栈占用）。 */
-                if (conn->send_buffer) {
-                    size_t cap = conn->send_buffer_size;
-
-                    /* 头部帧 */
-                    size_t resp_offset = 0;
-                    conn->send_buffer[resp_offset++] = NL_H3_FRAME_HEADERS;
-                    resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, 10);
-                    conn->send_buffer[resp_offset++] = 0x88; /* 静态表 :status=200 (idx 8, 1-based) */
-
-                    for (int i = 0; i < resp.header_count && resp_offset + 32 < cap; i++) {
-                        conn->send_buffer[resp_offset++] = 0x00;
-                        resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, 0);
-                        size_t name_len = strlen(resp.headers[i].name);
-                        resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, name_len);
-                        memcpy(conn->send_buffer + resp_offset, resp.headers[i].name, name_len);
-                        resp_offset += name_len;
-                        size_t value_len = strlen(resp.headers[i].value);
-                        resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, value_len);
-                        memcpy(conn->send_buffer + resp_offset, resp.headers[i].value, value_len);
-                        resp_offset += value_len;
-                    }
-
-                    io->udp_send(io, conn->fd, conn->send_buffer, resp_offset,
-                                 &conn->client_addr, conn->client_addr_len);
-
-                    /* 数据帧（若有 body） */
-                    if (resp.body && resp.body_size > 0 &&
-                        resp.body_size < cap) {
-                        size_t data_offset = 0;
-                        conn->send_buffer[data_offset++] = NL_H3_FRAME_DATA;
-                        data_offset += quic_write_varint(conn->send_buffer + data_offset, cap - data_offset, resp.body_size);
-                        memcpy(conn->send_buffer + data_offset, resp.body, resp.body_size);
-                        data_offset += resp.body_size;
-
-                        io->udp_send(io, conn->fd, conn->send_buffer, data_offset,
-                                     &conn->client_addr, conn->client_addr_len);
-                    }
-
-                    if (resp.body) free(resp.body);
-                }
-            }
-            break;
-        }
-
-        case NL_H3_FRAME_SETTINGS:
-            /* 远端 H3 SETTINGS 透传（本演示骨架未逐字段解析） */
-            break;
-
-        case NL_H3_FRAME_GOAWAY:
-            conn->state = NL_QUIC_STATE_CLOSING;
-            break;
-    }
-
-    /* 以下为 QUIC 传输层帧（RFC 9000）：在 H3 控制/请求流上到达，
-     * 与 H3 应用帧共用 STREAM 载荷，故在同一 switch 处按帧号处理。 */
-    switch (frame_type) {
-        case NL_QUIC_FRAME_MAX_DATA: {
-            if (frame_length < 8) return 0;
-            uint64_t max_data = 0;
-            quic_read_varint(data + offset, frame_length, &max_data);
-            conn->max_data = max_data;
-            break;
-        }
-        case NL_QUIC_FRAME_MAX_STREAM_DATA: {
-            if (frame_length < 16 || !stream) return 0;
-            uint64_t s_id = 0, ms = 0;
-            size_t o = quic_read_varint(data + offset, frame_length, &s_id);
-            if (o == 0) return 0;
-            quic_read_varint(data + offset + o, frame_length - o, &ms);
-            if (stream->id == s_id) stream->recv_window = ms;
-            break;
-        }
-        case NL_QUIC_FRAME_MAX_STREAMS_BIDI:
-        case NL_QUIC_FRAME_MAX_STREAMS_UNI: {
-            if (frame_length < 8) return 0;
-            uint64_t max_streams = 0;
-            quic_read_varint(data + offset, frame_length, &max_streams);
-            conn->max_streams_bidi = max_streams;
-            break;
-        }
-        case NL_QUIC_FRAME_ACK: {
-            /* ACK 帧：解析 largest_acknowledged + ACK range，仅记录，不影响逻辑 */
-            uint64_t largest_ack = 0;
-            size_t o = quic_read_varint(data + offset, frame_length, &largest_ack);
-            if (o == 0) return 0;
-            uint64_t ack_delay = 0, count = 0;
-            o = quic_read_varint(data + offset + o, frame_length - o, &ack_delay);
-            if (o == 0) return 0;
-            quic_read_varint(data + offset + o * 2, frame_length - o * 2, &count);
-            /* 演示骨架：无需回 ACK-ACK，仅保留包号同步 */
-            if (largest_ack > conn->packet_number) conn->packet_number = largest_ack;
-            break;
-        }
-        case NL_QUIC_FRAME_PING:
-            /* PING 无载荷，无需应答（对端可自行判定存活） */
-            break;
-        case NL_QUIC_FRAME_CONNECTION_CLOSE: {
-            uint64_t reason_code = 0;
-            quic_read_varint(data + offset, frame_length, &reason_code);
-            conn->state = NL_QUIC_STATE_CLOSING;
-            break;
-        }
-        case NL_QUIC_FRAME_HANDSHAKE_DONE:
-            /* 1-RTT 可开始；保留 ESTABLISHED */
-            if (conn->state == NL_QUIC_STATE_HANDSHAKE) conn->state = NL_QUIC_STATE_ESTABLISHED;
-            break;
-        default:
-            break;
-    }
-
-    return 0;
-}
-
-int h3_process_quic_packet(struct nl_http_io* io, struct nl_http3_server* server, struct nl_http3_connection* conn,
-                           const uint8_t* data, size_t len, nl_http_handler handler, void* user_data) {
-    if (len < 1) return -1;
-
-    uint8_t first_byte = data[0];
-    nl_quic_packet_type_t packet_type;
-
-    if ((first_byte & 0x80) == 0) {
-        packet_type = NL_QUIC_PACKET_SHORT;
-    } else if ((first_byte & 0x40) == 0) {
-        packet_type = NL_QUIC_PACKET_VERSION_NEGOTIATION;
-    } else {
-        uint8_t type_bits = (first_byte >> 4) & 0x03;
-        switch (type_bits) {
-            case 0: packet_type = NL_QUIC_PACKET_INITIAL; break;
-            case 1: packet_type = NL_QUIC_PACKET_0RTT; break;
-            case 2: packet_type = NL_QUIC_PACKET_HANDSHAKE; break;
-            case 3: packet_type = NL_QUIC_PACKET_RETRY; break;
-            default: packet_type = NL_QUIC_PACKET_INITIAL; break;
-        }
-    }
-
-    size_t offset = 1;
-
-    if (packet_type == NL_QUIC_PACKET_VERSION_NEGOTIATION) {
-        return 0;
-    }
-
-    if (packet_type != NL_QUIC_PACKET_SHORT) {
-        /* 长包头：version + DCID + SCID */
-        if (len < offset + 4) return -1;
-        uint32_t version = ((uint32_t)data[offset] << 24) |
-                           ((uint32_t)data[offset + 1] << 16) |
-                           ((uint32_t)data[offset + 2] << 8) |
-                           data[offset + 3];
-        (void)version;
-        offset += 4;
-
-        if (len < offset + 1) return -1;
-        uint8_t dcid_len = data[offset];
-        offset += 1;
-        if (dcid_len > 0 && len >= offset + dcid_len) {
-            memcpy(conn->dest_conn_id.data, data + offset, dcid_len);
-            conn->dest_conn_id.len = dcid_len;
-            offset += dcid_len;
-        }
-
-        if (len < offset + 1) return -1;
-        uint8_t scid_len = data[offset];
-        offset += 1;
-        if (scid_len > 0 && len >= offset + scid_len) {
-            memcpy(conn->src_conn_id.data, data + offset, scid_len);
-            conn->src_conn_id.len = scid_len;
-            offset += scid_len;
-        }
-
-        if (packet_type == NL_QUIC_PACKET_INITIAL) {
-            conn->state = NL_QUIC_STATE_HANDSHAKE;
-
-            /* 复用连接级堆 send_buffer（按需分配、随连接回收），
-             * 消除原每报文 64KB(H3_BUFFER_SIZE) 栈占用。 */
-            if (!conn->send_buffer && conn->send_buffer_size < H3_BUFFER_SIZE) {
-                conn->send_buffer = (uint8_t*)malloc(H3_BUFFER_SIZE);
-                conn->send_buffer_size = conn->send_buffer ? H3_BUFFER_SIZE : 0;
-                if (!conn->send_buffer) return -1;
-            }
-            uint8_t* response = conn->send_buffer;
-            size_t resp_offset = 0;
-
-            response[resp_offset++] = 0xC0; /* Fixed bit, long header, initial type */
-            response[resp_offset++] = 0x00;
-            response[resp_offset++] = 0x00;
-            response[resp_offset++] = 0x00;
-            response[resp_offset++] = 0x01;
-
-            response[resp_offset++] = conn->src_conn_id.len;
-            if (conn->src_conn_id.len > 0)
-                memcpy(response + resp_offset, conn->src_conn_id.data, conn->src_conn_id.len);
-            resp_offset += conn->src_conn_id.len;
-
-            response[resp_offset++] = server->server_conn_id.len;
-            if (server->server_conn_id.len > 0)
-                memcpy(response + resp_offset, server->server_conn_id.data, server->server_conn_id.len);
-            resp_offset += server->server_conn_id.len;
-
-            response[resp_offset++] = NL_QUIC_FRAME_CRYPTO;
-            resp_offset += quic_write_varint(response + resp_offset, conn->send_buffer_size - resp_offset, 0); /* offset */
-            resp_offset += quic_write_varint(response + resp_offset, conn->send_buffer_size - resp_offset, 2);  /* length */
-            response[resp_offset++] = 0x01;
-            response[resp_offset++] = 0x00;
-
-            /* 经可插拔 crypto 路径做认证加密（默认零密钥演示态；
-             * tls3 扩展注入真实 AEAD 后此处自动启用真实密钥 + 标签）。 */
-            if (nl_quic_crypto_active && nl_quic_crypto_active->seal) {
-                uint8_t aad = 0;
-                uint8_t crypt[8 + NL_QUIC_AEAD_TAG_LEN];
-                int sealed = nl_quic_crypto_active->seal(nl_quic_crypto_active,
-                    &nl_quic_crypto_active->aead,
-                    response + resp_offset - 2, 2, conn->packet_number,
-                    &aad, 1, crypt);
-                if (sealed > 0) {
-                    memcpy(response + resp_offset - 2, crypt, sealed);
-                    resp_offset = resp_offset - 2 + sealed;
-                }
-            }
-
-            io->udp_send(io, conn->fd, response, resp_offset,
-                         &conn->client_addr, conn->client_addr_len);
-
-            conn->state = NL_QUIC_STATE_ESTABLISHED; /* 演示态 */
-        }
-    } else {
-        /* 短包头：已建立连接上的帧。
-         * 先解 QUIC STREAM 帧（stream_id + offset + fin + 载荷），
-         * 载荷内可能是 QUIC 传输帧（控制流）或 H3 应用帧（请求流）。 */
-        if (conn->state == NL_QUIC_STATE_ESTABLISHED) {
-            if (len < offset + 1) return -1;
-
-            /* 短包头：DCID 长度字节 + packet number（演示 2 字节） */
-            uint8_t dcid_len = data[offset];
-            offset += 1 + dcid_len + 2;
-
-            if (offset >= len) return 0;
-
-            /* 解析 QUIC STREAM 帧：frame_type + varint len + varint stream_id + varint offset + FIN + payload */
-            uint8_t qframe = data[offset];
-            size_t qf_offset = offset + 1;
-            uint64_t qframe_len = 0;
-            size_t ql = quic_read_varint(data + qf_offset, len - qf_offset, &qframe_len);
-            if (ql == 0) return 0;
-            qf_offset += ql;
-
-            uint64_t q_stream_id = 0;
-            ql = quic_read_varint(data + qf_offset, qframe_len ? (qf_offset + qframe_len <= len ? qframe_len : 0) : 0, &q_stream_id);
-            if (ql == 0) return 0;
-            qf_offset += ql;
-
-            /* 在 STREAM 帧内进一步分发：QUIC 传输帧 vs H3 应用帧 */
-            if (qframe == NL_QUIC_FRAME_STREAM || qframe == NL_QUIC_FRAME_STREAM_FIN) {
-                /* H3 请求/控制流：跳过 varint stream_id/offset/FIN 后为 H3 应用帧载荷 */
-                uint64_t q_stream_offset = 0;
-                ql = quic_read_varint(data + qf_offset, qf_offset + qframe_len <= len ? qframe_len : 0, &q_stream_offset);
-                if (ql == 0) return 0;
-                qf_offset += ql;
-                /* FIN 标志在 payload 之后，忽略即可 */
-
-                uint64_t stream_id_for_lookup = q_stream_id;
-                struct nl_http3_stream* stream = h3_find_or_create_stream(conn, stream_id_for_lookup);
-                if (stream) {
-                    stream->recv_offset += q_stream_offset;
-                    h3_process_stream_frame(io, conn, stream, data + qf_offset,
-                                            (qf_offset + qframe_len <= len ? qframe_len : 0),
-                                            handler, user_data);
-                }
-            } else {
-                /* 非 STREAM：直接对传输帧处理（控制流的传输层帧） */
-                struct nl_http3_stream* ctrl = h3_find_or_create_stream(conn, 0);
-                (void)ctrl;
-                h3_process_stream_frame(io, conn, ctrl, data + offset,
-                                        (offset + qframe_len <= len ? qframe_len : 0),
-                                        handler, user_data);
-            }
-        }
-    }
-
-    return 0;
-}
-
-/* ============================================================
- * 连接初始化（common 部分：默认值 + hpack + client_addr 拷贝）
+ * 连接初始化（common 部分：默认值 + hpack）
  *
  * 锁的初始化（pthread_mutex_init / InitializeCriticalSection）属于平台
  * 行为，由各平台 .c 在调用本函数后通过 NL_HTTP_MUTEX_LOCK 宏补齐；
@@ -1356,61 +1303,47 @@ void h2_connection_init(struct nl_http2_connection* conn, nl_http_handle_t fd) {
     conn->connection_window_size = H2_DEFAULT_WINDOW_SIZE;
     conn->preface_sent = 0;
     conn->settings_ack_received = 0;
+    conn->draining = 0;
+    conn->goaway_last_stream = 0;
     conn->streams = NULL;
 
-    hpack_init(&conn->hpack);
-}
-
-void h3_connection_init(struct nl_http3_connection* conn, nl_http_handle_t fd,
-                        void* client_addr, size_t client_addr_len,
-                        struct nl_http3_server* server) {
-    if (!conn) return;
-    memset(conn, 0, sizeof(*conn));
-    conn->fd = fd;
-
-    /* 平台 sockaddr（如 sockaddr_in）按 client_addr_len 拷贝 */
-    if (client_addr && client_addr_len > 0) {
-        conn->client_addr = malloc(client_addr_len);
-        if (conn->client_addr) {
-            memcpy(conn->client_addr, client_addr, client_addr_len);
-            conn->client_addr_len = client_addr_len;
-        }
-    }
-
-    if (server) {
-        conn->dest_conn_id = server->server_conn_id;
-        quic_generate_conn_id(&conn->src_conn_id, QUIC_MAX_CONN_ID_LEN);
-        conn->original_conn_id = conn->src_conn_id;
-        conn->max_data = QUIC_INITIAL_MAX_DATA;
-        conn->max_streams_bidi = QUIC_DEFAULT_MAX_STREAMS_BIDI;
-        conn->max_streams_uni = QUIC_DEFAULT_MAX_STREAMS_UNI;
-        /* send_buffer / local_params / 锁由平台 lock_init 初始化，避免双重分配 */
-        conn->next = server->connections;
-        server->connections = conn;
-    } else {
-        quic_generate_conn_id(&conn->src_conn_id, QUIC_MAX_CONN_ID_LEN);
-        conn->original_conn_id = conn->src_conn_id;
-    }
-
-    conn->packet_number = 0;
-    conn->state = NL_QUIC_STATE_INIT;
-    conn->streams = NULL;
+    /* 远端初始参数为 RFC 7540 §6.5.2 默认值（未收到 SETTINGS 前生效）：
+     * 无并发流限制用 0xFFFFFFFF 表示；max_header_list_size=0 表示无限制。 */
+    conn->remote_settings.header_table_size = 4096;
+    conn->remote_settings.enable_push = 1;
+    conn->remote_settings.max_concurrent_streams = 0xFFFFFFFFu;
+    conn->remote_settings.initial_window_size = H2_DEFAULT_WINDOW_SIZE;
+    conn->remote_settings.max_frame_size = H2_MAX_FRAME_SIZE;
+    conn->remote_settings.max_header_list_size = 0;
 
     hpack_init(&conn->hpack);
+    hpack_init(&conn->hpack_enc);
+    /* 编码表初始上限跟随远端默认动态表容量（4096），收到 SETTINGS 后再调整 */
+    conn->hpack_enc.max_dynamic_table_size = 4096;
 }
 
-void h3_connection_free(struct nl_http3_connection* conn) {
+void h2_connection_cleanup(struct nl_http2_connection* conn) {
     if (!conn) return;
-    struct nl_http3_stream* stream = conn->streams;
+
+    hpack_free(&conn->hpack);
+    hpack_free(&conn->hpack_enc);
+
+    if (conn->pending_headers_block) {
+        free(conn->pending_headers_block);
+        conn->pending_headers_block = NULL;
+        conn->pending_headers_len = 0;
+        conn->pending_headers_stream = 0;
+    }
+
+    struct nl_http2_stream* stream = conn->streams;
     while (stream) {
-        struct nl_http3_stream* next = stream->next;
-        h3_stream_free(stream);
+        struct nl_http2_stream* next = stream->next;
+        if (stream->request.body) free(stream->request.body);
+        if (stream->response.body) free(stream->response.body);
+        free(stream);
         stream = next;
     }
-    hpack_free(&conn->hpack);
-    if (conn->send_buffer) free(conn->send_buffer);
-    if (conn->client_addr) free(conn->client_addr);
-    free(conn);
+    conn->streams = NULL;
 }
 
 /* ============================================================
@@ -1477,72 +1410,6 @@ void nl_http_response_set_body(nl_http_response_t* resp, const char* body, size_
 }
 
 /* ============================================================
- * QUIC 可插拔加密（内置零密钥演示态）
- *
- * 核心库不链接 mbedTLS，默认 crypto 仅做"拷贝 + 追加 16 字节占位标签"
- * （无真实 AEAD，aead.real_key==0）。tls3 扩展在真实密钥协商完成后，
- * 会用 mbedTLS AEAD 实现（ChaCha20-Poly1305 / AES-GCM）替换 seal/open，
- * 并把 real_key 置 1 后注入。
- * ============================================================ */
-static int nl_quic_default_seal(struct nl_quic_crypto* crypto, nl_quic_aead_ctx_t* ctx,
-                               const uint8_t* in, size_t in_len,
-                               uint64_t pkt_num,
-                               const uint8_t* aad, size_t aad_len,
-                               uint8_t* out) {
-    (void)crypto; (void)aad; (void)aad_len;
-    if (!ctx || !ctx->real_key) {
-        /* 演示态：原样拷贝，追加 16 字节零标签，返回总长 */
-        if (out) {
-            memcpy(out, in, in_len);
-            memset(out + in_len, 0, NL_QUIC_AEAD_TAG_LEN);
-            (void)pkt_num;
-        }
-        return (int)(in_len + NL_QUIC_AEAD_TAG_LEN);
-    }
-    /* 真实 AEAD 由 tls3 注入的 seal 覆盖，这里不应被调用 */
-    return -1;
-}
-
-static int nl_quic_default_open(struct nl_quic_crypto* crypto, nl_quic_aead_ctx_t* ctx,
-                                const uint8_t* in, size_t in_len,
-                                uint64_t pkt_num,
-                                const uint8_t* aad, size_t aad_len,
-                                uint8_t* out) {
-    (void)crypto; (void)aad; (void)aad_len;
-    if (!ctx || !ctx->real_key) {
-        /* 演示态：剥掉尾部 16 字节标签，返回明文体 */
-        if (in_len <= NL_QUIC_AEAD_TAG_LEN) return -1;
-        size_t plain = in_len - NL_QUIC_AEAD_TAG_LEN;
-        if (out) memcpy(out, in, plain);
-        (void)pkt_num;
-        return (int)plain;
-    }
-    return -1;
-}
-
-static void nl_quic_default_free(struct nl_quic_crypto* crypto) {
-    (void)crypto;
-}
-
-static struct nl_quic_crypto nl_quic_default_crypto = {
-    .opaque   = NULL,
-    .aead     = { .real_key = 0 },
-    .seal     = nl_quic_default_seal,
-    .open     = nl_quic_default_open,
-    .free_ctx = nl_quic_default_free,
-};
-
-struct nl_quic_crypto* nl_quic_crypto_active = &nl_quic_default_crypto;
-
-void nl_http_quic_crypto_install(struct nl_quic_crypto* crypto) {
-    nl_quic_crypto_active = crypto ? crypto : &nl_quic_default_crypto;
-}
-
-nl_quic_crypto_t* nl_http_quic_crypto_default(void) {
-    return &nl_quic_default_crypto;
-}
-
-/* ============================================================
  * 帧编解码回环（端对端联调）
  *
  * 纯内存，供单元测试 / 联调校验编解码正确性。
@@ -1566,26 +1433,5 @@ int h2_frame_roundtrip(uint8_t* data, size_t data_cap,
     if (header->length != payload_len) return 0;
     if (payload_len > 0 && back.length > 0 &&
         memcmp(data + 9, payload, back.length) != 0) return 0;
-    return 1;
-}
-
-int quic_varint_roundtrip(const uint64_t* values, size_t count,
-                          uint8_t* out, size_t out_cap, size_t* out_used) {
-    if (!values || !out || !out_used) return 0;
-    size_t off = 0;
-    for (size_t i = 0; i < count; i++) {
-        size_t w = quic_write_varint(out + off, out_cap - off, values[i]);
-        if (w == 0) return 0;
-        off += w;
-    }
-    *out_used = off;
-
-    size_t p = 0;
-    for (size_t i = 0; i < count; i++) {
-        uint64_t v = 0;
-        size_t r = quic_read_varint(out + p, off - p, &v);
-        if (r == 0 || v != values[i]) return 0;
-        p += r;
-    }
     return 1;
 }

@@ -36,10 +36,10 @@
     #define NL_HTTPS_BACKEND_VER NL_TLS2_VERSION
 #endif
 
-#define NL_HTTPS_VERSION "2.4.2"
-#define NL_HTTPS_VERSION_MAJOR 2
-#define NL_HTTPS_VERSION_MINOR 4
-#define NL_HTTPS_VERSION_PATCH 2
+#define NL_HTTPS_VERSION "3.0.0"
+#define NL_HTTPS_VERSION_MAJOR 3
+#define NL_HTTPS_VERSION_MINOR 0
+#define NL_HTTPS_VERSION_PATCH 0
 
 /* ============================================================
  * 扩展生命周期回调

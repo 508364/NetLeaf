@@ -1,11 +1,11 @@
 # NetLeaf - CMake Build Configuration (Pure C)
-# NL扩展系统 v2.4.2
+# NL扩展系统 v3.0.0
 # 架构: 核心库 + 独立扩展，运行时自动加载
 # 说明: 各扩展模块的目标定义已拆分到 src/<模块>/CMakeLists.txt，
 #       本文件仅负责核心库、模块装配（add_subdirectory）以及示例与测试。
 
 cmake_minimum_required(VERSION 3.14)
-project(netleaf VERSION 2.4.2 DESCRIPTION "NetLeaf - A Modern High-Performance Network Library" HOMEPAGE_URL "https://github.com/508364/netleaf" LANGUAGES C)
+project(netleaf VERSION 3.0.0 DESCRIPTION "NetLeaf - A Modern High-Performance Network Library" HOMEPAGE_URL "https://github.com/508364/netleaf" LANGUAGES C)
 
 # Allow overriding the C compiler via CC environment variable or cmake -DCMAKE_C_COMPILER=...
 # This supports LLVM-MinGW (clang.exe), MSVC (cl.exe), and any other toolchain.
@@ -15,7 +15,7 @@ if(NOT CMAKE_C_COMPILER)
     endif()
 endif()
 
-set(NETLEAF_VERSION_STRING "2.4.2-00000000")
+set(NETLEAF_VERSION_STRING "3.0.0-00000000")
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -36,7 +36,7 @@ option(BUILD_MQTT "Build MQTT module" ON)
 option(BUILD_MQTT_SERVER "Build MQTT server module" ON)
 option(BUILD_TLS "Build TLS2 extension (mbedTLS 2.28, TLS 1.0-1.3)" OFF)
 option(BUILD_TLS3 "Build TLS3 extension (mbedTLS 3.x, TLS 1.2/1.3)" ON)
-option(BUILD_QUICTLS "Build QUIC-TLS extension (self-implemented RFC 9001, requires BUILD_TLS3)" OFF)
+option(BUILD_QUIC "Build QUIC extension (H3 legacy pure logic + self-implemented RFC 9001, requires BUILD_TLS3)" OFF)
 option(BUILD_LANG "Build lang extension (official soft dependency)" ON)
 
 # ============================================================
@@ -206,8 +206,9 @@ endif()
 # Core Library (netleaf) - Pure Networking, No Built-in Modules
 # ============================================================
 
-# HTTP（H1/H2/H3 + QUIC 纯逻辑）已融回核心库：netleaf_http_common.c 与各平台
+# HTTP（H1/H2 纯逻辑）已融回核心库：netleaf_http_common.c 与各平台
 # netleaf_http_<plat>.c 直接编入 netleaf_core，纯 HTTP API 由核心承载。
+# （原 H3 / QUIC 代码已迁出主库，见 src/quic 扩展。）
 # TLS/HTTPS 作为"HTTP→TLS 连接的中间层扩展"独立于 src/http/netleaf_http_tls_<plat>.c，
 # 由独立 CMake 目标 netleaf_https 编译，安装后注册 HTTPS 相关接口。
 # 公共工具层（平台无关）：统一收敛各扩展重复的字符串/哈希/一次性守卫工具，
@@ -285,12 +286,13 @@ if(BUILD_TLS3)
     add_subdirectory(src/tls3)
 endif()
 
-# QUIC-TLS 扩展（自研 RFC 9001 数据包保护层，复用 tls3 引入的 mbedTLS 目标）
-if(BUILD_QUICTLS)
+# QUIC 扩展（原 quictls 扩展与主库迁出的 H3/QUIC 纯逻辑合并；
+# 自研 RFC 9001 数据包保护层，复用 tls3 引入的 mbedTLS 目标）
+if(BUILD_QUIC)
     if(BUILD_TLS3)
-        add_subdirectory(src/quictls)
+        add_subdirectory(src/quic)
     else()
-        message(WARNING "BUILD_QUICTLS=ON 需要 BUILD_TLS3=ON（复用其 mbedTLS 目标），已跳过 quictls。")
+        message(WARNING "BUILD_QUIC=ON 需要 BUILD_TLS3=ON（复用其 mbedTLS 目标），已跳过 quic。")
     endif()
 endif()
 

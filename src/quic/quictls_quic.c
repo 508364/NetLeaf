@@ -26,7 +26,7 @@
   #endif
 #endif
 
-#include "netleaf_quictls.h"
+#include "netleaf_quic.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -794,7 +794,7 @@ done:
  * C8-A：可运行 HTTP/3 服务端 + 客户端（UDP 回环）
  *
  * 复用本文件既有的静态编解码器（pkt_build_/pkt_parse_/crypto_frame_
- * stream_frame_/h3_frame_/qpack_ 系列）与 netleaf_quictls.h 的 TLS 13 状态机公共 API，
+ * stream_frame_/h3_frame_/qpack_ 系列）与 netleaf_quic.h 的 TLS 13 状态机公共 API，
  * 在 POSIX（socket/pthread）与 Windows（winsock2/线程 API）上通过薄可移植层实现同一套
  * 可端到端跑通的 happy-path：
  *   QUIC 握手（Initial CH/SH + Handshake 其余）+ 1-RTT 上一次 H3 GET 请求/响应。
@@ -831,6 +831,7 @@ done:
   #include <unistd.h>
   #include <pthread.h>
   #include <time.h>
+  #include <errno.h>
   typedef int       nlh3_sock_t;
   typedef socklen_t nlh3_socklen_t;
   typedef ssize_t   nlh3_ssize_t;
@@ -1133,9 +1134,9 @@ static int nlh3_server_handle(nlh3_server_t* s, const uint8_t* dg, size_t dlen,
         static int entry_cnt = 0;
         if (entry_cnt < 60) {
             entry_cnt++;
-            DWORD ms = GetTickCount();
-            fprintf(stderr, "[h3-srv] handle#%d t=%lu recvfrom b0=0x%02x dlen=%zu peer=%d.%d port=%d\n",
-                    entry_cnt, ms, dg[0], dlen,
+            uint64_t ms = nlh3_now_ms();
+            fprintf(stderr, "[h3-srv] handle#%d t=%llu recvfrom b0=0x%02x dlen=%zu peer=%d.%d port=%d\n",
+                    entry_cnt, (unsigned long long)ms, dg[0], dlen,
                     (int)((peer->sin_addr.s_addr >> 0) & 0xff),
                     (int)((peer->sin_addr.s_addr >> 8) & 0xff),
                     ntohs(peer->sin_port));
@@ -1156,7 +1157,7 @@ static int nlh3_server_handle(nlh3_server_t* s, const uint8_t* dg, size_t dlen,
         /* 完整字节 dump（前 32 个 datagram） */
         if (raw_dump_cnt < 32) {
             char pbin[128];
-            _snprintf(pbin, sizeof(pbin), "f:/C-C++/NetLeaf/build_win/bin/dump/client_raw_%02d.bin", raw_dump_cnt);
+            snprintf(pbin, sizeof(pbin), "f:/C-C++/NetLeaf/build_win/bin/dump/client_raw_%02d.bin", raw_dump_cnt);
             FILE* rbf = fopen(pbin, "wb");
             if (rbf) { fwrite(dg, 1, dlen, rbf); fclose(rbf); }
         }
@@ -2076,8 +2077,8 @@ static void* nlh3_server_thread(void* arg) {
     nlh3_server_t* s = (nlh3_server_t*)arg;
 #ifdef NLH3_DBG
     {
-        DWORD ms = GetTickCount();
-        fprintf(stderr, "[h3-srv] thread started t=%lu fd=%d running=%d\n", ms, (int)s->fd, s->running);
+        uint64_t ms = nlh3_now_ms();
+        fprintf(stderr, "[h3-srv] thread started t=%llu fd=%d running=%d\n", (unsigned long long)ms, (int)s->fd, s->running);
         fflush(stderr);
     }
 #endif
@@ -2089,8 +2090,13 @@ static void* nlh3_server_thread(void* arg) {
 #ifdef NLH3_DBG
         if (n <= 0 && thread_rcv_cnt < 30) {
             thread_rcv_cnt++;
-            DWORD ms = GetTickCount();
-            fprintf(stderr, "[h3-srv] thread recvfrom t=%lu n=%d errno=%d (timeout/error)\n", ms, (int)n, (int)WSAGetLastError());
+            uint64_t ms = nlh3_now_ms();
+#ifdef _WIN32
+            int sock_err = (int)WSAGetLastError();
+#else
+            int sock_err = errno;
+#endif
+            fprintf(stderr, "[h3-srv] thread recvfrom t=%llu n=%d errno=%d (timeout/error)\n", (unsigned long long)ms, (int)n, sock_err);
             fflush(stderr);
         }
 #endif

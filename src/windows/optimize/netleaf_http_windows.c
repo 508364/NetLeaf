@@ -1,4 +1,3 @@
-#define _CRT_RAND_S
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,22 +5,21 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <bcrypt.h>
 
 /*
- * Windows 平台 HTTP/1/2/3 适配层（纯 HTTP，无 TLS）。
+ * Windows 平台 HTTP/1/2 适配层（纯 HTTP，无 TLS）。
  *
- * 设计：纯逻辑函数（解析/hpack/h2 帧/h3/quic-varint/访问器）已抽到平台无关的
+ * 设计：纯逻辑函数（解析/hpack/h2 帧/访问器）已抽到平台无关的
  * src/http/netleaf_http_common.c，本文件只保留平台相关部分：
  *   - 平台句柄/线程/锁宏（NL_HTTPS_SOCK / NL_HTTP_THREAD / NL_HTTP_MUTEX / 锁钩子）
- *   - I/O 函数表（nl_http_io_t：Winsock TCP 写 h2 帧、UDP 发 QUIC 报文）
+ *   - I/O 函数表（nl_http_io_t：Winsock TCP 写 h2 帧）
  *   - nl_http_server（H1 生命周期）+ 平台线程 + 生命周期
- *   - QUIC 连接 ID RNG（BCryptGenRandom/rand_s 回退）
  *
  * HTTPS/TLS 专属代码已拆到 src/http/netleaf_http_tls_windows.c，
  * 由独立 CMake 目标 netleaf_https 编译并链接 netleaf_tls3/tls2。
  * 本文件定义 nl_http_server 结构（仅 HTTP 字段，无 TLS 字段）；
  * netleaf_https 库中同结构带 TLS 字段的定义由 _tls 文件提供。
+ * 原 H3 / QUIC 代码已随 QUIC/HTTP3 功能一并迁出主库（见 src/quic 扩展）。
  */
 
 /* 平台句柄/线程/锁宏：须在本头 include 前定义，供公共结构体使用。
@@ -51,7 +49,6 @@ struct nl_http_server {
     int port;
     int running;
     int enable_http2;
-    int enable_http3;
     NL_HTTP_THREAD thread;
     nl_http_handler handler;
     void* user_data;
@@ -63,7 +60,7 @@ struct nl_http_client {
 };
 
 /* ============================================================
- * I/O 函数表：TCP 写 h2 帧 / UDP 发 QUIC 报文（Winsock）
+ * I/O 函数表：TCP 写 h2 帧（Winsock）
  * ============================================================ */
 static int io_write_h2_frame(struct nl_http_io* io, nl_http_handle_t handle,
                              const uint8_t* data, size_t len) {
@@ -72,36 +69,9 @@ static int io_write_h2_frame(struct nl_http_io* io, nl_http_handle_t handle,
     return (written < 0) ? -1 : written;
 }
 
-static int io_udp_send(struct nl_http_io* io, nl_http_handle_t handle,
-                       const uint8_t* data, size_t len,
-                       void* client_addr, size_t client_addr_len) {
-    (void)io;
-    int sent = sendto(handle, (const char*)data, (int)len, 0,
-                      (struct sockaddr*)client_addr, (int)client_addr_len);
-    return (sent < 0) ? -1 : 0;
-}
-
 static struct nl_http_io nl_http_io = {
     .write_h2_frame = io_write_h2_frame,
-    .udp_send       = io_udp_send,
 };
-
-/* QUIC 连接 ID RNG：BCryptGenRandom，失败回退 rand_s */
-void quic_generate_conn_id(nl_quic_conn_id_t* conn_id, uint8_t len) {
-    if (!conn_id) return;
-    if (len > QUIC_MAX_CONN_ID_LEN) len = QUIC_MAX_CONN_ID_LEN;
-    conn_id->len = len;
-
-    NTSTATUS status = BCryptGenRandom(NULL, conn_id->data, len,
-                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (status != 0) {
-        for (uint8_t i = 0; i < len; i++) {
-            unsigned int rv;
-            rand_s(&rv);
-            conn_id->data[i] = (uint8_t)(rv & 0xFF);
-        }
-    }
-}
 
 /* ============================================================
  * H1 / H2 客户端线程（Win32 DWORD WINAPI）
@@ -158,6 +128,7 @@ static DWORD WINAPI http2_client_thread(LPVOID arg) {
     }
 
     NL_HTTP_MUTEX_DESTROY(&conn.mutex);
+    h2_connection_cleanup(&conn);
     closesocket(client_fd);
     return 0;
 }
@@ -167,25 +138,27 @@ typedef struct {
     nl_http_server_t* server;
 } http1_client_args_t;
 
+/* 读取单个完整 HTTP/1 请求到 buf（容量 cap）。成功返回实际读取字节数，
+ * 连接关闭/出错返回 <=0。配合 nl_http_find_terminator 做增量解析。
+ * （原为 http1_client_thread 内的 GNU 嵌套函数，-Wpedantic 报
+ * "ISO C forbids nested functions"，提升为文件级 static。） */
+static long nl_http_read_request_win(SOCKET fd, char* buf, size_t cap, size_t* total) {
+    *total = 0;
+    while (*total < cap - 1) {
+        int n = recv(fd, buf + *total, (int)(cap - 1 - *total), 0);
+        if (n <= 0) return (long)*total;
+        *total += (size_t)n;
+        buf[*total] = '\0';
+        if (nl_http_find_terminator(buf, *total) != -1) return (long)*total;
+    }
+    return (long)*total;
+}
+
 static DWORD WINAPI http1_client_thread(LPVOID arg) {
     http1_client_args_t* args = (http1_client_args_t*)arg;
     SOCKET client_fd = args->client_fd;
     nl_http_server_t* server = args->server;
     free(args);
-
-    /* 读取单个完整 HTTP/1 请求到 buf（容量 cap）。成功返回实际读取字节数，
-     * 连接关闭/出错返回 <=0。配合 nl_http_find_terminator 做增量解析。 */
-    long nl_http_read_request_win(SOCKET fd, char* buf, size_t cap, size_t* total) {
-        *total = 0;
-        while (*total < cap - 1) {
-            int n = recv(fd, buf + *total, (int)(cap - 1 - *total), 0);
-            if (n <= 0) return (long)*total;
-            *total += (size_t)n;
-            buf[*total] = '\0';
-            if (nl_http_find_terminator(buf, *total) != -1) return (long)*total;
-        }
-        return (long)*total;
-    }
 
     /* 取长补短：旧路径（核心库 nl_handle_client）支持 keep-alive 连接复用，
      * 新路径原先"读完即 close"。此处改为 Connection 感知：默认 keep-alive，
@@ -362,10 +335,6 @@ void nl_http_server_enable_http2(nl_http_server_t* server, int enable) {
     if (server) server->enable_http2 = enable;
 }
 
-void nl_http_server_enable_http3(nl_http_server_t* server, int enable) {
-    if (server) server->enable_http3 = enable;
-}
-
 nl_http2_server_t* nl_http2_server_create(int port) {
     nl_http2_server_t* server = calloc(1, sizeof(nl_http2_server_t));
     if (!server) return NULL;
@@ -434,156 +403,6 @@ void nl_http2_server_set_handler(nl_http2_server_t* server, nl_http_handler hand
  * HTTPS（TLS）已拆到 src/http/netleaf_http_tls_windows.c，由独立
  * CMake 目标 netleaf_https 编译并链接 netleaf_tls3/tls2。
  * 本文件（netleaf_http 库）不再包含 TLS API。
+ *
+ * 原 H3 / QUIC 服务端已随 QUIC/HTTP3 代码一并迁出主库（见 src/quic 扩展）。
  * ============================================================ */
-
-/* ============================================================
- * H3 / QUIC 服务端
- * ============================================================ */
-
-/* 平台补齐：local_params / send_buffer / 锁（公共 h3_connection_init 只
- * 负责 memset + client_addr 拷贝 + hpack + 链表挂载，此处补齐平台部分）。 */
-static void h3_connection_lock_init(struct nl_http3_connection* conn) {
-    conn->local_params.initial_max_data = QUIC_INITIAL_MAX_DATA;
-    conn->local_params.initial_max_stream_data_bidi_local = QUIC_INITIAL_MAX_STREAM_DATA;
-    conn->local_params.initial_max_stream_data_bidi_remote = QUIC_INITIAL_MAX_STREAM_DATA;
-    conn->local_params.initial_max_stream_data_uni = QUIC_INITIAL_MAX_STREAM_DATA;
-    conn->local_params.initial_max_streams_bidi = QUIC_DEFAULT_MAX_STREAMS_BIDI;
-    conn->local_params.initial_max_streams_uni = QUIC_DEFAULT_MAX_STREAMS_UNI;
-    conn->local_params.max_idle_timeout = QUIC_DEFAULT_MAX_IDLE_TIMEOUT;
-    conn->local_params.ack_delay_exponent = 3;
-    conn->local_params.max_ack_delay = 25;
-    conn->local_params.active_connection_id_limit = 8;
-    uint8_t* sb = malloc(H3_BUFFER_SIZE);
-    if (sb) {
-        conn->send_buffer = sb;
-        conn->send_buffer_size = H3_BUFFER_SIZE;
-        conn->send_buffer_len = 0;
-    }
-    NL_HTTP_MUTEX_INIT(&conn->mutex);
-}
-
-static DWORD WINAPI http3_server_thread(LPVOID arg) {
-    nl_http3_server_t* server = (nl_http3_server_t*)arg;
-
-    uint8_t buffer[H3_BUFFER_SIZE];
-    struct sockaddr_in client_addr;
-    int client_len = sizeof(client_addr);
-
-    while (server->running) {
-        int bytes_read = recvfrom(server->fd, (char*)buffer, sizeof(buffer), 0,
-                                  (struct sockaddr*)&client_addr, &client_len);
-
-        if (bytes_read > 0) {
-            /* 匹配现有连接（平台 sockaddr 比较） */
-            struct nl_http3_connection* conn = NULL;
-            for (struct nl_http3_connection* curr = server->connections; curr; curr = curr->next) {
-                struct sockaddr_in* ca = (struct sockaddr_in*)curr->client_addr;
-                if (ca && ca->sin_addr.s_addr == client_addr.sin_addr.s_addr &&
-                    ca->sin_port == client_addr.sin_port) {
-                    conn = curr;
-                    break;
-                }
-            }
-
-            if (!conn) {
-                conn = calloc(1, sizeof(struct nl_http3_connection));
-                if (conn) {
-                    h3_connection_init(conn, server->fd, &client_addr,
-                                       (size_t)client_len, server);
-                    h3_connection_lock_init(conn);
-                }
-            }
-
-            if (conn) {
-                NL_HTTP_MUTEX_LOCK(&conn->mutex);
-                h3_process_quic_packet(&nl_http_io, server, conn, buffer,
-                                       (size_t)bytes_read,
-                                       server->handler, server->user_data);
-                NL_HTTP_MUTEX_UNLOCK(&conn->mutex);
-            }
-        }
-    }
-
-    /* 清理连接 */
-    struct nl_http3_connection* c = server->connections;
-    while (c) {
-        struct nl_http3_connection* next = c->next;
-        NL_HTTP_MUTEX_DESTROY(&c->mutex);
-        h3_connection_free(c);
-        c = next;
-    }
-
-    return 0;
-}
-
-nl_http3_server_t* nl_http3_server_create(int port) {
-    nl_http3_server_t* server = calloc(1, sizeof(nl_http3_server_t));
-    if (!server) return NULL;
-
-    server->fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (server->fd == INVALID_SOCKET) {
-        free(server);
-        return NULL;
-    }
-
-    BOOL opt = TRUE;
-    setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((u_short)port);
-
-    if (bind(server->fd, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(server->fd);
-        free(server);
-        return NULL;
-    }
-
-    server->port = port;
-
-    /* 默认传输参数 */
-    server->default_params.initial_max_data = QUIC_INITIAL_MAX_DATA;
-    server->default_params.initial_max_stream_data_bidi_local = QUIC_INITIAL_MAX_STREAM_DATA;
-    server->default_params.initial_max_stream_data_bidi_remote = QUIC_INITIAL_MAX_STREAM_DATA;
-    server->default_params.initial_max_stream_data_uni = QUIC_INITIAL_MAX_STREAM_DATA;
-    server->default_params.initial_max_streams_bidi = QUIC_DEFAULT_MAX_STREAMS_BIDI;
-    server->default_params.initial_max_streams_uni = QUIC_DEFAULT_MAX_STREAMS_UNI;
-    server->default_params.max_idle_timeout = QUIC_DEFAULT_MAX_IDLE_TIMEOUT;
-    server->default_params.ack_delay_exponent = 3;
-    server->default_params.max_ack_delay = 25;
-    server->default_params.active_connection_id_limit = 8;
-
-    quic_generate_conn_id(&server->server_conn_id, 8);
-    return server;
-}
-
-void nl_http3_server_destroy(nl_http3_server_t* server) {
-    if (!server) return;
-    if (NL_HTTPS_SOCK_VALID(server->fd)) NL_HTTPS_CLOSOBJ(server->fd);
-    free(server);
-}
-
-int nl_http3_server_start(nl_http3_server_t* server) {
-    if (!server || server->running) return -1;
-    server->running = 1;
-    server->thread = CreateThread(NULL, 0, http3_server_thread, server, 0, NULL);
-    return server->thread ? 0 : -1;
-}
-
-void nl_http3_server_stop(nl_http3_server_t* server) {
-    if (!server || !server->running) return;
-    server->running = 0;
-    NL_HTTPS_CLOSOBJ(server->fd);
-    if (server->thread) {
-        WaitForSingleObject(server->thread, INFINITE);
-        CloseHandle(server->thread);
-    }
-}
-
-void nl_http3_server_set_handler(nl_http3_server_t* server, nl_http_handler handler, void* user_data) {
-    if (!server) return;
-    server->handler = handler;
-    server->user_data = user_data;
-}

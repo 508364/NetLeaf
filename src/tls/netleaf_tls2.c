@@ -130,6 +130,7 @@ struct nl_tls2_ctx {
     int                       verify_peer;                 // 客户端校验对端 / 服务端校验客户端
     int                       is_server;                   // 0 = 客户端，1 = 服务端
     int                       use_dtls;                    // 0 = TLS(流)，1 = DTLS(数据报)
+    int                       handshake_timeout_ms;        // 配置的握手超时(0 = 无限等待)
     int                       rng_seeded;
     int                       crl_loaded;
     int                       cache_inited;
@@ -153,6 +154,32 @@ struct nl_tls2_session {
 // Error string mapping
 static const char* tls2_error_string(int code) {
     static char buf[256];
+    switch (code) {
+        /* NL_TLS2 自有错误码必须先于 mbedtls 码匹配：
+         * 如 NL_TLS2_HANDSHAKE(-6) 与 MBEDTLS_ERR_MPI_INVALID_CHARACTER(-0x0006=-6)
+         * 数值相同，落到 mbedtls 分支会被误报为 "BIGNUM - invalid character"。 */
+        case NL_TLS2_OK:             return "Success";
+        case NL_TLS2_ERROR:          return "Generic error";
+        case NL_TLS2_BAD_CA:         return "Invalid CA certificate";
+        case NL_TLS2_BAD_CERT:       return "Invalid certificate";
+        case NL_TLS2_BAD_KEY:        return "Invalid private key";
+        case NL_TLS2_ALLOC_FAIL:     return "Memory allocation failed";
+        case NL_TLS2_HANDSHAKE:      return "Handshake failed";
+        case NL_TLS2_READ:           return "Read error";
+        case NL_TLS2_WRITE:          return "Write error";
+        case NL_TLS2_NOT_INIT:       return "Not initialized";
+        case NL_TLS2_INVALID_STATE:  return "Invalid state";
+        case NL_TLS2_BAD_PSK:        return "Invalid PSK";
+        case NL_TLS2_BAD_CRL:        return "Invalid CRL";
+        case NL_TLS2_BAD_ALPN:       return "Invalid ALPN";
+        case NL_TLS2_BAD_CIPHER:     return "Invalid ciphersuite";
+        case NL_TLS2_TIMEOUT:        return "Handshake timeout";
+        case NL_TLS2_NO_SESSION:     return "No session";
+        case NL_TLS2_WANT_READ:      return "Would block: read";
+        case NL_TLS2_WANT_WRITE:     return "Would block: write";
+        case NL_TLS2_UNKNOWN_ERROR:  return "Unknown error";
+        default: break;
+    }
     switch (code) {
         case MBEDTLS_ERR_SSL_BAD_INPUT_DATA:       return "Bad input parameters";
         case MBEDTLS_ERR_SSL_ALLOC_FAILED:         return "Memory allocation failed";
@@ -289,6 +316,7 @@ int nl_tls2_configure(nl_tls2_ctx_t* ctx, const nl_tls2_config_t* cfg) {
     }
     ctx->is_server = cfg->is_server ? 1 : 0;
     ctx->use_dtls  = cfg->use_dtls ? 1 : 0;
+    ctx->handshake_timeout_ms = cfg->handshake_timeout_ms;
     // 重复配置安全：先释放上次加载的证书/私钥/CRL/多证书
     mbedtls_x509_crt_free(&ctx->ca_chain);   mbedtls_x509_crt_init(&ctx->ca_chain);
     mbedtls_x509_crl_free(&ctx->crl_chain);  mbedtls_x509_crl_init(&ctx->crl_chain);
@@ -393,13 +421,10 @@ int nl_tls2_configure(nl_tls2_ctx_t* ctx, const nl_tls2_config_t* cfg) {
                 mbedtls_ssl_cache_init(&ctx->cache);
                 ctx->cache_inited = 1;
             }
-            ret = mbedtls_ssl_cache_init(&ctx->cache, mbedtls_ctr_drbg_random,
-                                         &ctx->ctr_drbg, cfg->session_cache_size);
-            if (ret != 0) return NL_TLS2_ERROR;
-            mbedtls_ssl_conf_session_cache(&ctx->conf,
+            mbedtls_ssl_cache_set_max_entries(&ctx->cache, cfg->session_cache_size);
+            mbedtls_ssl_conf_session_cache(&ctx->conf, &ctx->cache,
                                            mbedtls_ssl_cache_get,
-                                           mbedtls_ssl_cache_set,
-                                           &ctx->cache);
+                                           mbedtls_ssl_cache_set);
         }
     }
     // 配置 mbedTLS 多证书选择（SNI 主机证书）回调
@@ -457,8 +482,7 @@ const char* nl_tls2_get_alpn(nl_tls2_ctx_t* ctx) {
 int nl_tls2_set_ciphersuites(nl_tls2_ctx_t* ctx, const int* ciphersuites) {
     if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
     if (!ciphersuites) return NL_TLS2_OK;
-    int ret = mbedtls_ssl_conf_ciphersuites(&ctx->conf, ciphersuites);
-    if (ret != 0) return NL_TLS2_BAD_CIPHER;
+    mbedtls_ssl_conf_ciphersuites(&ctx->conf, ciphersuites);
     return NL_TLS2_OK;
 }
 
@@ -518,13 +542,10 @@ int nl_tls2_set_session_cache(nl_tls2_ctx_t* ctx, int max_entries) {
         mbedtls_ssl_cache_init(&ctx->cache);
         ctx->cache_inited = 1;
     }
-    int ret = mbedtls_ssl_cache_init(&ctx->cache, mbedtls_ctr_drbg_random,
-                                     &ctx->ctr_drbg, max_entries);
-    if (ret != 0) return NL_TLS2_ERROR;
-    mbedtls_ssl_conf_session_cache(&ctx->conf,
+    mbedtls_ssl_cache_set_max_entries(&ctx->cache, max_entries);
+    mbedtls_ssl_conf_session_cache(&ctx->conf, &ctx->cache,
                                    mbedtls_ssl_cache_get,
-                                   mbedtls_ssl_cache_set,
-                                   &ctx->cache);
+                                   mbedtls_ssl_cache_set);
     return NL_TLS2_OK;
 }
 
@@ -566,6 +587,14 @@ static void nl_tls2_setup_bio(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
 int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
     if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
 
+    /* 绑定 ssl 与 conf：mbedtls_ssl_handshake 要求 ssl->conf 非空，
+     * 否则返回 MBEDTLS_ERR_SSL_BAD_INPUT_DATA(-0x7100)。
+     * 重复握手时先 free+init 释放旧缓冲；hostname / 会话注入必须在 setup 之后。 */
+    mbedtls_ssl_free(&ctx->ssl);
+    mbedtls_ssl_init(&ctx->ssl);
+    int sret = mbedtls_ssl_setup(&ctx->ssl, &ctx->conf);
+    if (sret != 0) return NL_TLS2_ALLOC_FAIL;
+
     // 应用 hostname（SNI / 证书校验）
     if (ctx->hostname && !ctx->is_server) {
         mbedtls_ssl_set_hostname(&ctx->ssl, ctx->hostname);
@@ -578,6 +607,12 @@ int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
 
     // 建立底层连接
     ctx->server_fd.fd = sock;
+    /* 2.28 set_bio 参数顺序 (p_bio, f_send, f_recv, f_recv_timeout)；
+     * DTLS 需要带超时的 recv 回调配合重传定时器。 */
+    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd,
+                        mbedtls_net_send, mbedtls_net_recv,
+                        ctx->use_dtls ? mbedtls_net_recv_timeout : NULL);
+
     ctx->setup_done = 0;
     ctx->handshaked = 0;
 
@@ -586,10 +621,10 @@ int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
     if (ctx->is_server) {
         // 服务端：用外部 fd 绑定到 mbedTLS 网络层
         ctx->server_fd.fd = sock;
-        mbedtls_net_set_nonblocking(&ctx->server_fd, 1);
+        mbedtls_net_set_nonblock(&ctx->server_fd);
         int ret;
         do {
-            ret = mbedtls_ssl_handshake_server(&ctx->ssl);
+            ret = mbedtls_ssl_handshake(&ctx->ssl);
             if (ret == 0) break;
             if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
                 ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -613,7 +648,7 @@ int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
     } else {
         int ret;
         do {
-            ret = mbedtls_ssl_handshake_client(&ctx->ssl);
+            ret = mbedtls_ssl_handshake(&ctx->ssl);
             if (ret == 0) break;
             if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
                 ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -638,12 +673,14 @@ int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
 
     ctx->handshaked = 1;
     if (ctx->offered) {
-        ctx->reused = (mbedtls_ssl_session_id_reset(&ctx->ssl) == 0) ? 0 : 1;
+        /* mbedTLS 2.28 无 mbedtls_ssl_session_id_reset；与 tls3 一致，
+         * 3.x/2.x 下不再可靠区分 session-resume，保持 0 */
+        ctx->reused = 0;
     }
     if (ctx->use_dtls) {
         // 绑定 DTLS 定时器回调
-        mbedtls_ssl_set_timer(&ctx->ssl, &ctx->dtls_timer,
-                              nl_tls2_timer_set, nl_tls2_timer_get);
+        mbedtls_ssl_set_timer_cb(&ctx->ssl, &ctx->dtls_timer,
+                                 nl_tls2_timer_set, nl_tls2_timer_get);
     }
     return NL_TLS2_OK;
 }
@@ -654,7 +691,10 @@ int nl_tls2_handshake(nl_tls2_ctx_t* ctx, int sock) {
         // 必须已 configure
         return NL_TLS2_INVALID_STATE;
     }
-    return nl_tls2_handshake_ex(ctx, sock, 0);
+    /* 使用 configure() 保存的超时；0 = 无限等待(handshake_ex 用 <0 表示)。
+     * 直接传 0 会让 select 以零超时轮询，首个 WANT_READ 即误报超时。 */
+    int timeout_ms = ctx->handshake_timeout_ms > 0 ? ctx->handshake_timeout_ms : -1;
+    return nl_tls2_handshake_ex(ctx, sock, timeout_ms);
 }
 
 int nl_tls2_send(nl_tls2_ctx_t* ctx, const void* buf, size_t len) {
@@ -711,11 +751,16 @@ const char* nl_tls2_get_peer_cert(nl_tls2_ctx_t* ctx) {
     const mbedtls_x509_crt* pc = mbedtls_ssl_get_peer_cert(&ctx->ssl);
     if (!pc) return "";
     char* info = ctx->peer_cert_info;
-    int off = 0;
-    off += snprintf(info + off, sizeof(ctx->peer_cert_info) - off,
-                    "subject: ");
-    off += mbedtls_x509_string_subject(pc->subject, 0, info + off,
-                                       sizeof(ctx->peer_cert_info) - off);
+    char  buf[256];
+    memset(info, 0, sizeof(ctx->peer_cert_info));
+    int off = snprintf(info, sizeof(ctx->peer_cert_info), "subject: ");
+    if (off > 0) {
+        int len = mbedtls_x509_dn_gets(buf, sizeof(buf), &pc->subject);
+        if (len > 0) {
+            off += snprintf(info + off, sizeof(ctx->peer_cert_info) - (size_t)off,
+                           "%s", buf);
+        }
+    }
     return info;
 }
 
@@ -772,14 +817,9 @@ const char* nl_tls2_get_proto_version(const nl_tls2_ctx_t* ctx) {
 
 const char* nl_tls2_get_ciphersuite(const nl_tls2_ctx_t* ctx) {
     if (!ctx || !ctx->handshaked) return "";
-    int suite = mbedtls_ssl_get_ciphersuite(&ctx->ssl);
-    const int* csl = mbedtls_ssl_list_ciphersuites();
-    for (int i = 0; csl[i] != 0; i++) {
-        if (csl[i] == suite) {
-            return mbedtls_ssl_get_ciphersuite_name(csl[i]);
-        }
-    }
-    return "";
+    /* 本仓定制的 mbedtls 2.28 中该函数返回套件名称(const char*) */
+    const char* name = mbedtls_ssl_get_ciphersuite(&ctx->ssl);
+    return (name && name[0] != '\0') ? name : "";
 }
 
 const char* nl_tls2_strerror(int err) {
@@ -814,7 +854,9 @@ const char* nl_tls2_version(void) {
     return NL_TLS2_VERSION;
 }
 
-NL_TLS2_REGISTER_LANG();
+/* 文件作用域裸写 `nl_tls2_register_lang();` 会被 C 解析为函数声明(implicit int)，
+ * 与 tls3 一致包一层定义。 */
+void nl_tls2_lang_init(void) { nl_tls2_register_lang(); }
 
 #endif // NL_TLS2_ENABLE / NL_TLS2_STATIC
 

@@ -132,6 +132,7 @@ struct nl_tls3_ctx {
     int                       verify_peer;
     int                       is_server;
     int                       use_dtls;
+    int                       handshake_timeout_ms;   // 配置的握手超时(0 = 无限等待)
     int                       rng_seeded;
     int                       crl_loaded;
     int                       cache_inited;
@@ -154,6 +155,32 @@ struct nl_tls3_session {
 // Error string mapping
 static const char* tls3_error_string(int code) {
     static char buf[256];
+    switch (code) {
+        /* NL_TLS3 自有错误码必须先于 mbedtls 码匹配：
+         * 如 NL_TLS3_TIMEOUT(-15) 与 MBEDTLS_ERR_CCM_AUTH_FAILED(-0x000F=-15)
+         * 数值相同，落到 mbedtls 分支会被误报为 "CCM 解密失败"。 */
+        case NL_TLS3_OK:              return "Success";
+        case NL_TLS3_ERROR:           return "Generic error";
+        case NL_TLS3_BAD_CA:          return "Invalid CA certificate";
+        case NL_TLS3_BAD_CERT:        return "Invalid certificate";
+        case NL_TLS3_BAD_KEY:         return "Invalid private key";
+        case NL_TLS3_ALLOC_FAIL:      return "Memory allocation failed";
+        case NL_TLS3_HANDSHAKE:       return "Handshake failed";
+        case NL_TLS3_READ:            return "Read error";
+        case NL_TLS3_WRITE:           return "Write error";
+        case NL_TLS3_NOT_INIT:        return "Not initialized";
+        case NL_TLS3_INVALID_STATE:   return "Invalid state";
+        case NL_TLS3_BAD_PSK:         return "Invalid PSK";
+        case NL_TLS3_BAD_CRL:         return "Invalid CRL";
+        case NL_TLS3_BAD_ALPN:        return "Invalid ALPN";
+        case NL_TLS3_BAD_CIPHER:      return "Invalid ciphersuite";
+        case NL_TLS3_TIMEOUT:         return "Handshake timeout";
+        case NL_TLS3_NO_SESSION:      return "No session";
+        case NL_TLS3_WANT_READ:       return "Would block: read";
+        case NL_TLS3_WANT_WRITE:      return "Would block: write";
+        case NL_TLS3_UNKNOWN_ERROR:   return "Unknown error";
+        default: break;
+    }
     switch (code) {
         case MBEDTLS_ERR_SSL_BAD_INPUT_DATA:       return "Bad input parameters";
         case MBEDTLS_ERR_SSL_ALLOC_FAILED:         return "Memory allocation failed";
@@ -284,6 +311,7 @@ int nl_tls3_configure(nl_tls3_ctx_t* ctx, const nl_tls3_config_t* cfg) {
     }
     ctx->is_server = cfg->is_server ? 1 : 0;
     ctx->use_dtls  = cfg->use_dtls ? 1 : 0;
+    ctx->handshake_timeout_ms = cfg->handshake_timeout_ms;
     // 重复配置安全
     mbedtls_x509_crt_free(&ctx->ca_chain);    mbedtls_x509_crt_init(&ctx->ca_chain);
     mbedtls_x509_crl_free(&ctx->crl_chain);   mbedtls_x509_crl_init(&ctx->crl_chain);
@@ -544,6 +572,17 @@ int nl_tls3_set_sni_callback(nl_tls3_ctx_t* ctx, nl_tls3_sni_cb cb, void* user_d
 
 int nl_tls3_handshake_ex(nl_tls3_ctx_t* ctx, int sock, int timeout_ms) {
     if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
+
+    /* 绑定 ssl 与 conf：mbedtls_ssl_handshake 要求 ssl->conf 非空，
+     * 否则返回 MBEDTLS_ERR_SSL_BAD_INPUT_DATA(-0x7100)。
+     * mbedtls_ssl_setup 只保存 conf 指针（不复制内容）。
+     * 重复握手（如客户端复用 ctx 重连）时先 free+init 释放旧缓冲；
+     * hostname / 会话注入必须在 setup 之后设置（setup 会重置 ssl 状态）。 */
+    mbedtls_ssl_free(&ctx->ssl);
+    mbedtls_ssl_init(&ctx->ssl);
+    int ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->conf);
+    if (ret != 0) return NL_TLS3_ALLOC_FAIL;
+
     if (ctx->hostname && !ctx->is_server) {
         mbedtls_ssl_set_hostname(&ctx->ssl, ctx->hostname);
     }
@@ -552,10 +591,20 @@ int nl_tls3_handshake_ex(nl_tls3_ctx_t* ctx, int sock, int timeout_ms) {
         ctx->reused = 0;
     }
     ctx->server_fd.fd = sock;
+
+    /* 绑定 I/O 回调：mbedTLS 通过 f_recv/f_send 收发记录层数据，
+     * 未设置时 fetch_input 返回 MBEDTLS_ERR_SSL_BAD_INPUT_DATA(-0x7100)。
+     * DTLS 需要带超时的 recv 回调配合重传定时器；TLS 用普通阻塞收即可
+     * （服务端已设非阻塞，返回 WANT_READ 由外层轮询）。 */
+    /* 注意：本仓捆绑的 mbedtls3 头文件中 set_bio 参数顺序为
+     * (f_send, f_recv, f_recv_timeout)，与上游文档习惯相反，勿按 upstream 填。 */
+    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->server_fd,
+                        mbedtls_net_send, mbedtls_net_recv,
+                        ctx->use_dtls ? mbedtls_net_recv_timeout : NULL);
+
     ctx->setup_done = 0;
     ctx->handshaked = 0;
 
-    int ret;
     if (ctx->is_server) {
         mbedtls_net_set_nonblock(&ctx->server_fd);
         do {
@@ -622,7 +671,10 @@ int nl_tls3_handshake_ex(nl_tls3_ctx_t* ctx, int sock, int timeout_ms) {
 int nl_tls3_handshake(nl_tls3_ctx_t* ctx, int sock) {
     if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
     if (!ctx->setup_done) return NL_TLS3_INVALID_STATE;
-    return nl_tls3_handshake_ex(ctx, sock, 0);
+    /* 使用 configure() 保存的超时；0 = 无限等待(handshake_ex 用 <0 表示)。
+     * 直接传 0 会让 select 以零超时轮询，首个 WANT_READ 即误报超时。 */
+    int timeout_ms = ctx->handshake_timeout_ms > 0 ? ctx->handshake_timeout_ms : -1;
+    return nl_tls3_handshake_ex(ctx, sock, timeout_ms);
 }
 
 int nl_tls3_send(nl_tls3_ctx_t* ctx, const void* buf, size_t len) {

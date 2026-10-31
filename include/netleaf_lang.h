@@ -292,7 +292,7 @@ NL_LANG_API int nl_lang_var_condition_eval(const char* expr);
 NL_LANG_API const char* nl_lang_var_replace_html(const char* input, char* output, size_t output_size);
 NL_LANG_API const char* nl_lang_get_error_with_vars(int lib_id, int error_code, char* buffer, size_t buffer_size);
 
-#define NL_LANG_VERSION "2.4.2"
+#define NL_LANG_VERSION "3.0.0"
 #define NL_LANG_VERSION_MAJOR 2
 #define NL_LANG_VERSION_MINOR 4
 #define NL_LANG_VERSION_PATCH 1
@@ -437,7 +437,7 @@ typedef nl_script_result_t* (*nl_script_exec_func_t)(const char* script, const c
 #define nl_lang_var_replace_html(in, out, os) ("")
 #define nl_lang_get_error_with_vars(l, c, b, bs) ("")
 
-#define NL_LANG_VERSION "2.4.2"
+#define NL_LANG_VERSION "3.0.0"
 #define NL_LANG_VERSION_MAJOR 2
 #define NL_LANG_VERSION_MINOR 4
 #define NL_LANG_VERSION_PATCH 2
@@ -452,7 +452,7 @@ typedef enum {
     NL_LANG_CAP_CONDITIONALS = 1 << 6
 } nl_lang_cap_t;
 
-#define nl_lang_version() ("2.4.2")
+#define nl_lang_version() ("3.0.0")
 #define nl_lang_is_available() (0)
 #define nl_lang_init() (0)
 #define nl_lang_shutdown() (0)

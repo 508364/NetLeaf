@@ -1,7 +1,7 @@
 /*
  * NetLeaf HTTP 短名转接层（nlh_*）
  *
- * 原长名接口（nl_http_* / nl_http2_* / nl_http3_*）已标记 deprecated，
+ * 原长名接口（nl_http_* / nl_http2_*）已标记 deprecated，
  * 直接调用仍可用但产生告警；本文件提供一一对应的短名 nlh_*，签名
  * 完全一致、无告警，为推荐用法。本文件随核心库 netleaf_core 编译导出，
  * 仅在内部转发到原长名实现，不改变 ABI。
@@ -17,7 +17,7 @@
 #include "netleaf_http.h"
 
 /* ------------------------------------------------------------
- * H1 / H2 / H3 服务端生命周期与访问器（随核心库导出，始终可用）
+ * H1 / H2 服务端生命周期与访问器（随核心库导出，始终可用）
  * 全部转发到原长名，签名一致。
  * ------------------------------------------------------------ */
 
@@ -39,9 +39,6 @@ void nlh_server_set_handler(nl_http_server_t* server, nl_http_handler handler, v
 void nlh_server_enable_http2(nl_http_server_t* server, int enable) {
     nl_http_server_enable_http2(server, enable);
 }
-void nlh_server_enable_http3(nl_http_server_t* server, int enable) {
-    nl_http_server_enable_http3(server, enable);
-}
 
 nl_http2_server_t* nlh_h2_create(int port) {
     return nl_http2_server_create(port);
@@ -57,22 +54,6 @@ void nlh_h2_stop(nl_http2_server_t* server) {
 }
 void nlh_h2_set_handler(nl_http2_server_t* server, nl_http_handler handler, void* user_data) {
     nl_http2_server_set_handler(server, handler, user_data);
-}
-
-nl_http3_server_t* nlh_h3_create(int port) {
-    return nl_http3_server_create(port);
-}
-void nlh_h3_destroy(nl_http3_server_t* server) {
-    nl_http3_server_destroy(server);
-}
-int nlh_h3_start(nl_http3_server_t* server) {
-    return nl_http3_server_start(server);
-}
-void nlh_h3_stop(nl_http3_server_t* server) {
-    nl_http3_server_stop(server);
-}
-void nlh_h3_set_handler(nl_http3_server_t* server, nl_http_handler handler, void* user_data) {
-    nl_http3_server_set_handler(server, handler, user_data);
 }
 
 nlh_http_method_t nlh_req_method(const nl_http_request_t* req) {
