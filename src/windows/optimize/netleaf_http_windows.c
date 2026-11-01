@@ -238,6 +238,9 @@ static DWORD WINAPI server_thread(LPVOID arg) {
                 HANDLE thread = CreateThread(NULL, 0, http1_client_thread, args, 0, NULL);
                 if (thread) CloseHandle(thread);
             }
+        } else {
+            // accept 失败（socket 耗尽/被中断）时短暂退避，避免 tight loop 空转 100% CPU
+            Sleep(10);
         }
     }
 
@@ -261,6 +264,9 @@ static DWORD WINAPI http2_server_thread(LPVOID arg) {
 
             HANDLE thread = CreateThread(NULL, 0, http2_client_thread, args, 0, NULL);
             if (thread) CloseHandle(thread);
+        } else {
+            // accept 失败（socket 耗尽/被中断）时短暂退避，避免 tight loop 空转 100% CPU
+            Sleep(10);
         }
     }
 

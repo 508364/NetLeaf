@@ -1,147 +1,152 @@
 @echo off
-chcp 65001 >nul 2>&1
-REM NetLeaf Multi-Architecture Build Script (MSVC)
-REM Builds for Windows x64, x86, and ARM64 using Visual Studio compiler
-REM This is a pure C project - no C++ compiler needed
+REM ============================================================
+REM NetLeaf - Windows build (MSVC / Visual Studio)
+REM This script ONLY builds Windows targets with the MSVC toolset.
+REM It does not build Linux / macOS / Android and invokes no other script.
 REM
-REM Usage: Run from Visual Studio Developer Command Prompt
-REM        or use "x64 Native Tools Command Prompt for VS 2022"
-REM        build_all-MSVC.bat [x64^|x86^|arm64^|all]
-REM   amd64 is an alias of x64. Default: all
+REM Usage: build_all-MSVC.bat [x64|x86|arm64|all]   (default: all)
+REM         amd64 is an alias of x64
+REM
+REM You do NOT need to open a Developer Command Prompt: Visual Studio is
+REM located automatically through vswhere, and CMake drives the VS generator.
+REM ============================================================
 
-set VERSION=2.4.2
-set SRC_DIR=%~dp0
-REM Remove trailing backslash
-set SRC_DIR=%SRC_DIR:~0,-1%
+setlocal enabledelayedexpansion
+set "VERSION=3.0.0"
+set "SRC_DIR=%~dp0"
+set "SRC_DIR=%SRC_DIR:~0,-1%"
 
-REM Parse architecture argument (pure cmd/if/goto, no parentheses)
+REM ---------- parse argument ----------
 set "ARCH=%~1"
 if not defined ARCH set "ARCH=all"
 if /i "%ARCH%"=="amd64" set "ARCH=x64"
-set BUILD_X64=0
-set BUILD_X86=0
-set BUILD_ARM64=0
-if /i "%ARCH%"=="all" set BUILD_X64=1
-if /i "%ARCH%"=="all" set BUILD_X86=1
-if /i "%ARCH%"=="all" set BUILD_ARM64=1
-if /i "%ARCH%"=="x64" set BUILD_X64=1
-if /i "%ARCH%"=="x86" set BUILD_X86=1
-if /i "%ARCH%"=="arm64" set BUILD_ARM64=1
-if /i "%ARCH%"=="all" goto :arch_ok
-if /i "%ARCH%"=="x64" goto :arch_ok
-if /i "%ARCH%"=="x86" goto :arch_ok
-if /i "%ARCH%"=="arm64" goto :arch_ok
-echo [ERROR] Unknown architecture: %ARCH%
-echo Usage: build_all-MSVC.bat [x64^|x86^|arm64^|all]
-echo   amd64 is an alias of x64. Default: all
-exit /b 1
 
-:arch_ok
+set "BUILD_X64=0"
+set "BUILD_X86=0"
+set "BUILD_ARM64=0"
+if /i "%ARCH%"=="all"   set "BUILD_X64=1"
+if /i "%ARCH%"=="all"   set "BUILD_X86=1"
+if /i "%ARCH%"=="all"   set "BUILD_ARM64=1"
+if /i "%ARCH%"=="x64"   set "BUILD_X64=1"
+if /i "%ARCH%"=="x86"   set "BUILD_X86=1"
+if /i "%ARCH%"=="arm64" set "BUILD_ARM64=1"
+if "%BUILD_X64%%BUILD_X86%%BUILD_ARM64%"=="000" (
+    echo [ERROR] Unknown architecture: %ARCH%
+    echo Usage: build_all-MSVC.bat [x64^|x86^|arm64^|all]
+    exit /b 1
+)
+
+REM ---------- locate Visual Studio ----------
+set "VSWHERE=%VSWHERE%"
+if not defined VSWHERE set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VS_INSTALL="
+if exist "%VSWHERE%" (
+    for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL=%%I"
+)
+
+REM Pick the matching CMake generator from the install path.
+set "VS_GEN="
+if not defined VS_INSTALL goto :vs_gen_done
+if "%VS_INSTALL%"=="" goto :vs_gen_done
+echo %VS_INSTALL% | findstr /C:"2022" >nul
+if not errorlevel 1 set "VS_GEN=Visual Studio 17 2022"
+if defined VS_GEN goto :vs_gen_done
+echo %VS_INSTALL% | findstr /C:"2019" >nul
+if not errorlevel 1 set "VS_GEN=Visual Studio 16 2019"
+if defined VS_GEN goto :vs_gen_done
+echo %VS_INSTALL% | findstr /C:"2017" >nul
+if not errorlevel 1 set "VS_GEN=Visual Studio 15 2017"
+
+:vs_gen_done
+if not defined VS_GEN if defined VSCMD_VER set "VS_GEN=NMake Makefiles"
+if not defined VS_GEN where cl.exe >nul 2>nul && set "VS_GEN=NMake Makefiles"
+if not defined VS_GEN (
+    echo [ERROR] Visual Studio ^(MSVC toolset^) not found.
+    echo         Install "Visual Studio Build Tools" with the C++ workload, or run this
+    echo         Windows build with the LLVM-MinGW script instead:
+    echo             build_all-Clang.bat
+    exit /b 1
+)
+
 echo ========================================
-echo   NetLeaf v%VERSION% Build Script (MSVC - Pure C)
+echo   NetLeaf v%VERSION% - Windows (MSVC)
 echo ========================================
-echo.
-echo Usage: Run from Visual Studio Developer Command Prompt
-echo Source directory: %SRC_DIR%
-echo Output: releases/ directory
-echo Target architecture: %ARCH%
-echo.
-
-REM Check if VS environment is available
-where cl >nul 2>nul
-if %errorlevel% equ 0 goto :cl_ok
-echo [ERROR] Visual Studio compiler (cl.exe) not found
-echo.
-echo Please run this script from Visual Studio Developer Command Prompt
-echo or use "x64 Native Tools Command Prompt for VS 2022"
-echo.
-exit /b 1
-
-:cl_ok
-
-REM Create output directories
-if not exist "build_x64" mkdir build_x64
-if not exist "build_x86" mkdir build_x86
-if not exist "build_arm64" mkdir build_arm64
-if not exist "releases" mkdir releases
-
-REM Common CMake options (Pure C project)
-set COMMON_OPTS=-DBUILD_EXAMPLES=ON -DBUILD_TESTS=ON -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON
-
-REM ---------------------------------------------------------------------------
-if "%BUILD_X64%"=="0" goto :skip_x64
-REM 1. Build for x64
-echo [1/3] Building for Windows x64...
-if exist "build_x64" rmdir /s /q "build_x64"
-mkdir "build_x64"
-cmake -G "Visual Studio 17 2022" -A x64 %COMMON_OPTS% "%SRC_DIR%"
-if %errorlevel% neq 0 ( echo CMake failed for x64! & exit /b 1 )
-cd build_x64
-cmake --build . --config Release
-if %errorlevel% neq 0 ( echo Build failed for x64! & exit /b 1 )
-cd ..
-echo x64 build completed!
-
-REM Package x64
-echo Creating x64 package...
-powershell.exe -Command "Compress-Archive -Path 'build_x64\bin\Release\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
-echo x64 package created!
+echo Source   : %SRC_DIR%
+echo VS       : %VS_INSTALL%
+echo Generator: %VS_GEN%
+echo Target   : %ARCH%
+echo Output   : releases\
 echo.
 
-:skip_x64
-REM ---------------------------------------------------------------------------
-if "%BUILD_X86%"=="0" goto :skip_x86
-REM 2. Build for x86 (Win32)
-echo [2/3] Building for Windows x86...
-if exist "build_x86" rmdir /s /q "build_x86"
-mkdir "build_x86"
-cmake -G "Visual Studio 17 2022" -A Win32 %COMMON_OPTS% "%SRC_DIR%"
-if %errorlevel% neq 0 ( echo CMake failed for x86! & exit /b 1 )
-cd build_x86
-cmake --build . --config Release
-if %errorlevel% neq 0 ( echo Build failed for x86! & exit /b 1 )
-cd ..
-echo x86 build completed!
+if not exist "%SRC_DIR%\releases" mkdir "%SRC_DIR%\releases"
 
-REM Package x86
-echo Creating x86 package...
-powershell.exe -Command "Compress-Archive -Path 'build_x86\bin\Release\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
-echo x86 package created!
-echo.
+REM BUILD_TLS(tls2) conflicts with BUILD_TLS3 inside one build tree; pick TLS3.
+set "NL_OPTS=-DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON -DBUILD_TLS=OFF -DBUILD_TLS3=ON -DBUILD_LANG=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON"
 
-:skip_x86
-REM ---------------------------------------------------------------------------
-if "%BUILD_ARM64%"=="0" goto :skip_arm64
-REM 3. Build for ARM64
-echo [3/3] Building for Windows ARM64...
-if exist "build_arm64" rmdir /s /q "build_arm64"
-mkdir "build_arm64"
-cmake -G "Visual Studio 17 2022" -A ARM64 %COMMON_OPTS% "%SRC_DIR%"
-if %errorlevel% neq 0 ( echo CMake failed for ARM64! & exit /b 1 )
-cd build_arm64
-cmake --build . --config Release
-if %errorlevel% neq 0 ( echo Build failed for ARM64! & exit /b 1 )
-cd ..
-echo ARM64 build completed!
+if "%BUILD_X64%"=="1"   call :build_arch x64   x64   && call :package x64
+if "%BUILD_X86%"=="1"   call :build_arch x86   Win32 && call :package x86
+if "%BUILD_ARM64%"=="1" call :build_arch arm64 ARM64 && call :package arm64
 
-REM Package ARM64
-echo Creating ARM64 package...
-powershell.exe -Command "Compress-Archive -Path 'build_arm64\bin\Release\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
-echo ARM64 package created!
-echo.
-
-:skip_arm64
-REM ---------------------------------------------------------------------------
 echo ========================================
-echo   All MSVC builds completed successfully!
+echo   Windows (MSVC) builds completed
 echo ========================================
-echo.
-echo Packages location: releases\
-if "%BUILD_X64%"=="1" echo   - NetLeaf-%VERSION%-windows-x64.zip
-if "%BUILD_X86%"=="1" echo   - NetLeaf-%VERSION%-windows-x86.zip
-if "%BUILD_ARM64%"=="1" echo   - NetLeaf-%VERSION%-windows-arm64.zip
-echo.
-echo Note: For cross-compilation without MSVC, use build_all-Clang.bat
-echo.
-
+echo Packages in: %SRC_DIR%\releases\
 endlocal
+exit /b 0
+
+REM ============================================================
+REM :build_arch  <pack_arch>  <cmake_platform>
+REM ============================================================
+:build_arch
+set "PACK_ARCH=%~1"
+set "CM_PLATFORM=%~2"
+set "BDIR=%SRC_DIR%\build_msvc_%PACK_ARCH%"
+echo.
+echo ----------------------------------------
+echo [Build] Windows %PACK_ARCH% ^(MSVC, -A %CM_PLATFORM%^)
+echo ----------------------------------------
+if exist "%BDIR%" rmdir /s /q "%BDIR%"
+mkdir "%BDIR%"
+pushd "%BDIR%"
+set "GEN_ARGS="
+if /i not "%VS_GEN%"=="NMake Makefiles" set "GEN_ARGS=-A %CM_PLATFORM%"
+cmake -G "%VS_GEN%" %GEN_ARGS% %NL_OPTS% "%SRC_DIR%"
+if errorlevel 1 (
+    echo [ERROR] CMake configure failed for %PACK_ARCH%
+    popd
+    exit /b 1
+)
+if /i "%VS_GEN%"=="NMake Makefiles" (
+    cmake --build . --config Release
+) else (
+    cmake --build . --config Release --parallel %NUMBER_OF_PROCESSORS%
+)
+if errorlevel 1 (
+    echo [ERROR] Build failed for %PACK_ARCH%
+    popd
+    exit /b 1
+)
+popd
+echo [OK] Windows %PACK_ARCH% built
+exit /b 0
+
+REM ============================================================
+REM :package  <pack_arch>
+REM ============================================================
+:package
+set "PACK_ARCH=%~1"
+set "BDIR=%SRC_DIR%\build_msvc_%PACK_ARCH%"
+set "PKG=%BDIR%\pkg_out"
+echo [Pack] %PACK_ARCH% ...
+if exist "%PKG%" rmdir /s /q "%PKG%"
+mkdir "%PKG%"
+copy /Y "%BDIR%\bin\Release\*.dll" "%PKG%\" >nul 2>nul
+copy /Y "%BDIR%\bin\*.dll" "%PKG%\" >nul 2>nul
+copy /Y "%BDIR%\lib\Release\*.lib" "%PKG%\" >nul 2>nul
+copy /Y "%BDIR%\lib\*.lib" "%PKG%\" >nul 2>nul
+copy /Y "%SRC_DIR%\include\*.h" "%PKG%\" >nul 2>nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%PKG%\*' -DestinationPath '%SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-msvc.zip' -Force"
+rmdir /s /q "%PKG%"
+echo [OK] %SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-msvc.zip
+exit /b 0

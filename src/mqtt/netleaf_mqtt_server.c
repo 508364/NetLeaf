@@ -220,6 +220,8 @@ typedef struct nl_mqtt_server_client {
     char*                     recv_buf;   // TCP 粘包/半包重组缓冲区
     size_t                    recv_len;
     size_t                    recv_cap;
+    char*                     out_scratch;     // 发包编码复用缓冲(消除每包 malloc/free)
+    size_t                    out_scratch_cap;
     uint16_t                  next_packet_id;   // 出站报文标识符分配器
     nl_mqtt_server_session_t* session;          // 关联会话(订阅/未确认消息/入站 QoS2)
     struct nl_mqtt_server_client* next;
@@ -290,6 +292,10 @@ typedef struct nl_mqtt_server {
     char**   deleted_retained_topics;         // 待落盘的“已清除保留消息”主题
     size_t   deleted_retained_count;
     size_t   deleted_retained_cap;
+    // poll() 工作区缓存：随并发数增长复用(POSIX，实为 struct pollfd*)，
+    // 消除事件循环每轮 poll 前的 malloc/free
+    void*         pollfds;
+    size_t        pollfds_cap;
     nl_mqtt_server_stats_t    stats;
 } nl_mqtt_server_t;
 
@@ -1571,6 +1577,16 @@ static int nl_mqtt_server_send_suback(nl_mqtt_server_client_t* client,
     return nl_mqtt_server_send_all(client, buf, pos);
 }
 
+// 取得容量至少为 need 的客户端编码缓冲(复用而非每包 malloc/free)
+static char* nl_mqtt_server_scratch(nl_mqtt_server_client_t* client, size_t need) {
+    if (client->out_scratch_cap >= need) return client->out_scratch;
+    char* nb = (char*)realloc(client->out_scratch, need);
+    if (!nb) return NULL;
+    client->out_scratch = nb;
+    client->out_scratch_cap = need;
+    return nb;
+}
+
 // 发送 UNSUBACK：
 //   MQTT 3.1.1 —— 仅含报文标识符
 //   MQTT 5.0   —— 追加 1 字节属性长度(0x00) + 每个过滤器 1 字节原因码(0x00 成功)
@@ -1581,10 +1597,10 @@ static int nl_mqtt_server_send_unsuback(nl_mqtt_server_client_t* client,
     size_t remaining = 2 + (with_props ? (size_t)1 + (size_t)count : 0);
 
     size_t cap = 5 + remaining;
-    char* buf = (char*)malloc(cap);
+    char* buf = nl_mqtt_server_scratch(client, cap);
     if (!buf) return -1;
     int hdr = nl_mqtt_server_write_fixed_header(buf, cap, 0xB0, remaining);
-    if (hdr < 0) { free(buf); return -1; }
+    if (hdr < 0) return -1;
     size_t pos = (size_t)hdr;
 
     buf[pos++] = (char)((packet_id >> 8) & 0xFF);
@@ -1594,9 +1610,7 @@ static int nl_mqtt_server_send_unsuback(nl_mqtt_server_client_t* client,
         for (int i = 0; i < count; i++) buf[pos++] = 0x00;    // 原因码：成功
     }
 
-    int rc = nl_mqtt_server_send_all(client, buf, pos);
-    free(buf);
-    return rc;
+    return nl_mqtt_server_send_all(client, buf, pos);
 }
 
 // 发送 QoS 确认类报文(PUBACK 0x40 / PUBREC 0x50 / PUBREL 0x62 / PUBCOMP 0x70)：
@@ -1676,13 +1690,13 @@ static int nl_mqtt_server_send_publish(nl_mqtt_server_client_t* client,
                      + (with_props ? (size_t)pvlen + pblen : 0) + payload_len;
 
     size_t cap = 5 + remaining;
-    char* buf = (char*)malloc(cap);
+    char* buf = nl_mqtt_server_scratch(client, cap);
     if (!buf) return -1;
 
     uint8_t first = (uint8_t)(0x30 | (dup ? 0x08 : 0x00) |
                               ((qos & 0x03) << 1) | (retain ? 0x01 : 0x00));
     int hdr = nl_mqtt_server_write_fixed_header(buf, cap, first, remaining);
-    if (hdr < 0) { free(buf); return -1; }
+    if (hdr < 0) return -1;
     size_t pos = (size_t)hdr;
 
     buf[pos++] = (char)((topic_len >> 8) & 0xFF);
@@ -1708,7 +1722,7 @@ static int nl_mqtt_server_send_publish(nl_mqtt_server_client_t* client,
         if (sub_id > 0) {
             buf[pos++] = 0x0B;
             int n = nl_mqtt_server_encode_varint(buf + pos, cap - pos, sub_id);
-            if (n < 0) { free(buf); return -1; }
+            if (n < 0) return -1;
             pos += (size_t)n;
         }
         pos += nl_mqtt_server_props_write(buf + pos, cap - pos, fwd_props);
@@ -1721,13 +1735,10 @@ static int nl_mqtt_server_send_publish(nl_mqtt_server_client_t* client,
 
     // 遵守对端声明的 Maximum Packet Size：超出则不发送该报文
     if (client->max_packet_size > 0 && pos > client->max_packet_size) {
-        free(buf);
         return -1;
     }
 
-    int rc = nl_mqtt_server_send_all(client, buf, pos);
-    free(buf);
-    return rc;
+    return nl_mqtt_server_send_all(client, buf, pos);
 }
 
 // 分配下一个非零报文标识符(0 为非法值，回绕时跳过)
@@ -2955,6 +2966,7 @@ static void nl_mqtt_server_disconnect_client_internal(nl_mqtt_server_t* srv,
     }
 
     free(client->recv_buf);
+    free(client->out_scratch);
     free(client);
 }
 
@@ -3194,6 +3206,7 @@ void nl_mqtt_server_destroy(nl_mqtt_server_t* server) {
         closesocket_close(client->sock);
 #endif
         free(client->recv_buf);
+        free(client->out_scratch);
         free(client);
         client = next;
     }
@@ -3248,6 +3261,7 @@ void nl_mqtt_server_destroy(nl_mqtt_server_t* server) {
     free(server->tls_key_file);
     free(server->server_reference);
     free(server->session_store_path);
+    free(server->pollfds);
     free(server);
 }
 
@@ -4423,8 +4437,15 @@ int nl_mqtt_server_poll(nl_mqtt_server_t* server, int timeout_ms) {
 #else
     size_t cap = 1;
     for (nl_mqtt_server_client_t* c = server->clients; c; c = c->next) cap++;
-    struct pollfd* pfds = (struct pollfd*)malloc(cap * sizeof(struct pollfd));
-    if (!pfds) { result = -1; goto done; }
+    if (cap > server->pollfds_cap) {
+        // 仅增长不收缩：复用工作区，避免每轮 poll 的 malloc/free
+        struct pollfd* np = (struct pollfd*)realloc(server->pollfds,
+                                                    cap * sizeof(struct pollfd));
+        if (!np) { result = -1; goto done; }
+        server->pollfds = np;
+        server->pollfds_cap = cap;
+    }
+    struct pollfd* pfds = (struct pollfd*)server->pollfds;
     size_t nf = 0;
     if (server->listen_sock >= 0) {
         pfds[nf].fd = server->listen_sock; pfds[nf].events = POLLIN; pfds[nf].revents = 0; nf++;
@@ -4433,7 +4454,7 @@ int nl_mqtt_server_poll(nl_mqtt_server_t* server, int timeout_ms) {
         if (c->sock >= 0) { pfds[nf].fd = c->sock; pfds[nf].events = POLLIN; pfds[nf].revents = 0; nf++; }
     }
     int nready = poll(pfds, (nfds_t)nf, timeout_ms);
-    if (nready < 0) { free(pfds); result = -2; goto done; }
+    if (nready < 0) { result = -2; goto done; }
 #define NL_READY(fd) nl_poll_ready(pfds, nf, (fd))
 #endif
 
@@ -4500,9 +4521,6 @@ int nl_mqtt_server_poll(nl_mqtt_server_t* server, int timeout_ms) {
         nl_mqtt_server_save_sessions(server);
     }
 
-#if !defined(_WIN32)
-    free(pfds);
-#endif
     result = events;
 
 done:

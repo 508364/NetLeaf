@@ -794,6 +794,18 @@ static int nl_mqtt_build_connect_packet(nl_mqtt_client_t* c,
                                          const nl_mqtt_connect_opts_t* opts) {
     size_t pos = 0;
     size_t cap = 512;
+    // 按输入字段预估初始容量：典型 CONNECT(含长 client_id/凭据/遗嘱)一次分配，
+    // 免去下方逐字段的反复 realloc；极端超长属性仍走原有 realloc 兜底
+    if (opts) {
+        if (opts->client_id) cap += strlen(opts->client_id) + 2;
+        if (opts->username)  cap += strlen(opts->username) + 2;
+        if (opts->password)  cap += strlen(opts->password) + 2;
+        if (opts->will_enabled) {
+            if (opts->will_topic) cap += strlen(opts->will_topic) + 2;
+            cap += (opts->will_msg_len ? opts->will_msg_len
+                    : (opts->will_msg ? strlen(opts->will_msg) : 0)) + 2;
+        }
+    }
     char* pkt = (char*)malloc(cap);
     if (!pkt) return -1;
 

@@ -38,6 +38,10 @@ option(BUILD_TLS "Build TLS2 extension (mbedTLS 2.28, TLS 1.0-1.3)" OFF)
 option(BUILD_TLS3 "Build TLS3 extension (mbedTLS 3.x, TLS 1.2/1.3)" ON)
 option(BUILD_QUIC "Build QUIC extension (H3 legacy pure logic + self-implemented RFC 9001, requires BUILD_TLS3)" OFF)
 option(BUILD_LANG "Build lang extension (official soft dependency)" ON)
+# Windows 旧版阻塞式 worker 线程池（已废弃）：默认不编译。
+# 默认构建的 Web 服务统一走 IOCP 引擎（本地 + 代理路由）；
+# 仅在需要回退/对比测试时显式开启。
+option(NETLEAF_LEGACY_WORKER_POOL "Build legacy blocking worker pool (Windows, deprecated)" OFF)
 
 # ============================================================
 # BUG-303：Link-Time Optimization (LTO)
@@ -128,6 +132,10 @@ if(WIN32)
         src/windows/netleaf_lazy_windows.c
         src/windows/netleaf_sysinfo_windows.c
     )
+    if(NETLEAF_LEGACY_WORKER_POOL)
+        list(APPEND NETLEAF_PLATFORM_SOURCES src/windows/netleaf_worker_pool_windows.c)
+        add_compile_definitions(NETLEAF_LEGACY_WORKER_POOL)
+    endif()
     set(NL_OPTIMIZE_HTTP_SOURCES
         src/http/netleaf_http_common.c
         src/http/netleaf_http_shortnames.c

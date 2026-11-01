@@ -279,11 +279,21 @@ static void parse_http_request(const char* data, size_t len,
     if (!header_end) header_end = data + len;
 
     // Parse first line: METHOD PATH VERSION
+    // 只复制首行而非整个头部，且优先用栈缓冲：消除每请求一次 malloc + 全头部 memcpy
     size_t header_len = (size_t)(header_end - data);
-    char* line = (char*)malloc(header_len + 1);
-    if (!line) return;
-    memcpy(line, data, header_len);
-    line[header_len] = '\0';
+    size_t line_len = 0;
+    while (line_len < header_len && data[line_len] != '\n') line_len++;
+    if (line_len > 0 && data[line_len - 1] == '\r') line_len--;
+    char stack_line[256];
+    char* line;
+    if (line_len < sizeof(stack_line)) {
+        line = stack_line;
+    } else {
+        line = (char*)malloc(line_len + 1);
+        if (!line) return;
+    }
+    memcpy(line, data, line_len);
+    line[line_len] = '\0';
 
     char* space1 = strchr(line, ' ');
     char* space2 = space1 ? strchr(space1 + 1, ' ') : NULL;
@@ -318,7 +328,7 @@ static void parse_http_request(const char* data, size_t len,
         *body = NULL;
     }
 
-    free(line);
+    if (line != stack_line) free(line);
 }
 
 static void* listener_thread(void* arg) {

@@ -1,267 +1,173 @@
 @echo off
-chcp 65001 >nul 2>&1
-REM NetLeaf Android Cross-Compile Script (Windows, NDK based)
-REM Pure C core + extensions compiled with NDK clang for arm64-v8a / armeabi-v7a / x86_64
+REM ============================================================
+REM NetLeaf - Android cross-compile build (Windows host, NDK clang)
+REM This script ONLY builds Android targets. It does not build
+REM Windows / Linux / macOS and never invokes another script.
 REM
-REM Usage: build_android.bat [aarch64^|armeabi-v7a^|x86_64^|all]
-REM   aarch64 maps to arm64-v8a (recommended for 64-bit ARM), x86_64 for emulators.
-REM   Default: all
+REM Usage: build_android.bat [arm64-v8a|armeabi-v7a|x86_64|all]  (default: all)
+REM        aarch64 is an alias of arm64-v8a
 REM
-REM Requires: Android NDK on PATH or in default locations.
+REM NDK lookup order:
+REM   ANDROID_NDK / ANDROID_NDK_HOME / ANDROID_NDK_ROOT / NDK_HOME / NDK_ROOT
+REM   <ANDROID_HOME>/ndk  <ANDROID_SDK_ROOT>/ndk  common install dirs
+REM   (if the directory contains versioned sub-dirs, the highest version wins)
+REM
+REM Output: build-android\<abi>\stage-lib\  (libnetleaf*.so + public headers)
+REM ============================================================
 
 setlocal enabledelayedexpansion
-set VERSION=2.4.2
-set SRC_DIR=%~dp0
-set SRC_DIR=%SRC_DIR:~0,-1%
+set "VERSION=3.0.0"
+set "MIN_SDK=21"
+set "SRC_DIR=%~dp0"
+set "SRC_DIR=%SRC_DIR:~0,-1%"
 
-REM ---------------------------------------------------------------------------
-REM 1. Parse architecture argument
-REM ---------------------------------------------------------------------------
+REM ---------- parse argument ----------
 set "ARCH=%~1"
 if not defined ARCH set "ARCH=all"
-set "BUILD_A64=0"
-set "BUILD_V7A=0"
-set "BUILD_X64=0"
-if /i "%ARCH%"=="all" (
-    set "BUILD_A64=1"
-    set "BUILD_V7A=1"
-    set "BUILD_X64=1"
-)
-if /i "%ARCH%"=="aarch64" set "BUILD_A64=1"
-if /i "%ARCH%"=="armeabi-v7a" set "BUILD_V7A=1"
-if /i "%ARCH%"=="x86_64" set "BUILD_X64=1"
-if "%BUILD_A64%"=="0" if "%BUILD_V7A%"=="0" if "%BUILD_X64%"=="0" (
-    echo [ERROR] Unknown architecture: %ARCH%
-    echo Usage: build_android.bat [aarch64^|armeabi-v7a^|x86_64^|all]
+if /i "%ARCH%"=="aarch64" set "ARCH=arm64-v8a"
+
+set "B_A64=0"
+set "B_V7A=0"
+set "B_X64=0"
+if /i "%ARCH%"=="all"        set "B_A64=1"
+if /i "%ARCH%"=="all"        set "B_V7A=1"
+if /i "%ARCH%"=="all"        set "B_X64=1"
+if /i "%ARCH%"=="arm64-v8a"  set "B_A64=1"
+if /i "%ARCH%"=="armeabi-v7a" set "B_V7A=1"
+if /i "%ARCH%"=="x86_64"     set "B_X64=1"
+if "%B_A64%%B_V7A%%B_X64%"=="000" (
+    echo [ERROR] Unknown ABI: %ARCH%
+    echo Usage: build_android.bat [arm64-v8a^|armeabi-v7a^|x86_64^|all]
     exit /b 1
 )
 
-REM ---------------------------------------------------------------------------
-REM 2. Detect Android NDK
-REM ---------------------------------------------------------------------------
+REM ---------- locate NDK ----------
 set "NDK_ROOT="
-if defined ANDROID_NDK_HOME set "NDK_ROOT=%ANDROID_NDK_HOME%"
-if defined ANDROID_NDK_ROOT set "NDK_ROOT=%ANDROID_NDK_ROOT%"
-if not defined NDK_ROOT if exist "C:\Android\Sdk\ndk" set "NDK_ROOT=C:\Android\Sdk\ndk"
-if not defined NDK_ROOT if exist "E:\AndroidSdk\ndk" set "NDK_ROOT=E:\AndroidSdk\ndk"
-
-REM If NDK_ROOT is a parent containing versioned sub-directories, pick highest
-REM (lexicographic order over versioned dir names: 27.x > 26.x > 25.x).
-if defined NDK_ROOT (
-    if not exist "!NDK_ROOT!\meta.json" (
-        echo Locating NDK under !NDK_ROOT! ...
-        for /d %%V in ("!NDK_ROOT!\*") do (
-            if exist "%%~V\meta.json" (
-                if not defined BEST_NDK (
-                    set "BEST_NDK=%%~V"
-                ) else (
-                    REM Compare: 27.* beats 25.*; simple first-arg test is unreliable
-                    REM so we let the user set ANDROID_NDK_HOME to an exact dir if
-                    REM multiple versions coexist. Otherwise, take the last match.
-                    set "BEST_NDK=%%~V"
-                )
-            )
-        )
-        if defined BEST_NDK set "NDK_ROOT=!BEST_NDK!"
+for %%V in (ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_ROOT NDK_HOME NDK_ROOT) do (
+    if not defined NDK_ROOT if defined %%V (
+        if exist "!%%V!" set "NDK_ROOT=!%%V!"
     )
 )
-
+if not defined NDK_ROOT if defined ANDROID_HOME if exist "%ANDROID_HOME%\ndk" set "NDK_ROOT=%ANDROID_HOME%\ndk"
+if not defined NDK_ROOT if defined ANDROID_SDK_ROOT if exist "%ANDROID_SDK_ROOT%\ndk" set "NDK_ROOT=%ANDROID_SDK_ROOT%\ndk"
+REM environment-derived default locations only (no hardcoded drive letters)
+for %%D in (
+    "%LOCALAPPDATA%\Android\Sdk\ndk"
+    "%USERPROFILE%\AppData\Local\Android\Sdk\ndk"
+    "%ProgramFiles%\Android\Sdk\ndk"
+) do (
+    if not defined NDK_ROOT if exist "%%~D" set "NDK_ROOT=%%~D"
+)
 if not defined NDK_ROOT (
     echo [ERROR] Android NDK not found.
-    echo         Install via:  sdkmanager "ndk;27.2.12479018"
-    echo         Or set:       ANDROID_NDK_HOME=C:\path\to\ndk
-    echo         Default search paths tried:
-    echo           C:\Android\Sdk\ndk
-    echo           E:\AndroidSdk\ndk
+    echo         Set ANDROID_NDK_HOME to the NDK directory, for example:
+    echo           set ANDROID_NDK_HOME=^<path\to\ndk^>
     exit /b 1
 )
-if not exist "!NDK_ROOT!\meta.json" (
-    echo [ERROR] !NDK_ROOT! does not look like a valid NDK (missing meta.json).
-    exit /b 1
-)
-echo Using NDK: !NDK_ROOT!
 
-REM Toolchain file ships with NDK 25+
+REM If it is a parent folder with versioned sub-dirs, pick the highest version
+REM (versioned NDK dir names sort lexicographically, so the last match wins).
+if not exist "!NDK_ROOT!\source.properties" (
+    set "PICKED="
+    for /d %%V in ("!NDK_ROOT!\*") do (
+        if exist "%%~V\source.properties" set "PICKED=%%~V"
+    )
+    if defined PICKED set "NDK_ROOT=!PICKED!"
+)
+if not exist "!NDK_ROOT!\source.properties" (
+    echo [ERROR] !NDK_ROOT! is not a valid NDK ^(missing source.properties^).
+    exit /b 1
+)
 set "TOOLCHAIN=!NDK_ROOT!\build\cmake\android.toolchain.cmake"
 if not exist "!TOOLCHAIN!" (
-    echo [ERROR] android.toolchain.cmake not found at !TOOLCHAIN!
-    echo         Update NDK to r25 or later.
+    echo [ERROR] android.toolchain.cmake missing at !TOOLCHAIN! ^(NDK r21+ required^).
     exit /b 1
 )
 
-REM ---------------------------------------------------------------------------
-REM 3. Detect build tool (ninja / nmake / make)
-REM ---------------------------------------------------------------------------
+REM ---------- locate a make program / generator ----------
 set "GEN="
-set "BUILD_CMD="
-where ninja >nul 2>nul (
-    if !errorlevel! equ 0 (
-        set "GEN=Ninja"
-        set "BUILD_CMD=ninja"
-    )
-)
+set "MAKE_PROG="
+if defined LLVM_MINGW if exist "%LLVM_MINGW%\mingw32-make.exe" set "MAKE_PROG=%LLVM_MINGW%\mingw32-make.exe"
+if not defined MAKE_PROG if defined CMAKE_MAKE_PROGRAM if exist "%CMAKE_MAKE_PROGRAM%" set "MAKE_PROG=%CMAKE_MAKE_PROGRAM%"
+if not defined MAKE_PROG for /f "delims=" %%I in ('where mingw32-make.exe 2^>nul') do if not defined MAKE_PROG set "MAKE_PROG=%%I"
+if not defined MAKE_PROG for /f "delims=" %%I in ('where make.exe 2^>nul') do if not defined MAKE_PROG set "MAKE_PROG=%%I"
+for /f "delims=" %%I in ('where ninja.exe 2^>nul') do if not defined GEN set "GEN=Ninja"
+if not defined GEN if defined MAKE_PROG set "GEN=MinGW Makefiles"
 if not defined GEN (
-    where nmake >nul 2>nul (
-        if !errorlevel! equ 0 (
-            set "GEN=NMake Makefiles"
-            set "BUILD_CMD=nmake"
-        )
-    )
-)
-if not defined GEN (
-    where make >nul 2>nul (
-        if !errorlevel! equ 0 (
-            set "GEN=Unix Makefiles"
-            set "BUILD_CMD=make"
-        )
-    )
-)
-if not defined GEN (
-    echo [ERROR] None of ninja / nmake / make found in PATH.
+    echo [ERROR] No build tool found ^(ninja / mingw32-make / make^).
+    echo         Install ninja, or add LLVM-MinGW bin ^(ships mingw32-make^) to PATH.
     exit /b 1
 )
-echo Using generator: !GEN!
-
-REM ---------------------------------------------------------------------------
-REM 4. Common CMake flags for Android
-REM ---------------------------------------------------------------------------
-set "COMMON_OPTS=-DCMAKE_BUILD_TYPE=Release -DANDROID_PLATFORM=android-21 -DANDROID_STL=c++_shared -DANDROID_ARM_NEON=ON"
-set "COMMON_OPTS=!COMMON_OPTS! -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF"
-set "COMMON_OPTS=!COMMON_OPTS! -DBUILD_TLS=OFF -DBUILD_TLS3=ON -DBUILD_MQTT=OFF -DBUILD_MQTT_SERVER=OFF"
-set "COMMON_OPTS=!COMMON_OPTS! -DBUILD_LANG=ON -DBUILD_LINKAGG=ON -DBUILD_VUE=OFF -DBUILD_AUTOCOMPLETE=ON"
-set "COMMON_OPTS=!COMMON_OPTS! -DBUILD_AUTOROUTE=OFF -DBUILD_ERRORPAGE=ON -DBUILD_IPC=ON -DBUILD_HTTPS=OFF"
 
 echo ========================================
-echo   NetLeaf v!VERSION! Android Build (NDK)
+echo   NetLeaf v%VERSION% - Android build
 echo ========================================
-echo Source: %SRC_DIR%
-echo NDK:    !NDK_ROOT!
-echo ABI:    %ARCH%
+echo Source   : %SRC_DIR%
+echo NDK      : %NDK_ROOT%
+echo Generator: %GEN%
+echo Make     : %MAKE_PROG%
+echo ABI      : %ARCH%
+echo Output   : build-android\^<abi^>\stage-lib\
 echo.
 
-REM ---------------------------------------------------------------------------
-REM 5. Build arm64-v8a (aarch64)
-REM ---------------------------------------------------------------------------
-if "%BUILD_A64%"=="0" goto :skip_a64
+set "NL_OPTS=-DCMAKE_BUILD_TYPE=Release -DANDROID_PLATFORM=android-%MIN_SDK% -DANDROID_ARM_NEON=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TLS=OFF -DBUILD_TLS3=ON -DBUILD_MQTT=OFF -DBUILD_MQTT_SERVER=OFF -DBUILD_LANG=ON"
+
+set "FAILED="
+if "%B_A64%"=="1" call :build_abi arm64-v8a
+if "%B_V7A%"=="1" call :build_abi armeabi-v7a
+if "%B_X64%"=="1" call :build_abi x86_64
+
 echo ========================================
-echo [arm64-v8a] Cross-compiling...
+echo   Android build finished
 echo ========================================
-set "BUILD_DIR=%SRC_DIR%\build-android\arm64-v8a"
-if exist "!BUILD_DIR!" rmdir /s /q "!BUILD_DIR!"
-mkdir "!BUILD_DIR!"
-pushd "!BUILD_DIR!"
-cmake -G "!GEN!" -S "%SRC_DIR%" -B . -DCMAKE_TOOLCHAIN_FILE="!TOOLCHAIN!" -DANDROID_ABI=arm64-v8a !COMMON_OPTS!
-if !errorlevel! neq 0 (
-    echo [ERROR] CMake configure failed for arm64-v8a!
-    popd
+if defined FAILED (
+    echo [FAILED ABIs] %FAILED%
+    endlocal
     exit /b 1
 )
-if /i "!BUILD_CMD!"=="ninja" (ninja netleaf_core) else if /i "!BUILD_CMD!"=="nmake" (nmake netleaf_core) else (make netleaf_core)
-if !errorlevel! neq 0 (
-    echo [ERROR] Build failed for arm64-v8a!
-    popd
-    exit /b 1
-)
-popd
-echo arm64-v8a build completed!
-
-set "STAGE=%SRC_DIR%\build-android\arm64-v8a\stage-lib"
-if not exist "!STAGE!" mkdir "!STAGE!"
-copy /Y "!BUILD_DIR!\lib\libnetleaf*.so" "!STAGE!\" >nul
-copy /Y "%SRC_DIR%\include\*.h" "!STAGE!\" >nul
-copy /Y "%SRC_DIR%\CMakeLists.txt" "!STAGE!\" >nul
-echo Staged: !STAGE!
-echo.
-
-:skip_a64
-
-REM ---------------------------------------------------------------------------
-REM 6. Build armeabi-v7a
-REM ---------------------------------------------------------------------------
-if "%BUILD_V7A%"=="0" goto :skip_v7a
-echo ========================================
-echo [armeabi-v7a] Cross-compiling...
-echo ========================================
-set "BUILD_DIR=%SRC_DIR%\build-android\armeabi-v7a"
-if exist "!BUILD_DIR!" rmdir /s /q "!BUILD_DIR!"
-mkdir "!BUILD_DIR!"
-pushd "!BUILD_DIR!"
-cmake -G "!GEN!" -S "%SRC_DIR%" -B . -DCMAKE_TOOLCHAIN_FILE="!TOOLCHAIN!" -DANDROID_ABI=armeabi-v7a !COMMON_OPTS!
-if !errorlevel! neq 0 (
-    echo [ERROR] CMake configure failed for armeabi-v7a!
-    popd
-    exit /b 1
-)
-if /i "!BUILD_CMD!"=="ninja" (ninja netleaf_core) else if /i "!BUILD_CMD!"=="nmake" (nmake netleaf_core) else (make netleaf_core)
-if !errorlevel! neq 0 (
-    echo [ERROR] Build failed for armeabi-v7a!
-    popd
-    exit /b 1
-)
-popd
-echo armeabi-v7a build completed!
-
-set "STAGE=%SRC_DIR%\build-android\armeabi-v7a\stage-lib"
-if not exist "!STAGE!" mkdir "!STAGE!"
-copy /Y "!BUILD_DIR!\lib\libnetleaf*.so" "!STAGE!\" >nul
-copy /Y "%SRC_DIR%\include\*.h" "!STAGE!\" >nul
-copy /Y "%SRC_DIR%\CMakeLists.txt" "!STAGE!\" >nul
-echo Staged: !STAGE!
-echo.
-
-:skip_v7a
-
-REM ---------------------------------------------------------------------------
-REM 7. Build x86_64 (emulator)
-REM ---------------------------------------------------------------------------
-if "%BUILD_X64%"=="0" goto :skip_x64
-echo ========================================
-echo [x86_64] Cross-compiling...
-echo ========================================
-set "BUILD_DIR=%SRC_DIR%\build-android\x86_64"
-if exist "!BUILD_DIR!" rmdir /s /q "!BUILD_DIR!"
-mkdir "!BUILD_DIR!"
-pushd "!BUILD_DIR!"
-cmake -G "!GEN!" -S "%SRC_DIR%" -B . -DCMAKE_TOOLCHAIN_FILE="!TOOLCHAIN!" -DANDROID_ABI=x86_64 !COMMON_OPTS!
-if !errorlevel! neq 0 (
-    echo [ERROR] CMake configure failed for x86_64!
-    popd
-    exit /b 1
-)
-if /i "!BUILD_CMD!"=="ninja" (ninja netleaf_core) else if /i "!BUILD_CMD!"=="nmake" (nmake netleaf_core) else (make netleaf_core)
-if !errorlevel! neq 0 (
-    echo [ERROR] Build failed for x86_64!
-    popd
-    exit /b 1
-)
-popd
-echo x86_64 build completed!
-
-set "STAGE=%SRC_DIR%\build-android\x86_64\stage-lib"
-if not exist "!STAGE!" mkdir "!STAGE!"
-copy /Y "!BUILD_DIR!\lib\libnetleaf*.so" "!STAGE!\" >nul
-copy /Y "%SRC_DIR%\include\*.h" "!STAGE!\" >nul
-copy /Y "%SRC_DIR%\CMakeLists.txt" "!STAGE!\" >nul
-echo Staged: !STAGE!
-echo.
-
-:skip_x64
-
-REM ---------------------------------------------------------------------------
-REM 8. Summary
-REM ---------------------------------------------------------------------------
-echo ========================================
-echo   NetLeaf Android build completed!
-echo ========================================
-echo.
-echo Outputs:
-if "%BUILD_A64%"=="1" echo   build-android\arm64-v8a\stage-lib\
-if "%BUILD_V7A%"=="1" echo   build-android\armeabi-v7a\stage-lib\
-if "%BUILD_X64%"=="1" echo   build-android\x86_64\stage-lib\
-echo.
-echo Each stage-lib contains:
-echo   libnetleaf*.so   (shared library)
-echo   *.h              (public headers)
-echo   CMakeLists.txt   (for integration)
-echo.
+echo Outputs under: %SRC_DIR%\build-android\
 endlocal
+exit /b 0
+
+REM ============================================================
+REM :build_abi  <abi>
+REM ============================================================
+:build_abi
+set "ABI=%~1"
+set "BDIR=%SRC_DIR%\build-android\%ABI%"
+echo.
+echo ----------------------------------------
+echo [Build] Android %ABI%
+echo ----------------------------------------
+if exist "%BDIR%" rmdir /s /q "%BDIR%"
+mkdir "%BDIR%"
+
+set "GCMD="
+if /i "%GEN%"=="Ninja" set "GCMD=-DCMAKE_MAKE_PROGRAM=ninja.exe"
+if /i "%GEN%"=="MinGW Makefiles" set "GCMD=-DCMAKE_MAKE_PROGRAM=%MAKE_PROG%"
+
+cmake -S "%SRC_DIR%" -B "%BDIR%" -G "%GEN%" %GCMD% ^
+      -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN%" ^
+      -DANDROID_ABI=%ABI% ^
+      %NL_OPTS% ^
+      -DCMAKE_C_FLAGS="-fPIE -fdata-sections -ffunction-sections" ^
+      -DCMAKE_SHARED_LINKER_FLAGS="-fdata-sections -ffunction-sections -Wl,--gc-sections"
+if errorlevel 1 (
+    echo [FAIL] configure failed: %ABI%
+    set "FAILED=%FAILED% %ABI%"
+    exit /b 1
+)
+cmake --build "%BDIR%" --parallel %NUMBER_OF_PROCESSORS% --target netleaf_core
+if errorlevel 1 (
+    echo [FAIL] build failed: %ABI%
+    set "FAILED=%FAILED% %ABI%"
+    exit /b 1
+)
+
+set "STAGE=%BDIR%\stage-lib"
+if exist "%STAGE%" rmdir /s /q "%STAGE%"
+mkdir "%STAGE%"
+copy /Y "%BDIR%\lib\*netleaf*.so" "%STAGE%\" >nul 2>nul
+copy /Y "%SRC_DIR%\include\*.h" "%STAGE%\" >nul 2>nul
+echo [OK] %ABI% -^> %STAGE%
+exit /b 0

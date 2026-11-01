@@ -216,10 +216,14 @@ static DWORD WINAPI server_thread(LPVOID arg) {
             
             HANDLE thread = CreateThread(NULL, 0, client_thread, targ, 0, NULL);
             CloseHandle(thread);
-            
+
             if (server->on_connect) {
                 server->on_connect(server->user_data);
             }
+        } else {
+            // accept 失败（如 fd/socket 耗尽 EMFILE、被信号打断）时短暂退避，
+            // 避免 tight loop 空转导致 CPU 100%
+            Sleep(10);
         }
     }
     

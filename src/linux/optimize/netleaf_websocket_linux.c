@@ -234,10 +234,14 @@ static void* server_thread(void* arg) {
             pthread_t thread;
             pthread_create(&thread, NULL, client_thread, targ);
             pthread_detach(thread);
-            
+
             if (server->on_connect) {
                 server->on_connect(server->user_data);
             }
+        } else {
+            // accept 失败（如 fd 耗尽 EMFILE/ENFILE、被信号打断）时短暂退避，
+            // 避免 tight loop 空转导致 CPU 100%
+            usleep(10000);
         }
     }
     

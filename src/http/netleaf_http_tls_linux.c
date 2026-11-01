@@ -256,7 +256,7 @@ int nl_http_client_request(nl_http_client_t* client,
 struct nlh_tls_server {
     int fd;
     int port;
-    int running;
+    volatile int running;   /* 跨线程生命周期标志：accept 线程读、stop 写 */
     int enable_http2;
     pthread_t thread;
     nl_http_handler handler;
@@ -289,38 +289,58 @@ static void nlh_tls_h2_session(NL_HTTPS_TLS_CTX* tls, int sock,
     io.write_h2_frame = io_tls_write_h2_frame;
     io.user = tls;
 
-    char buffer[BUFFER_SIZE];
-    int bytes_read = NL_HTTPS_TLS_recv(tls, buffer, sizeof(buffer));
+    /* 累积缓冲：TLS record 边界与 H2 帧边界无关，帧头与载荷可能被
+     * 拆分到多次 recv（客户端分帧头/HPACK 两次写即触发），必须跨
+     * recv 拼帧后再解析，否则不完整帧会被静默丢弃、请求永不响应 */
+    size_t cap = BUFFER_SIZE;
+    uint8_t* acc = (uint8_t*)malloc(cap);
+    if (!acc) {
+        NL_HTTP_MUTEX_DESTROY(&conn.mutex);
+        h2_connection_cleanup(&conn);
+        return;
+    }
+    size_t have = 0;
+    int preface_done = 0;
 
-    if (bytes_read >= H2_PREFACE_LEN && memcmp(buffer, h2_preface, H2_PREFACE_LEN) == 0) {
-        conn.preface_sent = 1;
-        h2_send_settings(&io, sock, &conn);
+    for (;;) {
+        if (have == cap) {          /* 半帧积压：扩容等待后续数据 */
+            size_t ncap = cap * 2;
+            uint8_t* nacc = (uint8_t*)realloc(acc, ncap);
+            if (!nacc) break;
+            acc = nacc;
+            cap = ncap;
+        }
+        int n = NL_HTTPS_TLS_recv(tls, (char*)acc + have, (int)(cap - have));
+        if (n <= 0) break;
+        have += (size_t)n;
 
-        size_t remaining = (size_t)bytes_read - H2_PREFACE_LEN;
-        if (remaining > 0) {
-            h2_process_frame(&io, sock, &conn, (uint8_t*)buffer + H2_PREFACE_LEN,
-                             remaining, handler, user_data);
+        size_t offset = 0;
+        if (!preface_done) {
+            if (have < H2_PREFACE_LEN) continue;
+            if (memcmp(acc, h2_preface, H2_PREFACE_LEN) != 0) break;  /* 非法客户端 */
+            preface_done = 1;
+            conn.preface_sent = 1;
+            h2_send_settings(&io, sock, &conn);
+            offset = H2_PREFACE_LEN;
         }
 
-        while (1) {
-            bytes_read = NL_HTTPS_TLS_recv(tls, buffer, sizeof(buffer));
-            if (bytes_read <= 0) break;
+        while (offset + 9 <= have) {
+            struct nl_h2_frame_header header;
+            h2_frame_header_read(acc + offset, &header);
+            if (header.length > H2_MAX_FRAME_SIZE) { have = 0; goto done; } /* 协议违规 */
+            if (offset + 9 + header.length > have) break;  /* 半帧，留待下次 recv */
 
-            size_t offset = 0;
-            while (offset < (size_t)bytes_read) {
-                if (offset + 9 > (size_t)bytes_read) break;
-
-                struct nl_h2_frame_header header;
-                h2_frame_header_read((uint8_t*)buffer + offset, &header);
-                if (offset + 9 + header.length > (size_t)bytes_read) break;
-
-                h2_process_frame(&io, sock, &conn, (uint8_t*)buffer + offset,
-                                 9 + header.length, handler, user_data);
-                offset += 9 + header.length;
-            }
+            h2_process_frame(&io, sock, &conn, acc + offset,
+                             9 + header.length, handler, user_data);
+            offset += 9 + header.length;
+        }
+        if (offset > 0) {           /* 已消费部分前移，保留半帧 */
+            memmove(acc, acc + offset, have - offset);
+            have -= offset;
         }
     }
-
+done:
+    free(acc);
     NL_HTTP_MUTEX_DESTROY(&conn.mutex);
     h2_connection_cleanup(&conn);
 }
@@ -439,18 +459,22 @@ static void* nlh_tls_server_thread(void* arg) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_sock = accept(srv->fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_sock >= 0) {
-            nlh_tls_conn_args_t* args = malloc(sizeof(nlh_tls_conn_args_t));
-            if (!args) { close(client_sock); continue; }
-            args->sock = client_sock;
-            args->srv = srv;
-            pthread_t th;
-            if (pthread_create(&th, NULL, nlh_tls_conn_thread, args) != 0) {
-                free(args);
-                close(client_sock);
-            } else {
-                pthread_detach(th);
-            }
+        if (client_sock < 0) {
+            /* stop() 用 shutdown() 唤醒本线程后 accept 返回错误；
+             * 未在停止中则视为瞬时错误(EINTR 等)，继续等待 */
+            if (!srv->running) break;
+            continue;
+        }
+        nlh_tls_conn_args_t* args = malloc(sizeof(nlh_tls_conn_args_t));
+        if (!args) { close(client_sock); continue; }
+        args->sock = client_sock;
+        args->srv = srv;
+        pthread_t th;
+        if (pthread_create(&th, NULL, nlh_tls_conn_thread, args) != 0) {
+            free(args);
+            close(client_sock);
+        } else {
+            pthread_detach(th);
         }
     }
     return NULL;
@@ -518,9 +542,13 @@ int nlh_tls_server_start(nlh_tls_server_t* srv) {
 void nlh_tls_server_stop(nlh_tls_server_t* srv) {
     if (!srv || !srv->running) return;
     srv->running = 0;
+    /* POSIX 上 close() 不会唤醒阻塞中的 accept()（曾致 pthread_join 永久
+     * 阻塞）；shutdown(SHUT_RDWR) 会让 accept 立即返回错误，之后再 close
+     * 回收描述符 */
+    shutdown(srv->fd, SHUT_RDWR);
+    pthread_join(srv->thread, NULL);
     close(srv->fd);
     srv->fd = -1;
-    pthread_join(srv->thread, NULL);
 }
 
 void nlh_tls_server_destroy(nlh_tls_server_t* srv) {

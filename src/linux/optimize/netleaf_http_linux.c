@@ -245,6 +245,10 @@ static void* server_thread(void* arg) {
                 pthread_create(&thread, NULL, http1_client_thread, args);
                 pthread_detach(thread);
             }
+        } else {
+            // accept 失败（fd 耗尽 EMFILE/ENFILE、被信号打断）时短暂退避，
+            // 避免 tight loop 空转导致 CPU 100%
+            usleep(10000);
         }
     }
 
@@ -269,6 +273,10 @@ static void* http2_server_thread(void* arg) {
             pthread_t thread;
             pthread_create(&thread, NULL, http2_client_thread, args);
             pthread_detach(thread);
+        } else {
+            // accept 失败（fd 耗尽 EMFILE/ENFILE、被信号打断）时短暂退避，
+            // 避免 tight loop 空转导致 CPU 100%
+            usleep(10000);
         }
     }
 

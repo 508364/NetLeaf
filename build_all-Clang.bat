@@ -1,307 +1,164 @@
 @echo off
-chcp 65001 >nul 2>&1
-REM NetLeaf Multi-Architecture Build Script (LLVM-MinGW + WSL for Linux/macOS)
-REM Pure C project - no C++ compiler needed
+REM ============================================================
+REM NetLeaf - Windows build (LLVM-MinGW / Clang)
+REM This script ONLY builds Windows targets. It does not touch
+REM Linux / macOS / Android. No other script is invoked.
 REM
-REM Usage: build_all-Clang.bat [x64^|x86^|arm64^|all]
-REM   amd64 is an alias of x64. Default: all
+REM Usage: build_all-Clang.bat [x64|x86|arm64|all]   (default: all)
+REM         amd64 is an alias of x64
+REM
+REM Compiler lookup order:
+REM   1) LLVM_MINGW  env var (points at the bin directory)
+REM   2) CC          env var (full path of a *-w64-mingw32-clang.exe)
+REM   3) PATH        (x86_64/i686/aarch64 -w64-mingw32-clang.exe)
+REM   4) common install directories
+REM ============================================================
 
 setlocal enabledelayedexpansion
-set VERSION=2.4.2
-set SRC_DIR=%~dp0
-set SRC_DIR=%SRC_DIR:~0,-1%
+set "VERSION=3.0.0"
+set "SRC_DIR=%~dp0"
+set "SRC_DIR=%SRC_DIR:~0,-1%"
 
-REM Parse architecture argument
+REM ---------- parse argument ----------
 set "ARCH=%~1"
 if not defined ARCH set "ARCH=all"
 if /i "%ARCH%"=="amd64" set "ARCH=x64"
-set BUILD_X64=0
-set BUILD_X86=0
-set BUILD_ARM64=0
-if /i "%ARCH%"=="all"   set BUILD_X64=1
-if /i "%ARCH%"=="all"   set BUILD_X86=1
-if /i "%ARCH%"=="all"   set BUILD_ARM64=1
-if /i "%ARCH%"=="x64"   set BUILD_X64=1
-if /i "%ARCH%"=="x86"   set BUILD_X86=1
-if /i "%ARCH%"=="arm64" set BUILD_ARM64=1
-if /i "%ARCH%"=="all"   goto :arch_ok
-if /i "%ARCH%"=="x64"   goto :arch_ok
-if /i "%ARCH%"=="x86"   goto :arch_ok
-if /i "%ARCH%"=="arm64" goto :arch_ok
-echo [ERROR] Unknown architecture: %ARCH%
-echo Usage: build_all-Clang.bat [x64^|x86^|arm64^|all]
-exit /b 1
 
-:arch_ok
-REM ---------------------------------------------------------------------------
-REM 1. Detect LLVM-MinGW (from PATH, not hardcoded)
-REM ---------------------------------------------------------------------------
-set "LLVM_MINGW="
-if defined CC (
-    for %%I in ("%CC%") do if exist "%%~dpI" set "LLVM_MINGW=%%~dpI"
+set "BUILD_X64=0"
+set "BUILD_X86=0"
+set "BUILD_ARM64=0"
+if /i "%ARCH%"=="all"   set "BUILD_X64=1"
+if /i "%ARCH%"=="all"   set "BUILD_X86=1"
+if /i "%ARCH%"=="all"   set "BUILD_ARM64=1"
+if /i "%ARCH%"=="x64"   set "BUILD_X64=1"
+if /i "%ARCH%"=="x86"   set "BUILD_X86=1"
+if /i "%ARCH%"=="arm64" set "BUILD_ARM64=1"
+if "%BUILD_X64%%BUILD_X86%%BUILD_ARM64%"=="000" (
+    echo [ERROR] Unknown architecture: %ARCH%
+    echo Usage: build_all-Clang.bat [x64^|x86^|arm64^|all]
+    exit /b 1
 )
-if not defined LLVM_MINGW for /f "delims=" %%I in ('where x86_64-w64-mingw32-clang.exe 2^>nul') do if exist "%%I" set "LLVM_MINGW=%%~dpI"
-if not defined LLVM_MINGW for /f "delims=" %%I in ('where i686-w64-mingw32-clang.exe 2^>nul') do if exist "%%I" set "LLVM_MINGW=%%~dpI"
-if not defined LLVM_MINGW for /f "delims=" %%I in ('where aarch64-w64-mingw32-clang.exe 2^>nul') do if exist "%%I" set "LLVM_MINGW=%%~dpI"
-if not defined LLVM_MINGW for /f "delims=" %%I in ('where clang.exe 2^>nul') do if exist "%%I" set "LLVM_MINGW=%%~dpI"
-if defined LLVM_MINGW if "%LLVM_MINGW:~-1%"=="\" set "LLVM_MINGW=%LLVM_MINGW:~0,-1%"
+
+REM ---------- locate LLVM-MinGW ----------
+set "LLVM_MINGW="
+if defined LLVM_MINGW if not exist "%LLVM_MINGW%\x86_64-w64-mingw32-clang.exe" set "LLVM_MINGW="
+if not defined LLVM_MINGW if defined CC (
+    for %%I in ("%CC%") do if exist "%%~dpIx86_64-w64-mingw32-clang.exe" set "LLVM_MINGW=%%~dpI"
+)
+if not defined LLVM_MINGW for /f "delims=" %%I in ('where x86_64-w64-mingw32-clang.exe 2^>nul') do if not defined LLVM_MINGW set "LLVM_MINGW=%%~dpI"
+if not defined LLVM_MINGW for /f "delims=" %%I in ('where i686-w64-mingw32-clang.exe 2^>nul') do if not defined LLVM_MINGW set "LLVM_MINGW=%%~dpI"
+if not defined LLVM_MINGW for /f "delims=" %%I in ('where aarch64-w64-mingw32-clang.exe 2^>nul') do if not defined LLVM_MINGW set "LLVM_MINGW=%%~dpI"
+REM fall back to well-known install locations derived from environment vars only
+for %%D in (
+    "%ProgramFiles%\llvm-mingw\bin"
+    "%ProgramFiles(x86)%\llvm-mingw\bin"
+    "%LOCALAPPDATA%\llvm-mingw\bin"
+    "%USERPROFILE%\llvm-mingw\bin"
+) do (
+    if not defined LLVM_MINGW if exist "%%~D\x86_64-w64-mingw32-clang.exe" set "LLVM_MINGW=%%~D"
+)
 if not defined LLVM_MINGW (
     echo [ERROR] LLVM-MinGW not found.
-    echo         Add its bin dir to PATH, or set CC=e:\llvm-mingw\bin\clang.exe, then retry.
+    echo         Put its bin directory on PATH, or set:
+    echo           set LLVM_MINGW=^<path\to\llvm-mingw^>\bin
     exit /b 1
 )
+if "!LLVM_MINGW:~-1!"=="\" set "LLVM_MINGW=!LLVM_MINGW:~0,-1!"
+set "PATH=%LLVM_MINGW%;%PATH%"
 
-REM Check required tools
-set "CLANG_X64=%LLVM_MINGW%\x86_64-w64-mingw32-clang.exe"
-set "CLANG_X86=%LLVM_MINGW%\i686-w64-mingw32-clang.exe"
-set "CLANG_ARM=%LLVM_MINGW%\aarch64-w64-mingw32-clang.exe"
-
-if not exist "%CLANG_X64%" (
-    echo [ERROR] x86_64-w64-mingw32-clang.exe not found at %LLVM_MINGW%
-    exit /b 1
-)
-if not exist "%CLANG_X86%" (
-    echo [WARNING] i686-w64-mingw32-clang.exe not found, x86 build will fail
-)
-if not exist "%CLANG_ARM%" (
-    echo [WARNING] aarch64-w64-mingw32-clang.exe not found, ARM64 build will fail
-)
-
-REM Detect make command
+REM ---------- locate make ----------
 set "MAKE_CMD="
-where mingw32-make >nul 2>nul && set "MAKE_CMD=mingw32-make"
-if not defined MAKE_CMD where make >nul 2>nul && set "MAKE_CMD=make"
+if exist "%LLVM_MINGW%\mingw32-make.exe" set "MAKE_CMD=%LLVM_MINGW%\mingw32-make.exe"
+if not defined MAKE_CMD for /f "delims=" %%I in ('where mingw32-make.exe 2^>nul') do if not defined MAKE_CMD set "MAKE_CMD=%%I"
+if not defined MAKE_CMD for /f "delims=" %%I in ('where make.exe 2^>nul') do if not defined MAKE_CMD set "MAKE_CMD=%%I"
 if not defined MAKE_CMD (
-    echo [ERROR] Neither mingw32-make nor make found in PATH.
+    echo [ERROR] mingw32-make / make not found. LLVM-MinGW package normally ships mingw32-make.exe.
     exit /b 1
 )
-echo Using make command: %MAKE_CMD%
 
 echo ========================================
-echo   NetLeaf v%VERSION% Build Script ^(Pure C^)
+echo   NetLeaf v%VERSION% - Windows (LLVM-MinGW)
 echo ========================================
-echo.
-echo Windows builds: LLVM-MinGW ^(Clang/MinGW^)
-echo Linux/macOS builds: WSL ^(Ubuntu^)
-echo.
-echo Source directory: %SRC_DIR%
-echo Output: releases/ directory
-echo Target architecture: %ARCH%
+echo Source : %SRC_DIR%
+echo Compiler: %LLVM_MINGW%
+echo Make    : %MAKE_CMD%
+echo Target  : %ARCH%
+echo Output  : releases\
 echo.
 
-if not exist "releases" mkdir releases
+if not exist "%SRC_DIR%\releases" mkdir "%SRC_DIR%\releases"
 
-set WINDOWS_OPTS=-DBUILD_EXAMPLES=ON -DBUILD_TESTS=ON -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON
+REM BUILD_TLS(tls2) conflicts with BUILD_TLS3 inside one build tree; pick TLS3.
+set "NL_OPTS=-DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON -DBUILD_TLS=OFF -DBUILD_TLS3=ON -DBUILD_LANG=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON"
 
-REM ---------------------------------------------------------------------------
-REM 2. Windows x64 build
-REM ---------------------------------------------------------------------------
-if "%BUILD_X64%"=="0" goto :skip_x64
+if "%BUILD_X64%"=="1"   call :build_arch x64   x86_64 && call :package x64
+if "%BUILD_X86%"=="1"   call :build_arch x86   i686  && call :package x86
+if "%BUILD_ARM64%"=="1" call :build_arch arm64 aarch64 && call :package arm64
+
 echo ========================================
-echo [1/4] Building Windows x64...
+echo   Windows (LLVM-MinGW) builds completed
 echo ========================================
-if exist "build_x64" rmdir /s /q "build_x64"
-mkdir "build_x64"
-pushd "build_x64"
-cmake -G "MinGW Makefiles" ^
-      -DCMAKE_BUILD_TYPE=Release ^
-      -DCMAKE_C_COMPILER="%CLANG_X64%" ^
-      -DCMAKE_AR="%LLVM_MINGW%\x86_64-w64-mingw32-ar.exe" ^
-      -DCMAKE_RANLIB="%LLVM_MINGW%\x86_64-w64-mingw32-ranlib.exe" ^
-      %WINDOWS_OPTS% "%SRC_DIR%"
-if %errorlevel% neq 0 (
-    echo [ERROR] CMake failed for x64!
-    popd
-    exit /b 1
-)
-%MAKE_CMD% -j %NUMBER_OF_PROCESSORS%
-if %errorlevel% neq 0 (
-    echo [ERROR] Build failed for x64!
-    popd
-    exit /b 1
-)
-popd
-echo x64 build completed!
-
-echo Creating x64 package...
-powershell.exe -NoProfile -Command "Start-Sleep -Seconds 1; Compress-Archive -Path 'build_x64\bin\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x64.zip' -Force"
-echo x64 package created!
-echo.
-
-:skip_x64
-REM ---------------------------------------------------------------------------
-REM 3. Windows x86 build
-REM ---------------------------------------------------------------------------
-if "%BUILD_X86%"=="0" goto :skip_x86
-echo ========================================
-echo [2/4] Building Windows x86...
-echo ========================================
-if exist "build_i686" rmdir /s /q "build_i686"
-mkdir "build_i686"
-pushd "build_i686"
-cmake -G "MinGW Makefiles" ^
-      -DCMAKE_BUILD_TYPE=Release ^
-      -DCMAKE_C_COMPILER="%CLANG_X86%" ^
-      -DCMAKE_AR="%LLVM_MINGW%\i686-w64-mingw32-ar.exe" ^
-      -DCMAKE_RANLIB="%LLVM_MINGW%\i686-w64-mingw32-ranlib.exe" ^
-      %WINDOWS_OPTS% "%SRC_DIR%"
-if %errorlevel% neq 0 (
-    echo [ERROR] CMake failed for x86!
-    popd
-    exit /b 1
-)
-%MAKE_CMD% -j %NUMBER_OF_PROCESSORS%
-if %errorlevel% neq 0 (
-    echo [ERROR] Build failed for x86!
-    popd
-    exit /b 1
-)
-popd
-echo x86 build completed!
-
-echo Creating x86 package...
-powershell.exe -NoProfile -Command "Start-Sleep -Seconds 1; Compress-Archive -Path 'build_i686\bin\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-x86.zip' -Force"
-echo x86 package created!
-echo.
-
-:skip_x86
-REM ---------------------------------------------------------------------------
-REM 4. Windows ARM64 build
-REM ---------------------------------------------------------------------------
-if "%BUILD_ARM64%"=="0" goto :skip_arm64
-echo ========================================
-echo [3/4] Building Windows ARM64...
-echo ========================================
-if exist "build_arm64" rmdir /s /q "build_arm64"
-mkdir "build_arm64"
-pushd "build_arm64"
-cmake -G "MinGW Makefiles" ^
-      -DCMAKE_BUILD_TYPE=Release ^
-      -DCMAKE_C_COMPILER="%CLANG_ARM%" ^
-      -DCMAKE_AR="%LLVM_MINGW%\aarch64-w64-mingw32-ar.exe" ^
-      -DCMAKE_RANLIB="%LLVM_MINGW%\aarch64-w64-mingw32-ranlib.exe" ^
-      %WINDOWS_OPTS% "%SRC_DIR%"
-if %errorlevel% neq 0 (
-    echo [ERROR] CMake failed for ARM64!
-    popd
-    exit /b 1
-)
-%MAKE_CMD% -j %NUMBER_OF_PROCESSORS%
-if %errorlevel% neq 0 (
-    echo [ERROR] Build failed for ARM64!
-    popd
-    exit /b 1
-)
-popd
-echo ARM64 build completed!
-
-echo Creating ARM64 package...
-powershell.exe -NoProfile -Command "Start-Sleep -Seconds 1; Compress-Archive -Path 'build_arm64\bin\*.dll','include\*.h' -DestinationPath 'releases\NetLeaf-%VERSION%-windows-arm64.zip' -Force"
-echo ARM64 package created!
-echo.
-
-:skip_arm64
-REM ---------------------------------------------------------------------------
-REM 5. Linux/macOS builds via WSL (Ubuntu)
-REM ---------------------------------------------------------------------------
-echo ========================================
-echo [4/4] Building Linux/macOS via WSL...
-echo ========================================
-
-REM Check if WSL Ubuntu is available
-set "WSL_DISTRO="
-powershell.exe -NoProfile -Command "try { \$wsl = wsl -l -q 2>nul; foreach (\$d in \$wsl) { if (\$d.Contains('Ubuntu')) { Write-Output \$d; break } } } catch {}" > "%TEMP%\wsl_distro.txt" 2>nul
-for /f "tokens=*" %%d in ('type "%TEMP%\wsl_distro.txt" 2^>nul') do if not defined WSL_DISTRO set "WSL_DISTRO=%%d"
-del "%TEMP%\wsl_distro.txt" >nul 2>nul
-if not defined WSL_DISTRO (
-    echo [WARNING] WSL Ubuntu not found, skipping Linux/macOS builds.
-    echo           Install Ubuntu from Microsoft Store or run: wsl --install -d Ubuntu
-    echo.
-    goto :skip_linux
-)
-echo WSL distro: %WSL_DISTRO%
-
-REM Build Linux amd64
-echo Building Linux x86_64...
-wsl -d "%WSL_DISTRO%" bash -c "
-    mkdir -p /mnt/c/C-C++/NetLeaf/build_linux_amd64 &&
-    cd /mnt/c/C-C++/NetLeaf/build_linux_amd64 &&
-    cmake -G \"Unix Makefiles\" \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DBUILD_EXAMPLES=ON -DBUILD_TESTS=ON \
-          -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON \
-          /mnt/c/C-C++/NetLeaf &&
-    make -j\$(nproc) &&
-    tar czf /mnt/c/C-C++/NetLeaf/releases/NetLeaf-%VERSION%-linux-amd64.tar.gz \
-        lib/libnetleaf*.so* lib/libnetleaf*.a \
-        include/*.h 2>/dev/null || true
-" 2>nul
-if %errorlevel% neq 0 (
-    echo [ERROR] Linux x86_64 build failed in WSL!
-) else (
-    echo Linux x86_64 build completed!
-)
-
-REM Build Linux arm64
-echo Building Linux arm64...
-wsl -d "%WSL_DISTRO%" bash -c "
-    apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu 2>/dev/null &&
-    mkdir -p /mnt/c/C-C++/NetLeaf/build_linux_arm64 &&
-    cd /mnt/c/C-C++/NetLeaf/build_linux_arm64 &&
-    cmake -G \"Unix Makefiles\" \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-          -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF \
-          -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON \
-          /mnt/c/C-C++/NetLeaf &&
-    make -j\$(nproc) &&
-    tar czf /mnt/c/C-C++/NetLeaf/releases/NetLeaf-%VERSION%-linux-arm64.tar.gz \
-        lib/libnetleaf*.so* lib/libnetleaf*.a \
-        include/*.h 2>/dev/null || true
-" 2>nul
-if %errorlevel% neq 0 (
-    echo [WARNING] Linux arm64 build skipped (cross-compiler not available in WSL).
-) else (
-    echo Linux arm64 build completed!
-)
-
-REM Build macOS (via Apple Silicon cross-compilation in WSL, best-effort)
-echo Building macOS arm64...
-wsl -d "%WSL_DISTRO%" bash -c "
-    mkdir -p /mnt/c/C-C++/NetLeaf/build_macos_arm64 &&
-    cd /mnt/c/C-C++/NetLeaf/build_macos_arm64 &&
-    cmake -G \"Unix Makefiles\" \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_SYSTEM_NAME=Darwin \
-          -DCMAKE_SYSTEM_PROCESSOR=arm64 \
-          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-          -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF \
-          -DBUILD_TLS=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON \
-          /mnt/c/C-C++/NetLeaf &&
-    make -j\$(nproc) &&
-    tar czf /mnt/c/C-C++/NetLeaf/releases/NetLeaf-%VERSION%-macos-arm64.tar.gz \
-        lib/libnetleaf*.so* lib/libnetleaf*.a \
-        include/*.h 2>/dev/null || true
-" 2>nul
-if %errorlevel% neq 0 (
-    echo [WARNING] macOS arm64 build skipped (cross-compilation not supported).
-) else (
-    echo macOS arm64 build completed!
-)
-
-:skip_linux
-REM ---------------------------------------------------------------------------
-echo ========================================
-echo   All builds completed!
-echo ========================================
-echo.
-echo Packages location: releases\
-if "%BUILD_X64%"=="1"   echo   - NetLeaf-%VERSION%-windows-x64.zip
-if "%BUILD_X86%"=="1"   echo   - NetLeaf-%VERSION%-windows-x86.zip
-if "%BUILD_ARM64%"=="1" echo   - NetLeaf-%VERSION%-windows-arm64.zip
-echo   - Linux/macOS packages ^(generated by WSL^)
-echo.
-echo Note: For MSVC builds, use build_all-MSVC.bat
-echo.
-
+echo Packages in: %SRC_DIR%\releases\
 endlocal
+exit /b 0
+
+REM ============================================================
+REM :build_arch  <arch>  <triplet>
+REM ============================================================
+:build_arch
+set "PACK_ARCH=%~1"
+set "TRIPLET=%~2"
+set "CC_EXE=%LLVM_MINGW%\%TRIPLET%-w64-mingw32-clang.exe"
+set "AR_EXE=%LLVM_MINGW%\%TRIPLET%-w64-mingw32-ar.exe"
+set "RANLIB_EXE=%LLVM_MINGW%\%TRIPLET%-w64-mingw32-ranlib.exe"
+if not exist "%CC_EXE%" (
+    echo [SKIP] %PACK_ARCH%: compiler missing ^(%CC_EXE%^)
+    exit /b 1
+)
+set "BDIR=%SRC_DIR%\build_mingw_%PACK_ARCH%"
+echo.
+echo ----------------------------------------
+echo [Build] Windows %PACK_ARCH% ^(MinGW Makefiles^)
+echo ----------------------------------------
+if exist "%BDIR%" rmdir /s /q "%BDIR%"
+mkdir "%BDIR%"
+pushd "%BDIR%"
+cmake -G "MinGW Makefiles" ^
+      "-DCMAKE_MAKE_PROGRAM=%MAKE_CMD%" ^
+      "-DCMAKE_C_COMPILER=%CC_EXE%" ^
+      "-DCMAKE_AR=%AR_EXE%" ^
+      "-DCMAKE_RANLIB=%RANLIB_EXE%" ^
+      %NL_OPTS% "%SRC_DIR%"
+if errorlevel 1 (
+    echo [ERROR] CMake configure failed for %PACK_ARCH%
+    popd
+    exit /b 1
+)
+cmake --build . --parallel %NUMBER_OF_PROCESSORS%
+if errorlevel 1 (
+    echo [ERROR] Build failed for %PACK_ARCH%
+    popd
+    exit /b 1
+)
+popd
+echo [OK] Windows %PACK_ARCH% built
+exit /b 0
+
+REM ============================================================
+REM :package  <arch>
+REM ============================================================
+:package
+set "PACK_ARCH=%~1"
+set "BDIR=%SRC_DIR%\build_mingw_%PACK_ARCH%"
+set "PKG=%BDIR%\pkg_out"
+echo [Pack] %PACK_ARCH% ...
+if exist "%PKG%" rmdir /s /q "%PKG%"
+mkdir "%PKG%"
+copy /Y "%BDIR%\bin\*.dll" "%PKG%\" >nul 2>nul
+copy /Y "%BDIR%\lib\*.a" "%PKG%\" >nul 2>nul
+copy /Y "%BDIR%\lib\*.dll.a" "%PKG%\" >nul 2>nul
+copy /Y "%SRC_DIR%\include\*.h" "%PKG%\" >nul 2>nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%PKG%\*' -DestinationPath '%SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-mingw.zip' -Force"
+rmdir /s /q "%PKG%"
+echo [OK] %SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-mingw.zip
+exit /b 0

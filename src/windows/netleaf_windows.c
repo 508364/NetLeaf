@@ -11,6 +11,10 @@
 
 #include "../include/netleaf.h"
 
+#ifdef NETLEAF_LEGACY_WORKER_POOL
+#include "netleaf_worker_pool_windows.h"
+#endif
+
 #if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
@@ -300,10 +304,21 @@ static void parse_http_request(const char* data, size_t len,
     if (!header_end) header_end = data + len;
 
     size_t header_len = (size_t)(header_end - data);
-    char* line = (char*)malloc(header_len + 1);
-    if (!line) return;
-    memcpy(line, data, header_len);
-    line[header_len] = '\0';
+    // 仅需解析首行(METHOD PATH VERSION)：只复制首行而非整个头部，且优先用栈缓冲，
+    // 消除每个请求一次的 malloc + 全头部 memcpy
+    size_t line_len = 0;
+    while (line_len < header_len && data[line_len] != '\n') line_len++;
+    if (line_len > 0 && data[line_len - 1] == '\r') line_len--;
+    char stack_line[256];
+    char* line;
+    if (line_len < sizeof(stack_line)) {
+        line = stack_line;
+    } else {
+        line = (char*)malloc(line_len + 1);
+        if (!line) return;
+    }
+    memcpy(line, data, line_len);
+    line[line_len] = '\0';
 
     char* space1 = strchr(line, ' ');
     char* space2 = space1 ? strchr(space1 + 1, ' ') : NULL;
@@ -337,7 +352,7 @@ static void parse_http_request(const char* data, size_t len,
         *body = NULL;
     }
 
-    free(line);
+    if (line != stack_line) free(line);
 }
 
 // ---- TCP/HTTP/WEBSOCKET 全 IOCP 完成处理段（取代旧 worker_dispatch）----
@@ -381,6 +396,12 @@ static void nl_server_conn_release_locked(nl_server_t* server, int idx) {
     nl_server_conn_close_locked(c);
     c->state = NL_CONN_FREE;
     c->len = 0;
+    // 惰性接收缓冲：连接关闭即回收，槽位回到 cap=0；下次 post_recv 会按需重新分配。
+    // 释放安全：每槽位同一时刻至多一个 pending WSARecv，进入本函数时该 recv 已完成，
+    // 内核不再引用 c->buf（fail 路径无 pending I/O；完成路径即该 recv 的完成事件）。
+    free(c->buf);
+    c->buf = NULL;
+    c->cap = 0;
     if (server->conn_count > 0) server->conn_count--;
 }
 
@@ -658,33 +679,47 @@ static DWORD WINAPI listener_thread(LPVOID lpParam) {
                     inet_ntop(AF_INET, &sin->sin_addr, peer_addr, sizeof(peer_addr));
                     peer_port = (int)ntohs(sin->sin_port);
                 }
-                if (server->udp_handler_v2) {
-                    server->udp_handler_v2(slot->buf, (size_t)bytes_xfer,
-                                           peer_addr, peer_port, server->user_data);
-                } else {
-                    server->udp_handler(slot->buf, (size_t)bytes_xfer, server->user_data);
+
+                // 丢包修复：先拷出 datagram 并【立即重投该槽】，再同步调用 handler。
+                // 旧序（handler 先跑、函数末尾才重投）在同步 handler 执行期间该槽不可收，
+                // 突发流量下 16 槽环 + socket 队列被打满即丢包（实测发61万/丢约千）。
+                // 先重投保证 handler 执行期间仍保持全部 NL_UDP_RCV_SLOTS 个 outstanding
+                // WSARecvFrom，内核持续异步填充空闲槽位。
+                size_t dlen = (size_t)bytes_xfer;
+                char* copy = (char*)malloc(dlen);
+                if (copy) memcpy(copy, slot->buf, dlen);
+
+                // handler 仍在 → 立即重投（addrbuf/buf 归还内核；peer 已解到局部变量）
+                // handler 被动态清空 → 不重投，槽位耗尽后 GQCS 自然睡眠
+                if (server->running == 1 && (server->udp_handler || server->udp_handler_v2)) {
+                    memset(&slot->ov, 0, sizeof(slot->ov));
+                    slot->wb.buf = slot->buf;
+                    slot->wb.len = BUFFER_SIZE;
+                    DWORD wsa_flags2 = 0;
+                    DWORD dummy_bytes2 = 0;
+                    int addr_len2 = (int)sizeof(slot->addrbuf);
+                    int rc = WSARecvFrom(server->fd, &slot->wb, 1, &dummy_bytes2, &wsa_flags2,
+                                         (struct sockaddr*)slot->addrbuf, &addr_len2,
+                                         &slot->ov, NULL);
+                    if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+                        windows_log(NL_LOG_ERROR, "Windows UDP IOCP: slot 重 post WSARecvFrom 失败 gle=%d",
+                                    WSAGetLastError());
+                    }
+                }
+
+                // 拷贝缓冲只在本次 handler 调用期间有效（与旧 slot->buf 契约一致：
+                // handler 不得在调用后保留指针），调用完即回收
+                if (copy) {
+                    if (server->udp_handler_v2) {
+                        server->udp_handler_v2(copy, dlen, peer_addr, peer_port, server->user_data);
+                    } else if (server->udp_handler) {
+                        server->udp_handler(copy, dlen, server->user_data);
+                    }
+                    free(copy);
                 }
             } else {
                 // bytes_xfer == 0 + gle==ERROR_OPERATION_ABORTED 常见于 server 关闭
                 // 非 abort 的 0 长度 datagram 理论上合法但罕见
-            }
-
-            // handler 仍在 → 重 post 该槽（其余槽位持续 outstanding）；
-            // handler 被动态清空 → 该槽不重 post，槽位耗尽后 GQCS 自然睡眠
-            if (server->running == 1 && (server->udp_handler || server->udp_handler_v2)) {
-                memset(&slot->ov, 0, sizeof(slot->ov));
-                slot->wb.buf = slot->buf;
-                slot->wb.len = BUFFER_SIZE;
-                DWORD wsa_flags2 = 0;
-                DWORD dummy_bytes2 = 0;
-                int addr_len2 = (int)sizeof(slot->addrbuf);
-                int rc = WSARecvFrom(server->fd, &slot->wb, 1, &dummy_bytes2, &wsa_flags2,
-                                     (struct sockaddr*)slot->addrbuf, &addr_len2,
-                                     &slot->ov, NULL);
-                if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-                    windows_log(NL_LOG_ERROR, "Windows UDP IOCP: slot 重 post WSARecvFrom 失败 gle=%d",
-                                WSAGetLastError());
-                }
             }
         }
         return 0;
@@ -886,7 +921,9 @@ int nl_server_start(nl_server_t* server) {
             return NL_ERROR;
         }
 
-        // 全 IOCP 初始化：预分配连接槽位表 + 每槽位接收缓冲 + 完成处理临界区
+        // 全 IOCP 初始化：预分配连接槽位表 + 完成处理临界区。
+        // 接收缓冲改为惰性分配：槽位仅需 fd=INVALID_SOCKET（calloc 已置 buf=NULL/cap=0/state=FREE），
+        // 首次 post_recv 时按需 malloc(BUFFER_SIZE)，连接释放时回收 —— 空载不再常驻 1024×8KB。
         server->conns = (nl_server_conn_t*)calloc(NL_SERVER_MAX_CONNS, sizeof(nl_server_conn_t));
         if (!server->conns) {
             windows_log(NL_LOG_ERROR, "Windows: failed to allocate IOCP connection slots");
@@ -894,15 +931,6 @@ int nl_server_start(nl_server_t* server) {
         }
         for (int i = 0; i < NL_SERVER_MAX_CONNS; i++) {
             server->conns[i].fd = INVALID_SOCKET;
-            server->conns[i].buf = (char*)malloc(BUFFER_SIZE);
-            if (!server->conns[i].buf) {
-                for (int j = 0; j < i; j++) free(server->conns[j].buf);
-                free(server->conns);
-                server->conns = NULL;
-                windows_log(NL_LOG_ERROR, "Windows: failed to allocate IOCP recv buffers");
-                return NL_ERROR;
-            }
-            server->conns[i].cap = BUFFER_SIZE;
         }
         InitializeCriticalSection(&server->conn_lock);
         server->conn_lock_init = 1;
@@ -916,6 +944,17 @@ int nl_server_start(nl_server_t* server) {
             if (!server->udp_slots) {
                 windows_log(NL_LOG_ERROR, "Windows: failed to allocate UDP receive ring slots");
                 return NL_ERROR;
+            }
+            // 放大 UDP socket 内核接收缓冲：配合"先重投再 handler"的接收环，
+            // 突发 datagram 先落内核队列，减少槽环+队列同时打满导致的丢包。
+            // 仅在当前缓冲偏小(<1MB)时提升，不覆盖用户经 NL_OPT_SO_RCVBUF 的显式配置。
+            {
+                int cur_rcvbuf = 0; int cb = (int)sizeof(cur_rcvbuf);
+                if (getsockopt(server->fd, SOL_SOCKET, SO_RCVBUF, (char*)&cur_rcvbuf, &cb) != SOCKET_ERROR &&
+                    cur_rcvbuf < 1024 * 1024) {
+                    int udp_rcvbuf = 4 * 1024 * 1024;
+                    setsockopt(server->fd, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_rcvbuf, sizeof(udp_rcvbuf));
+                }
             }
         }
     }
@@ -2404,8 +2443,10 @@ struct nl_web_server {
     // 上游→客户端方向的延迟写：客户端写慢（send WSAEWOULDBLOCK）时按 slot 缓冲待补发字节
     char   **pr_up_pend;     // [idx] -> 待补发缓冲（懒分配，PR_PROXY_BUF_SZ）
     int     *pr_up_pend_len; // [idx] -> 待补发剩余字节数
+    int     *pr_up_req_len;  // [idx] -> 异步 connect 前已构造的上游请求字节数（完成后续发）
     HANDLE iocp;             // IOCP 完成端口（NULL=select 回退，非 NULL=IOCP 主路径）
     SOCKET pr_accept_client; // AcceptEx 预创建的备用 client socket
+    char*  pr_accept_addr;   // AcceptEx 输出缓冲（local+remote 地址；NULL 会 WSAEFAULT）
     void*  pr_iocp_client_ctx;  // [cap] 客户端侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
     void*  pr_iocp_up_ctx;      // [cap] 上游侧 OVERLAPPED 上下文（pr_iocp_ctx_t*）
     void*  pr_iocp_cw_ctx;      // [cap] 客户端写侧 OVERLAPPED 上下文（补发上游→客户端余量）
@@ -2464,6 +2505,7 @@ static void nl_route_hash_insert_simple(nl_web_server_t* server, nl_web_route_t*
     }
 }
 
+#ifdef NETLEAF_LEGACY_WORKER_POOL
 static nl_web_route_t* nl_route_hash_lookup_simple(nl_web_server_t* server, const char* path) {
     if (!server->route_hash) return NULL;
     int start = (int)nl_route_hash(path);
@@ -2475,6 +2517,7 @@ static nl_web_route_t* nl_route_hash_lookup_simple(nl_web_server_t* server, cons
     }
     return NULL;
 }
+#endif /* NETLEAF_LEGACY_WORKER_POOL */
 
 static void nl_route_hash_rebuild(nl_web_server_t* server) {
     if (!server->route_hash) nl_route_hash_init(server);
@@ -2518,6 +2561,11 @@ static const char* nl_vue_cdn =
 // 依据 route 中已解析好的 upstream(host:port) 与 protocol 建立 TCP/TLS 连接。
 // select 数据驱动引擎会前置调用，故需前置声明。
 static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route);
+// 异步连接辅助（ConnectEx）与 TLS 包装：定义在文件后段，完成事件分支需前置声明。
+static void nl_proxy_resolve_upstream(const nl_web_route_t* route, char* host,
+                                      size_t host_size, int* out_port);
+static void nl_proxy_tls_wrap(SOCKET up_sock, const char* host, nl_proxy_protocol_t proto);
+static int  nl_proxy_start_connect_async(nl_web_server_t* s, int idx, const nl_web_route_t* route);
 
 // ---------------------------------------------------------------------------
 // 数据驱动反向代理引擎（Windows select 版）
@@ -2544,6 +2592,7 @@ static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route);
 #define IOCP_EV_CLIENT_READ   2  // WSARecv 客户端读完成
 #define IOCP_EV_UPSTREAM_READ 3  // WSARecv 上游读完成
 #define IOCP_EV_CLIENT_WRITE  4  // WSASend 客户端写完成（补发上游→客户端余量）
+#define IOCP_EV_UPSTREAM_CONNECT 5  // ConnectEx 异步连接完成（不再阻塞引擎消费线程）
 #define IOCP_LISTEN_KEY 0xFFFFFFFFUL  // listen socket completion key 哨兵
 
 // IOCP OVERLAPPED 上下文（嵌 OVERLAPPED，每次 WSARecv/AcceptEx 唯一实例）
@@ -2584,6 +2633,7 @@ static void pr_free_slot(nl_web_server_t* s, int idx) {
     if (s->pr_up_key && s->pr_up_key[idx]) { free(s->pr_up_key[idx]); s->pr_up_key[idx] = NULL; }
     if (s->pr_up_pend && s->pr_up_pend[idx]) { free(s->pr_up_pend[idx]); s->pr_up_pend[idx] = NULL; }
     if (s->pr_up_pend_len) s->pr_up_pend_len[idx] = 0;
+    if (s->pr_up_req_len) s->pr_up_req_len[idx] = 0;
     s->pr_state[idx] = 0;
     s->pr_fd_client[idx]   = INVALID_SOCKET;
     s->pr_fd_upstream[idx] = 0;
@@ -2901,6 +2951,7 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
     s->pr_up_key      = (char**)calloc((size_t)cap, sizeof(char*));
     s->pr_up_pend     = (char**)calloc((size_t)cap, sizeof(char*));
     s->pr_up_pend_len = (int*)calloc((size_t)cap, sizeof(int));
+    s->pr_up_req_len  = (int*)calloc((size_t)cap, sizeof(int));
     // P7: 空闲超时扫描 + slot 复用竞态防护（conn_id 代号）
     s->pr_last_active_ms = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
     s->pr_conn_id        = (DWORD*)calloc((size_t)cap, sizeof(DWORD));
@@ -2918,7 +2969,7 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
         !s->pr_hdr_len || !s->pr_remain || !s->pr_free ||
         !s->pr_up_parse || !s->pr_up_cl || !s->pr_chunk_rem ||
         !s->pr_chunk_state || !s->pr_up_hlen || !s->pr_req_is_head || !s->pr_up_key ||
-        !s->pr_up_pend || !s->pr_up_pend_len ||
+        !s->pr_up_pend || !s->pr_up_pend_len || !s->pr_up_req_len ||
         !s->pr_last_active_ms || !s->pr_conn_id) {
         goto cleanup_fail;
     }
@@ -2955,9 +3006,19 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
         windows_log(NL_LOG_ERROR, "IOCP: WSASocket (accept) 失败");
         goto cleanup_fail;
     }
-    // post 第一个 AcceptEx（addr 缓冲简化为 NULL + 0，让 kernel 处理）
+    // AcceptEx 的输出地址缓冲：dwReceiveDataLength=0 时仍必须提供合法的
+    // local+remote 地址区（传 NULL 会返回 WSAEFAULT，导致 accept 永不完成）。
+    // 每服务器独立一份，避免多实例共享同一缓冲。
+    s->pr_accept_addr = (char*)calloc(1, (sizeof(struct sockaddr_in) + 16) * 2);
+    if (!s->pr_accept_addr) {
+        windows_log(NL_LOG_ERROR, "IOCP: AcceptEx 地址缓冲 calloc 失败");
+        goto cleanup_fail;
+    }
+    // post 第一个 AcceptEx
     DWORD bytes_recv_init = 0;
-    AcceptEx(listen_sock, s->pr_accept_client, NULL, 0, 0, 0, &bytes_recv_init, (LPOVERLAPPED)&g_pr_accept_ctx);
+    AcceptEx(listen_sock, s->pr_accept_client, s->pr_accept_addr, 0,
+             sizeof(struct sockaddr_in) + 16, sizeof(struct sockaddr_in) + 16,
+             &bytes_recv_init, (LPOVERLAPPED)&g_pr_accept_ctx);
 
     // P6: engine_threads>1 时创建额外 IOCP 消费线程跑同一完成循环。
     // 注：Windows engine_threads=IOCP 消费线程数；当前完成处理经 pr_loop_cs 临界区
@@ -3016,6 +3077,7 @@ cleanup_fail:
         closesocket(s->pr_accept_client);
         s->pr_accept_client = INVALID_SOCKET;
     }
+    free(s->pr_accept_addr); s->pr_accept_addr = NULL;
     free(s->pr_iocp_client_ctx); s->pr_iocp_client_ctx = NULL;
     free(s->pr_iocp_up_ctx);     s->pr_iocp_up_ctx     = NULL;
     free(s->pr_iocp_cw_ctx);     s->pr_iocp_cw_ctx     = NULL;
@@ -3037,6 +3099,7 @@ cleanup_fail:
     free(s->pr_up_key);      s->pr_up_key      = NULL;
     free(s->pr_up_pend);     s->pr_up_pend     = NULL;
     free(s->pr_up_pend_len); s->pr_up_pend_len = NULL;
+    free(s->pr_up_req_len);  s->pr_up_req_len  = NULL;
     free(s->pr_last_active_ms); s->pr_last_active_ms = NULL;  // P7
     free(s->pr_conn_id);        s->pr_conn_id        = NULL;  // slot 复用竞态防护
     s->pr_cap = s->pr_count = 0;
@@ -3048,10 +3111,12 @@ cleanup_fail:
 // ---- IOCP 完成事件处理段（调用方持有 pr_loop_cs，串行化执行）----
 // 入口校验 ctx->conn_id：slot 复用后旧连接的迟到完成事件直接丢弃（P7 空闲强关会放大该竞态）。
 static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
-                                      ULONG_PTR compkey, DWORD bytes_trans, pr_iocp_ctx_t* ctx) {
+                                      ULONG_PTR compkey, DWORD bytes_trans, pr_iocp_ctx_t* ctx,
+                                      int completion_ok) {
     int cap = s->pr_cap;
         // ---- AcceptEx 完成 ----
         if (compkey == (ULONG_PTR)IOCP_LISTEN_KEY) {
+            if (!completion_ok) return;   // 监听 AcceptEx 失败：等待下一轮重投
             // g_pr_accept_ctx 是静态 OVERLAPPED，AcceptEx 刚把新 client 填入 s->pr_accept_client
             SOCKET new_client = s->pr_accept_client;
             if (new_client != INVALID_SOCKET) {
@@ -3099,7 +3164,8 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
             s->pr_accept_client = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
             if (s->pr_accept_client != INVALID_SOCKET) {
                 DWORD bytes_recv_next = 0;
-                AcceptEx(listen_sock, s->pr_accept_client, NULL, 0, 0, 0,
+                AcceptEx(listen_sock, s->pr_accept_client, s->pr_accept_addr, 0,
+                         sizeof(struct sockaddr_in) + 16, sizeof(struct sockaddr_in) + 16,
                          &bytes_recv_next, (LPOVERLAPPED)&g_pr_accept_ctx);
             }
             return;
@@ -3114,6 +3180,97 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
 
         SOCKET cfd = s->pr_fd_client[idx];
         if (cfd == INVALID_SOCKET) return;
+
+        if (ctx->ev == IOCP_EV_UPSTREAM_CONNECT) {
+            // ---- ConnectEx 异步上游连接完成（不阻塞引擎消费线程）----
+            SOCKET ufd = s->pr_fd_upstream[idx];
+            if (!completion_ok || ufd == 0 || ufd == INVALID_SOCKET) {
+                // 连接失败 / 无 socket：回 502 并回收槽位
+                s->pr_up_req_len[idx] = 0;
+                if (ufd > 0 && ufd != INVALID_SOCKET) closesocket(ufd);
+                s->pr_fd_upstream[idx] = 0;
+                send_http_error(cfd, 502, "Bad Gateway");
+                closesocket(cfd);
+                s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                return;
+            }
+
+            // 取回路由（HTTPS 需要 host 做 TLS 握手）
+            nl_web_route_t* r = NULL;
+            int ridx = s->pr_route_idx[idx];
+            EnterCriticalSection(&s->mutex);
+            int cur = 0;
+            for (nl_web_route_t* it = s->routes; it; it = it->next, cur++)
+                if (cur == ridx) { r = it; break; }
+            LeaveCriticalSection(&s->mutex);
+
+            int stage_ok = 1;
+            if (r && r->protocol == NL_PROXY_HTTPS) {
+                char up_host[512];
+                int up_port = 0;
+                nl_proxy_resolve_upstream(r, up_host, sizeof(up_host), &up_port);
+                nl_proxy_tls_wrap(ufd, up_host, r->protocol);
+            }
+
+            // 发送异步 connect 前已构造好的上游请求（此时 socket 仍为阻塞态）
+            int req_len = s->pr_up_req_len[idx];
+            s->pr_up_req_len[idx] = 0;
+            if (req_len > 0 && s->pr_hbuf_out[idx]) {
+                int off = 0;
+                while (off < req_len) {
+                    int w = send(ufd, s->pr_hbuf_out[idx] + off, req_len - off, 0);
+                    if (w <= 0) { stage_ok = 0; break; }
+                    off += w;
+                }
+            }
+            // 懒分配上游响应缓冲（后续响应走 OVERLAPPED WSARecv 写入该缓冲）
+            if (stage_ok && !s->pr_up_pend[idx]) {
+                s->pr_up_pend[idx] = (char*)malloc(PR_PROXY_BUF_SZ);
+                if (!s->pr_up_pend[idx]) stage_ok = 0;
+            }
+            if (!stage_ok) {
+                if (s->pr_up_pend[idx]) { free(s->pr_up_pend[idx]); s->pr_up_pend[idx] = NULL; }
+                closesocket(ufd); s->pr_fd_upstream[idx] = 0;
+                send_http_error(cfd, 502, "Bad Gateway");
+                closesocket(cfd); s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);
+                return;
+            }
+
+            // 连接建立完成：切非阻塞，后续全部走 OVERLAPPED 读写
+            u_long nb_on = 1;
+            ioctlsocket(ufd, FIONBIO, &nb_on);
+
+            // post 上游 WSARecv（响应回来 → 转发客户端）
+            pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
+            memset(uctx, 0, sizeof(*uctx));
+            uctx->idx = idx;
+            uctx->conn_id = s->pr_conn_id[idx];
+            uctx->ev  = IOCP_EV_UPSTREAM_READ;
+            uctx->sock = ufd;
+            uctx->buf  = s->pr_up_pend[idx];
+            uctx->buflen = PR_PROXY_BUF_SZ;
+            WSABUF wsb_up = {PR_PROXY_BUF_SZ, s->pr_up_pend[idx]};
+            DWORD flg_up = 0, dummy_up = 0;
+            WSARecv(ufd, &wsb_up, 1, &dummy_up, &flg_up, (LPOVERLAPPED)uctx, NULL);
+
+            // post 客户端 WSARecv（可能还有 body 未读）
+            pr_iocp_ctx_t* cctx2 = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+            memset(cctx2, 0, sizeof(*cctx2));
+            cctx2->idx = idx;
+            cctx2->conn_id = s->pr_conn_id[idx];
+            cctx2->ev  = IOCP_EV_CLIENT_READ;
+            cctx2->sock = cfd;
+            cctx2->buf  = s->pr_hbuf[idx];
+            cctx2->buflen = 8192;
+            WSABUF wsabuf_c = {8192, s->pr_hbuf[idx]};
+            DWORD flags_c = 0, dummy_c = 0;
+            WSARecv(cfd, &wsabuf_c, 1, &dummy_c, &flags_c, (LPOVERLAPPED)cctx2, NULL);
+
+            s->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
+            return;
+        }
 
         if (ctx->ev == IOCP_EV_CLIENT_READ) {
             // ---- WSARecv 客户端读完成 ----
@@ -3278,6 +3435,26 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                     }
                 }
                 if (ufd_new == INVALID_SOCKET) {
+                    // ---- 异步连接上游（ConnectEx）：不阻塞引擎消费线程/其它连接 ----
+                    // 先构造请求写入 pr_hbuf_out[idx] 并记长度，连接完成后由
+                    // IOCP_EV_UPSTREAM_CONNECT 分支负责 TLS 握手 + 发送 + post 读。
+                    char* ubuf_async = s->pr_hbuf_out[idx];
+                    int build_n = pr_build_upstream_http(s, idx, method, path, proto,
+                                                         NULL, 0, ubuf_async, 8192);
+                    if (build_n > 0 && nl_proxy_start_connect_async(s, idx, r) > 0) {
+                        // 记录池 key / 路由（归还与 TLS 握手需要），随后等完成事件
+                        if (r->protocol != NL_PROXY_TCP) {
+                            pr_pool_make_key(s->pr_up_key[idx], 576, up_host, up_port, (int)r->protocol);
+                        } else {
+                            s->pr_up_key[idx][0] = '\0';
+                        }
+                        s->pr_route_idx[idx]  = ridx;
+                        s->pr_up_req_len[idx] = build_n;
+                        s->pr_state[idx]      = PR_ST_DIR_W | PR_ST_ACTIVE;
+                        return;   // 等待 IOCP_EV_UPSTREAM_CONNECT 完成事件
+                    }
+                    s->pr_up_req_len[idx] = 0;
+                    // 回退：ConnectEx 不可用 / 投递失败，走同步 connect
                     ufd_new = nl_proxy_connect_upstream(r);
                 }
                 if (ufd_new == INVALID_SOCKET) {
@@ -3582,11 +3759,13 @@ static void pr_iocp_consume_loop(nl_web_server_t* s, SOCKET listen_sock) {
             LeaveCriticalSection(&s->pr_loop_cs);
             continue;   // 空闲退避
         }
-        if (!ok || !p_ov) continue;   // 错误 / 空 OVERLAPPED：跳过
+        if (!p_ov) continue;   // 空 OVERLAPPED：跳过（仅 GQCS 自身失败/超时）
         pr_iocp_ctx_t* ctx = (pr_iocp_ctx_t*)p_ov;
         // P6: 完成事件处理段持锁串行化；GQCS 取包本身并发、处理收敛
+        // 注意：失败完成事件（ok == FALSE）仍要交给处理段 —— 异步上游连接失败
+        // 必须走 502 收尾，不能静默丢弃导致槽位泄漏。
         EnterCriticalSection(&s->pr_loop_cs);
-        pr_iocp_handle_completion(s, listen_sock, compkey, bytes_trans, ctx);
+        pr_iocp_handle_completion(s, listen_sock, compkey, bytes_trans, ctx, (int)ok);
         LeaveCriticalSection(&s->pr_loop_cs);
     }
 }
@@ -3607,39 +3786,142 @@ static DWORD WINAPI nl_web_proxy_engine_thread(LPVOID arg) {
     return 0;
 }
 
-// 连接上游服务器（原实现），成功返回套接字，失败返回 INVALID_SOCKET。
-static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route) {
-    char host[512];
-    int port = 0;
-    nl_proxy_protocol_t proto = route->protocol;
-
+// 上游 upstream 字符串 -> host:port（统一解析，供同步/异步连接复用）
+static void nl_proxy_resolve_upstream(const nl_web_route_t* route, char* host,
+                                      size_t host_size, int* out_port) {
     char upstream_copy[512];
     snprintf(upstream_copy, sizeof(upstream_copy), "%s", route->upstream);
+    int port = 0;
     char* colon = strrchr(upstream_copy, ':');
     if (colon) {
         *colon = '\0';
         port = atoi(colon + 1);
-        snprintf(host, sizeof(host), "%s", upstream_copy);
+        snprintf(host, host_size, "%s", upstream_copy);
     } else {
-        port = (proto == NL_PROXY_HTTPS) ? 443 : 80;
-        snprintf(host, sizeof(host), "%s", upstream_copy);
+        snprintf(host, host_size, "%s", upstream_copy);
+        port = (route->protocol == NL_PROXY_HTTPS) ? 443 : 80;
     }
-    if (port <= 0) port = (proto == NL_PROXY_HTTPS) ? 443 : 80;
+    if (port <= 0) port = (route->protocol == NL_PROXY_HTTPS) ? 443 : 80;
+    *out_port = port;
+}
 
-    struct sockaddr_in up_addr;
-    memset(&up_addr, 0, sizeof(up_addr));
-    up_addr.sin_family = AF_INET;
-    up_addr.sin_port = htons((u_short)port);
-
-    struct hostent* he = gethostbyname(host);
-    if (he && he->h_addr_list[0]) {
-        memcpy(&up_addr.sin_addr, he->h_addr_list[0], sizeof(struct in_addr));
-    } else {
-        // 回退：inet_pton 解析 IP 字面量；再失败则设为 127.0.0.1（本地回环场景）
-        if (inet_pton(AF_INET, host, &up_addr.sin_addr) != 1) {
-            up_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+// host 字符串 -> sockaddr_in（先按 IP 字面量解析，失败再走系统解析）
+static void nl_proxy_fill_addr(const char* host, int port, struct sockaddr_in* addr) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sin_family = AF_INET;
+    addr->sin_port = htons((u_short)port);
+    if (inet_pton(AF_INET, host, &addr->sin_addr) != 1) {
+        struct hostent* he = gethostbyname(host);
+        if (he && he->h_addr_list[0]) {
+            memcpy(&addr->sin_addr, he->h_addr_list[0], sizeof(struct in_addr));
+        } else {
+            addr->sin_addr.s_addr = inet_addr("127.0.0.1");
         }
     }
+}
+
+// HTTPS 上游 TLS 握手（阻塞；只在连接建立后执行，不阻塞连接阶段）
+static void nl_proxy_tls_wrap(SOCKET up_sock, const char* host, nl_proxy_protocol_t proto) {
+    if (proto != NL_PROXY_HTTPS) return;
+    int tls_ok = 0;
+#ifdef NL_HTTPS_ENABLE
+    extern int nl_tls_handshake(int sock, const char* host_name);
+    tls_ok = nl_tls_handshake((int)up_sock, host);
+#else
+    extern void* nl_extension_get_func_by_id(const char* ext_id, const char* func_name);
+    /* 尝试取 HTTPS 扩展的 TLS 握手钩子（如扩展导出 nl_tls_handshake） */
+    void* handshake_fn = nl_extension_get_func_by_id("https", "nl_tls_handshake");
+    if (handshake_fn) {
+        typedef int (*nl_tls_handshake_fn)(int, const char*);
+        tls_ok = ((nl_tls_handshake_fn)handshake_fn)((int)up_sock, host);
+    }
+#endif
+    if (!tls_ok) {
+        windows_log(NL_LOG_WARN, "proxy: TLS not available for upstream %s, falling back to plaintext", host);
+    }
+}
+
+// ---- ConnectEx 扩展动态获取（InitOnce 保证多引擎线程安全）----
+static INIT_ONCE g_connectex_once = INIT_ONCE_STATIC_INIT;
+static LPFN_CONNECTEX g_connectex_fn = NULL;
+static BOOL CALLBACK nl_connectex_init(PINIT_ONCE once, PVOID param, PVOID* ctx) {
+    (void)once; (void)param; (void)ctx;
+    SOCKET tmp = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (tmp == INVALID_SOCKET) return TRUE;
+    GUID guid = WSAID_CONNECTEX;
+    DWORD bytes = 0;
+    WSAIoctl(tmp, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid),
+             &g_connectex_fn, sizeof(g_connectex_fn), &bytes, NULL, NULL);
+    closesocket(tmp);
+    return TRUE;
+}
+static LPFN_CONNECTEX nl_get_connectex(void) {
+    InitOnceExecuteOnce(&g_connectex_once, nl_connectex_init, NULL, NULL);
+    return g_connectex_fn;
+}
+
+/**
+ * 异步发起上游连接（ConnectEx）。成功投递返回 1，等待 IOCP_EV_UPSTREAM_CONNECT；
+ * 返回 0 表示扩展不可用/创建失败，调用方应回退同步 connect。
+ * 前置条件：调用方已把上游请求构造进 pr_hbuf_out[idx]，长度写入 pr_up_req_len[idx]。
+ */
+static int nl_proxy_start_connect_async(nl_web_server_t* s, int idx, const nl_web_route_t* route) {
+    LPFN_CONNECTEX pfn = nl_get_connectex();
+    if (!pfn || !s->iocp) return 0;
+
+    char host[512];
+    int port = 0;
+    nl_proxy_resolve_upstream(route, host, sizeof(host), &port);
+
+    struct sockaddr_in up_addr;
+    nl_proxy_fill_addr(host, port, &up_addr);
+
+    SOCKET ufd = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (ufd == INVALID_SOCKET) return 0;
+
+    // ConnectEx 要求 socket 已绑定本地地址
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port = 0;
+    if (bind(ufd, (struct sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+        closesocket(ufd);
+        return 0;
+    }
+    // 必须在投递 ConnectEx 之前把 socket 关联到 IOCP（completion key = idx），
+    // 否则连接完成的 OVERLAPPED 不会作为完成包出现在引擎消费循环里。
+    if (!CreateIoCompletionPort((HANDLE)ufd, s->iocp, (ULONG_PTR)idx, 0)) {
+        closesocket(ufd);
+        return 0;
+    }
+
+    pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
+    memset(uctx, 0, sizeof(*uctx));
+    uctx->idx = idx;
+    uctx->conn_id = s->pr_conn_id[idx];
+    uctx->ev  = IOCP_EV_UPSTREAM_CONNECT;
+    uctx->sock = ufd;
+
+    BOOL ok = pfn(ufd, (struct sockaddr*)&up_addr, (int)sizeof(up_addr),
+                  NULL, 0, NULL, &uctx->ov);
+    if (!ok && WSAGetLastError() != WSA_IO_PENDING) {
+        closesocket(ufd);
+        return 0;
+    }
+    // 占位：连接完成前该 fd 不参与读/写
+    s->pr_fd_upstream[idx] = ufd;
+    return 1;
+}
+
+// 同步连接上游（回退路径；扩展不可用或 ConnectEx 投递失败时使用）
+static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route) {
+    char host[512];
+    int port = 0;
+    nl_proxy_resolve_upstream(route, host, sizeof(host), &port);
+
+    struct sockaddr_in up_addr;
+    nl_proxy_fill_addr(host, port, &up_addr);
 
     SOCKET up_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (up_sock == INVALID_SOCKET) return INVALID_SOCKET;
@@ -3653,30 +3935,12 @@ static SOCKET nl_proxy_connect_upstream(const nl_web_route_t* route) {
         return INVALID_SOCKET;
     }
 
-    // 完成反代：HTTPS 上游需要 TLS 握手。优先通过扩展系统动态发现 TLS 握手钩子，
-    // 取代原先依赖 #ifdef NL_HTTPS_ENABLE 的编译期死代码（核心库默认不定义该宏）。
-    if (proto == NL_PROXY_HTTPS) {
-        int tls_ok = 0;
-#ifdef NL_HTTPS_ENABLE
-        extern int nl_tls_handshake(int sock, const char* host);
-        tls_ok = nl_tls_handshake((int)up_sock, host);
-#else
-        extern void* nl_extension_get_func_by_id(const char* ext_id, const char* func_name);
-        /* 尝试取 HTTPS 扩展的 TLS 握手钩子（如扩展导出 nl_tls_handshake） */
-        void* handshake_fn = nl_extension_get_func_by_id("https", "nl_tls_handshake");
-        if (handshake_fn) {
-            typedef int (*nl_tls_handshake_fn)(int, const char*);
-            tls_ok = ((nl_tls_handshake_fn)handshake_fn)((int)up_sock, host);
-        }
-#endif
-        if (!tls_ok) {
-            windows_log(NL_LOG_WARN, "proxy: TLS not available for upstream %s, falling back to plaintext", host);
-        }
-    }
-
+    nl_proxy_tls_wrap(up_sock, host, route->protocol);
     return up_sock;
 }
 
+#ifdef NETLEAF_LEGACY_WORKER_POOL
+// 旧版阻塞式单连接处理（仅 legacy worker 池/单线程回退使用，默认构建不编译）
 static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
     char buffer[8192];
     int received = recv(client, buffer, sizeof(buffer) - 1, 0);
@@ -3907,44 +4171,36 @@ static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
     send_http_error(client, 404, "Not Found");
     closesocket(client);
 }
+#endif /* NETLEAF_LEGACY_WORKER_POOL */
 
-static DWORD WINAPI nl_worker_thread(LPVOID arg) {
-    nl_web_server_t* server = (nl_web_server_t*)arg;
-    while (server->running) {
-        SOCKET client = accept(server->sock, NULL, NULL);
-        if (client == INVALID_SOCKET) {
-            Sleep(10);
-            continue;
-        }
-        nl_handle_client(server, client);
-    }
-    return 0;
+#ifdef NETLEAF_LEGACY_WORKER_POOL
+// worker 线程回调适配（模块不依赖 nl_web_server_t 结构体）
+static void nl_web_client_dispatch(void* owner, SOCKET client) {
+    nl_handle_client((nl_web_server_t*)owner, client);
 }
 
 static DWORD WINAPI web_server_thread(LPVOID arg) {
     nl_web_server_t* server = (nl_web_server_t*)arg;
 
-    // 启动 worker 线程池
-    for (int i = 0; i < server->worker_count; i++) {
-        server->workers[i] = CreateThread(NULL, 0, nl_worker_thread, server, 0, NULL);
-        if (!server->workers[i]) {
-            server->worker_count = i;
-            break;
-        }
-    }
-    server->worker_active = 1;
+    // 可选模块：仅当显式启用 legacy worker 池且配置了 worker_count 时启动线程池
+    if (server->worker_count > 0 && server->workers) {
+        nl_worker_pool_ctx_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.sock          = server->sock;
+        ctx.running       = &server->running;
+        ctx.handles       = server->workers;
+        ctx.capacity      = server->worker_capacity;
+        ctx.handle_client = nl_web_client_dispatch;
+        ctx.owner         = server;
 
-    // 若 worker 全部启动成功，则 accept 线程退出，让 worker 承担所有连接
-    if (server->worker_count > 0) {
-        for (int i = 0; i < server->worker_count; i++) {
-            if (server->workers && server->workers[i]) {
-                WaitForSingleObject(server->workers[i], INFINITE);
-                CloseHandle(server->workers[i]);
-                server->workers[i] = NULL;
-            }
+        int started = nl_worker_pool_start(&ctx, server->worker_count);
+        if (started > 0) {
+            server->worker_active = 1;
+            nl_worker_pool_join(&ctx, started);
+            server->worker_active = 0;
+            server->worker_count  = 0;
+            return 0;
         }
-        server->worker_active = 0;
-        return 0;
     }
 
     // 回退：worker 未启动（启动失败或 worker_count=0），accept 线程自己承担主 accept 循环
@@ -3959,6 +4215,7 @@ static DWORD WINAPI web_server_thread(LPVOID arg) {
 
     return 0;
 }
+#endif /* NETLEAF_LEGACY_WORKER_POOL */
 
 nl_web_server_t* nl_web_create(int port) {
     init_web_mutex();
@@ -4033,6 +4290,7 @@ void nl_web_destroy(nl_web_server_t* server) {
         closesocket(server->pr_accept_client);
         server->pr_accept_client = INVALID_SOCKET;
     }
+    free(server->pr_accept_addr); server->pr_accept_addr = NULL;
     free(server->pr_iocp_client_ctx); server->pr_iocp_client_ctx = NULL;
     free(server->pr_iocp_up_ctx);     server->pr_iocp_up_ctx     = NULL;
     free(server->pr_iocp_cw_ctx);     server->pr_iocp_cw_ctx     = NULL;
@@ -4054,6 +4312,7 @@ void nl_web_destroy(nl_web_server_t* server) {
     free(server->pr_up_key);      server->pr_up_key      = NULL;
     free(server->pr_up_pend);     server->pr_up_pend     = NULL;
     free(server->pr_up_pend_len); server->pr_up_pend_len = NULL;
+    free(server->pr_up_req_len);  server->pr_up_req_len  = NULL;
     free(server->pr_last_active_ms); server->pr_last_active_ms = NULL;  // P7 兜底（引擎正常退出时已 free+置 NULL）
     free(server->pr_conn_id);        server->pr_conn_id        = NULL;  // slot 复用竞态防护 兜底
     if (server->up_pool) { pool_destroy(server->up_pool); free(server->up_pool); server->up_pool = NULL; }
@@ -4088,9 +4347,10 @@ int nl_web_start(nl_web_server_t* server) {
     }
     
     server->running = 1;
-    // 数据驱动检测：是否存在反向代理路由，有则起 select 多路复用引擎（单线程泵 N 连接），
-    // 否则回退 worker 池。
-    // P5: force_legacy_pool=1 强制走 worker 池（回退开关）
+    // 数据驱动检测：是否存在反向代理路由。
+#ifdef NETLEAF_LEGACY_WORKER_POOL
+    // 旧版阻塞 worker 池（可选模块）：仅代理路由走 IOCP 引擎，其余走 worker 池；
+    // force_legacy_pool=1 时强制整站走 worker 池（含代理）。
     int has_proxy = 0;
     EnterCriticalSection(&server->mutex);
     for (nl_web_route_t* r = server->routes; r; r = r->next)
@@ -4107,9 +4367,8 @@ int nl_web_start(nl_web_server_t* server) {
         windows_log(NL_LOG_INFO, "Web server (proxy engine) started on port %d", server->port);
         return NL_OK;
     }
-    // 全动态化：worker 池容量按需分配。未显式设置时用 WEB_WORKER_DEFAULT。
-    // 保留 64 上限（线程栈资源上限）防止误配置；worker_count 为 0 时由
-    // web_server_thread 回退到 accept 线程自处理连接。
+    // worker 池容量按需分配。未显式设置时用 WEB_WORKER_DEFAULT（上限 64）。
+    // worker_count 为 0 时由 web_server_thread 回退到 accept 线程自处理连接。
     int target = server->worker_count > 0 ? server->worker_count : WEB_WORKER_DEFAULT;
     if (target > 64) target = 64;
     if (server->worker_capacity < target) {
@@ -4130,9 +4389,21 @@ int nl_web_start(nl_web_server_t* server) {
         closesocket(server->sock);
         return NL_ERROR;
     }
-    
+
     windows_log(NL_LOG_INFO, "Web server started on port %d", server->port);
     return NL_OK;
+#else
+    // 默认构建：不含 legacy worker 池，本地路由 + 代理路由统一由 IOCP 引擎处理
+    // （引擎内置 PR_ROLE_LOCAL，见 pr_iocp_handle_completion 的 CONTENT/FILE/REDIRECT 分支）。
+    server->thread = CreateThread(NULL, 0, nl_web_proxy_engine_thread, server, 0, NULL);
+    if (!server->thread) {
+        server->running = 0;
+        closesocket(server->sock);
+        return NL_ERROR;
+    }
+    windows_log(NL_LOG_INFO, "Web server (IOCP engine) started on port %d", server->port);
+    return NL_OK;
+#endif
 }
 
 // 全动态化：运行时调整 worker 池目标容量（0 = 关闭池，回退 accept 线程自处理）。
