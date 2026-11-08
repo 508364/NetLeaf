@@ -1,5 +1,21 @@
 # NetLeaf 版本历史
 
+## v3.0.1（2026-11-08）
+
+### LinkAgg 反向数据池（第166轮）
+
+- 链路聚合改为“宿主主动拉取”：接入请求按端点入池，`nl_lagg_pull()` 拉取、`nl_lagg_request_respond()` 回送；客户端等待超时后重试一次，仍超时标记端点异常并返回 503，宿主恢复拉取后自动转健康
+- 新增 `nl_lagg_get_backend_health` / `nl_lagg_set_pull_timeout` / `nl_lagg_get_pool_endpoint` / `nl_lagg_set_pool_service`
+- 跨进程数据池服务（FETCH/RESP 协议），Windows 命名管道改为字节模式 + 64KB 缓冲，服务端 accept 改用已连接实例并为下一次 accept 预创建实例
+- 三平台重复实现合并为 `src/linkagg/netleaf_linkagg_core.c` 单份共享核心（删除 linux/windows/macos 三个平台副本，减少约 47KB 重复代码）；`nl_lagg_start()` 改为非阻塞启动监听线程
+- 新增回归测试 `test/test_linkagg_pull.c`：正常拉取/响应、超时 503 + 健康标记、恢复健康
+
+### TLS2/TLS3 异步模式
+
+- 新增 `nl_tls2_set_nonblocking` / `nl_tls3_set_nonblocking`（含 `is_nonblocking`）
+- 异步模式下握手/收发不再内部 select 等待，直接返回 `WANT_READ` / `WANT_WRITE`，由调用方事件循环驱动；同步行为保持不变
+- 修复 `handshake()` 因 `setup_done` 未置位而始终返回 INVALID_STATE 的问题
+
 ## v3.0.0
 
 > 本版本为大版本升级（2.4.2 → 3.0.0），涵盖 Web 引擎全异步重构（P1-P12）、HTTP/2 协议层补完、HTTPS/2、Windows 通用服务器全 IOCP 化等。版本号升级同步 19 个文件（CMakeLists、netleaf.h、9 个模块头 15 处版本宏、3 个内部头副本、docs/*.md、PROJECT_STRUCTURE.md）。

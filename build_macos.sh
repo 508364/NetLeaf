@@ -19,7 +19,7 @@
 # ============================================================
 set -uo pipefail
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -130,6 +130,8 @@ build_macos() {
     for f in "$SCRIPT_DIR"/include/*.h; do
         cp -f "$f" "$pkg/" 2>/dev/null || true
     done
+    # 子目录头文件（include/optimize）需保留相对路径
+    cp -rf "$SCRIPT_DIR"/include/optimize "$pkg/" 2>/dev/null || true
     shopt -u nullglob
     tar -czf "${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz" -C "$pkg" . 2>/dev/null || true
     rm -rf "$pkg"

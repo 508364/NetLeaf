@@ -13,7 +13,7 @@
 # ============================================================
 set -uo pipefail
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -181,6 +181,8 @@ package_arch() {
     for f in "${SCRIPT_DIR}"/include/*.h; do
         cp -f "$f" "${pkg_tmp}/" 2>/dev/null || true
     done
+    # 子目录头文件（include/optimize）需保留相对路径
+    cp -rf "${SCRIPT_DIR}"/include/optimize "${pkg_tmp}/" 2>/dev/null || true
     shopt -u nullglob
 
     tar -czf "${out}" -C "${pkg_tmp}" . 2>/dev/null || true

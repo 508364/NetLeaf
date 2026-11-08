@@ -17,7 +17,7 @@
 # ============================================================
 set -uo pipefail
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 MIN_SDK="21"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_ROOT="${SCRIPT_DIR}/build-android"
@@ -169,6 +169,8 @@ for abi in "${TARGETS[@]}"; do
     for f in "$SCRIPT_DIR"/include/*.h; do
         cp -f "$f" "$STAGE/" || true
     done
+    # 子目录头文件（include/optimize）需保留相对路径
+    cp -rf "$SCRIPT_DIR"/include/optimize "$STAGE/" 2>/dev/null || true
     shopt -u nullglob
     echo -e "${GREEN}[OK] $abi -> $STAGE${NC}"
 done

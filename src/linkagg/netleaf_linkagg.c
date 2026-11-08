@@ -140,7 +140,7 @@ const char* nl_lagg_get_port_id(nl_lagg_server_t* server) {
 
 // Stub implementations for module info functions
 int nl_lagg_is_available(void) {
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     return 1;
 #else
     return 0;
@@ -167,11 +167,12 @@ static nl_module_info_t g_linkagg_module_info = {
     .type = NL_MODULE_LINKAGG,
     .name = "linkagg",
     .version = NL_LINKAGG_VERSION,
-    .capabilities = NL_CAP_SERVER | NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_WIN | NL_CAP_PLATFORM_LINUX,
+    .capabilities = NL_CAP_SERVER | NL_CAP_THREAD_SAFE |
+                    NL_CAP_PLATFORM_WIN | NL_CAP_PLATFORM_LINUX | NL_CAP_PLATFORM_MACOS,
     .status = NL_MODULE_STATUS_UNINITIALIZED,
     .platform_windows = 1,
     .platform_linux = 1,
-    .platform_macos = 0,
+    .platform_macos = 1,
     .init = linkagg_init,
     .shutdown = linkagg_shutdown,
     .is_available = nl_lagg_is_available,
@@ -191,7 +192,7 @@ nl_module_info_t* nl_lagg_get_module_info(void) {
 
 NL_EXTENSION_DEFINE(linkagg, "LinkAgg", NL_LINKAGG_VERSION, "508364",
     "Same-port link aggregation and load balancing",
-    "Windows,Linux",
+    "Windows,Linux,macOS",
     NL_CAP_SERVER | NL_CAP_THREAD_SAFE,
     NULL, NULL, nl_lagg_is_available, nl_lagg_version);
 
@@ -199,8 +200,4 @@ nl_extension_info_t* nl_lagg_get_extension_info(void) {
     return &nl_extension_info_linkagg;
 }
 
-// Stub implementations - platform files override these
-// The real implementations are in netleaf_linkagg_windows.c / netleaf_linkagg_linux.c
-
-// These symbols will be linked from platform-specific object files
-// when building with BUILD_LINKAGG=ON
+// 平台相关的 socket / 线程实现统一在 netleaf_linkagg_core.c（三平台共享核心）中

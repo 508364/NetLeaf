@@ -133,6 +133,7 @@ struct nl_tls3_ctx {
     int                       is_server;
     int                       use_dtls;
     int                       handshake_timeout_ms;   // 配置的握手超时(0 = 无限等待)
+    int                       nonblocking;           // 异步模式：立即返回 WANT_READ/WRITE
     int                       rng_seeded;
     int                       crl_loaded;
     int                       cache_inited;
@@ -570,8 +571,43 @@ int nl_tls3_set_sni_callback(nl_tls3_ctx_t* ctx, nl_tls3_sni_cb cb, void* user_d
     return NL_TLS3_OK;
 }
 
+// 单步握手：把 mbedTLS 的 WANT 语义映射为公共错误码，供同步/异步共用
+static int nl_tls3_handshake_once(nl_tls3_ctx_t* ctx) {
+    int ret = mbedtls_ssl_handshake(&ctx->ssl);
+    if (ret == 0) {
+        ctx->handshaked = 1;
+        if (ctx->use_dtls) {
+            mbedtls_ssl_set_timer_cb(&ctx->ssl, &ctx->dtls_timer,
+                                     nl_tls3_timer_set, nl_tls3_timer_get);
+        }
+        if (ctx->offered) ctx->reused = 0;
+        return NL_TLS3_OK;
+    }
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ)  return NL_TLS3_WANT_READ;
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) return NL_TLS3_WANT_WRITE;
+    return ret == MBEDTLS_ERR_SSL_CONN_EOF ? NL_TLS3_READ : NL_TLS3_HANDSHAKE;
+}
+
+int nl_tls3_set_nonblocking(nl_tls3_ctx_t* ctx, int enable) {
+    if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
+    ctx->nonblocking = enable ? 1 : 0;
+    return NL_TLS3_OK;
+}
+
+int nl_tls3_is_nonblocking(const nl_tls3_ctx_t* ctx) {
+    return ctx ? ctx->nonblocking : 0;
+}
+
 int nl_tls3_handshake_ex(nl_tls3_ctx_t* ctx, int sock, int timeout_ms) {
     if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
+
+    /* 异步模式下允许连续调用以推进一步握手：
+     * 已为同一 socket 完成 setup 且尚未握手成功时，不再重建 ssl 状态。 */
+    if (ctx->nonblocking && ctx->setup_done &&
+        ctx->server_fd.fd == sock && !ctx->handshaked) {
+        int r = nl_tls3_handshake_once(ctx);
+        return r;
+    }
 
     /* 绑定 ssl 与 conf：mbedtls_ssl_handshake 要求 ssl->conf 非空，
      * 否则返回 MBEDTLS_ERR_SSL_BAD_INPUT_DATA(-0x7100)。
@@ -602,75 +638,44 @@ int nl_tls3_handshake_ex(nl_tls3_ctx_t* ctx, int sock, int timeout_ms) {
                         mbedtls_net_send, mbedtls_net_recv,
                         ctx->use_dtls ? mbedtls_net_recv_timeout : NULL);
 
-    ctx->setup_done = 0;
+    ctx->setup_done = 1;
     ctx->handshaked = 0;
+
+    // 异步模式：只推进一步，把等待交给调用方的事件循环
+    if (ctx->nonblocking) {
+        return nl_tls3_handshake_once(ctx);
+    }
 
     if (ctx->is_server) {
         mbedtls_net_set_nonblock(&ctx->server_fd);
-        do {
-            ret = mbedtls_ssl_handshake(&ctx->ssl);
-            if (ret == 0) break;
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-                ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                return ret == MBEDTLS_ERR_SSL_CONN_EOF ? NL_TLS3_READ : NL_TLS3_HANDSHAKE;
-            }
-            if (ctx->use_dtls) {
-                ctx->dtls_timer.int_ms = 0;
-                ctx->dtls_timer.fin_ms = 0;
-                if (timeout_ms > 0) {
-                    ctx->dtls_timer.start_ms = nl_tls3_now_ms();
-                    ctx->dtls_timer.fin_ms   = timeout_ms;
-                }
-            }
-            int wr = ret == MBEDTLS_ERR_SSL_WANT_WRITE ? 1 : 0;
-            if (timeout_ms >= 0) {
-                if (nl_tls3_sock_wait(ctx->server_fd.fd, wr, timeout_ms) <= 0) {
-                    return NL_TLS3_TIMEOUT;
-                }
-            }
-        } while (1);
-    } else {
-        do {
-            ret = mbedtls_ssl_handshake(&ctx->ssl);
-            if (ret == 0) break;
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-                ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                return ret == MBEDTLS_ERR_SSL_CONN_EOF ? NL_TLS3_READ : NL_TLS3_HANDSHAKE;
-            }
-            if (ctx->use_dtls) {
-                ctx->dtls_timer.int_ms = 0;
-                ctx->dtls_timer.fin_ms = 0;
-                if (timeout_ms > 0) {
-                    ctx->dtls_timer.start_ms = nl_tls3_now_ms();
-                    ctx->dtls_timer.fin_ms   = timeout_ms;
-                }
-            }
-            int wr = ret == MBEDTLS_ERR_SSL_WANT_WRITE ? 1 : 0;
-            if (timeout_ms >= 0) {
-                if (nl_tls3_sock_wait(ctx->server_fd.fd, wr, timeout_ms) <= 0) {
-                    return NL_TLS3_TIMEOUT;
-                }
-            }
-        } while (1);
     }
 
-    ctx->handshaked = 1;
-    // mbedTLS 3.x 移除了 mbedtls_ssl_session_id_reset，
-    // 通过比较当前会话与 offer 会话的 id 是否一致来推断是否命中缓存
-    // （命中时会话被更新，未命中则保留 offer 的 id）
-    if (ctx->offered) {
-        ctx->reused = 0; // 3.x 下不再可靠区分 session-resume 状态，保持 0
+    while (1) {
+        int r = nl_tls3_handshake_once(ctx);
+        if (r == NL_TLS3_OK) break;
+        if (r != NL_TLS3_WANT_READ && r != NL_TLS3_WANT_WRITE) return r;
+
+        if (ctx->use_dtls) {
+            ctx->dtls_timer.int_ms = 0;
+            ctx->dtls_timer.fin_ms = 0;
+            if (timeout_ms > 0) {
+                ctx->dtls_timer.start_ms = nl_tls3_now_ms();
+                ctx->dtls_timer.fin_ms   = timeout_ms;
+            }
+        }
+        int wr = r == NL_TLS3_WANT_WRITE ? 1 : 0;
+        if (timeout_ms >= 0) {
+            if (nl_tls3_sock_wait(ctx->server_fd.fd, wr, timeout_ms) <= 0) {
+                return NL_TLS3_TIMEOUT;
+            }
+        }
     }
-    if (ctx->use_dtls) {
-        mbedtls_ssl_set_timer_cb(&ctx->ssl, &ctx->dtls_timer,
-                                 nl_tls3_timer_set, nl_tls3_timer_get);
-    }
+
     return NL_TLS3_OK;
 }
 
 int nl_tls3_handshake(nl_tls3_ctx_t* ctx, int sock) {
     if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
-    if (!ctx->setup_done) return NL_TLS3_INVALID_STATE;
     /* 使用 configure() 保存的超时；0 = 无限等待(handshake_ex 用 <0 表示)。
      * 直接传 0 会让 select 以零超时轮询，首个 WANT_READ 即误报超时。 */
     int timeout_ms = ctx->handshake_timeout_ms > 0 ? ctx->handshake_timeout_ms : -1;
@@ -680,6 +685,14 @@ int nl_tls3_handshake(nl_tls3_ctx_t* ctx, int sock) {
 int nl_tls3_send(nl_tls3_ctx_t* ctx, const void* buf, size_t len) {
     if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
     if (!ctx->handshaked) return NL_TLS3_INVALID_STATE;
+    if (ctx->nonblocking) {
+        int r = mbedtls_ssl_write(&ctx->ssl, (const unsigned char*)buf, (int)len);
+        if (r >= 0) return r;
+        if (r == MBEDTLS_ERR_SSL_WANT_READ)  return NL_TLS3_WANT_READ;
+        if (r == MBEDTLS_ERR_SSL_WANT_WRITE) return NL_TLS3_WANT_WRITE;
+        if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return NL_TLS3_READ;
+        return NL_TLS3_WRITE;
+    }
     int ret;
     do {
         ret = mbedtls_ssl_write(&ctx->ssl, (const unsigned char*)buf, (int)len);
@@ -698,6 +711,13 @@ int nl_tls3_send(nl_tls3_ctx_t* ctx, const void* buf, size_t len) {
 int nl_tls3_recv(nl_tls3_ctx_t* ctx, void* buf, size_t len) {
     if (!ctx || !ctx->initialized) return NL_TLS3_INVALID_STATE;
     if (!ctx->handshaked) return NL_TLS3_INVALID_STATE;
+    if (ctx->nonblocking) {
+        int r = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf, (int)len);
+        if (r >= 0) return r;
+        if (r == MBEDTLS_ERR_SSL_WANT_READ)  return NL_TLS3_WANT_READ;
+        if (r == MBEDTLS_ERR_SSL_WANT_WRITE) return NL_TLS3_WANT_WRITE;
+        return NL_TLS3_READ;
+    }
     int ret;
     do {
         ret = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf, (int)len);

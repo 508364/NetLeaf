@@ -259,6 +259,16 @@ NL_TLS3_API int nl_tls3_handshake(nl_tls3_ctx_t* ctx, int sock);
 NL_TLS3_API int nl_tls3_handshake_ex(nl_tls3_ctx_t* ctx, int sock, int timeout_ms);
 
 /**
+ * @brief 切换异步(非阻塞)模式。
+ *
+ * 启用后 handshake_ex / send / recv 不再内部 select 等待，而是立即返回
+ * NL_TLS3_WANT_READ 或 NL_TLS3_WANT_WRITE，由调用方自行 poll/epoll 驱动，
+ * 避免在事件循环线程中阻塞。
+ */
+NL_TLS3_API int nl_tls3_set_nonblocking(nl_tls3_ctx_t* ctx, int enable);
+NL_TLS3_API int nl_tls3_is_nonblocking(const nl_tls3_ctx_t* ctx);
+
+/**
  * @brief Send data through TLS3 connection
  */
 NL_TLS3_API int nl_tls3_send(nl_tls3_ctx_t* ctx, const void* buf, size_t len);

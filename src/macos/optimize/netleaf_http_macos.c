@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <signal.h>
@@ -134,6 +135,22 @@ static void* http2_client_thread(void* arg) {
     return NULL;
 }
 
+/* 明文 H1 传输回调：ctx 指向会话内保持有效的 fd。 */
+static long nlh_plain_recv_cb(void* ctx, char* buf, size_t len) {
+    return (long)read(*(int*)ctx, buf, len);
+}
+
+static int nlh_plain_write_cb(void* ctx, const char* data, size_t len) {
+    int fd = *(int*)ctx;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 typedef struct {
     int client_fd;
     nl_http_server_t* server;
@@ -145,32 +162,21 @@ static void* http1_client_thread(void* arg) {
     nl_http_server_t* server = args->server;
     free(args);
 
-    /* 读取单个完整 HTTP/1 请求到 buf（容量 cap）。成功返回实际读取字节数，
-     * 连接关闭/出错返回 <=0。配合 nl_http_find_terminator 做增量解析。 */
-    long nl_http_read_request_mac(int fd, char* buf, size_t cap, size_t* total) {
-        *total = 0;
-        while (*total < cap - 1) {
-            ssize_t n = read(fd, buf + *total, cap - 1 - *total);
-            if (n <= 0) return *total;
-            *total += (size_t)n;
-            buf[*total] = '\0';
-            if (nl_http_find_terminator(buf, *total) != -1) return (long)*total;
-        }
-        return (long)*total;
-    }
-
     /* 取长补短：旧路径（核心库 nl_handle_client）支持 keep-alive 连接复用，
      * 新路径原先"读完即 close"。此处改为 Connection 感知：默认 keep-alive，
      * 请求头显式指定 close 或为 HTTP/1.0 无 keep-alive 时关闭。 */
     int keep_alive = 1;
     while (keep_alive) {
-        char buffer[BUFFER_SIZE];
         size_t total = 0;
-        long got = nl_http_read_request_mac(client_fd, buffer, sizeof(buffer), &total);
-        if (got <= 0 || total == 0) break;
+        /* 读满整个请求（头部 + Content-Length body），与 TLS 会话保持一致 */
+        char* buffer = nl_http_read_request_full(nlh_plain_recv_cb, &client_fd,
+                                                 BUFFER_SIZE, NL_HTTP_MAX_REQUEST,
+                                                 &total);
+        if (!buffer || total == 0) { free(buffer); break; }
 
         nl_http_request_t req;
         nl_http_response_t resp;
+        memset(&req, 0, sizeof(req));
         memset(&resp, 0, sizeof(resp));
         resp.status = 200;
         int parsed = 0;
@@ -203,7 +209,16 @@ static void* http1_client_thread(void* arg) {
             free(response_data);
         }
 
+        /* 文件响应：头部已带 Content-Length，正文在此分块发出 */
+        if (resp.file_path) {
+            nl_http_stream_file_chunks(resp.file_path, resp.file_size,
+                                       nlh_plain_write_cb, &client_fd);
+            free(resp.file_path);
+            resp.file_path = NULL;
+        }
+        if (resp.body) free(resp.body);
         if (req.body) free(req.body);
+        free(buffer);
     }
 
     close(client_fd);
@@ -224,6 +239,9 @@ static void* server_thread(void* arg) {
 
         if (client_fd >= 0) {
             if (server->enable_http2) {
+                /* H2 需要：禁用 Nagle，避免帧/响应头被 TCP 缓冲拖慢 */
+                int _nd = 1;
+                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &_nd, sizeof(_nd));
                 http2_client_args_t* args = malloc(sizeof(http2_client_args_t));
                 args->client_fd = client_fd;
                 args->handler = server->handler;
@@ -259,6 +277,9 @@ static void* http2_server_thread(void* arg) {
         int client_fd = accept(server->fd, (struct sockaddr*)&client_addr, &client_len);
 
         if (client_fd >= 0) {
+            /* H2 需要：禁用 Nagle，避免帧/响应头被 TCP 缓冲拖慢 */
+            int _nd = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &_nd, sizeof(_nd));
             http2_client_args_t* args = malloc(sizeof(http2_client_args_t));
             args->client_fd = client_fd;
             args->handler = server->handler;

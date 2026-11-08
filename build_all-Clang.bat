@@ -15,7 +15,7 @@ REM   4) common install directories
 REM ============================================================
 
 setlocal enabledelayedexpansion
-set "VERSION=3.0.0"
+set "VERSION=3.0.1"
 set "SRC_DIR=%~dp0"
 set "SRC_DIR=%SRC_DIR:~0,-1%"
 
@@ -157,7 +157,7 @@ mkdir "%PKG%"
 copy /Y "%BDIR%\bin\*.dll" "%PKG%\" >nul 2>nul
 copy /Y "%BDIR%\lib\*.a" "%PKG%\" >nul 2>nul
 copy /Y "%BDIR%\lib\*.dll.a" "%PKG%\" >nul 2>nul
-copy /Y "%SRC_DIR%\include\*.h" "%PKG%\" >nul 2>nul
+xcopy "%SRC_DIR%\include\*" "%PKG%" /E /Y /Q >nul 2>nul
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%PKG%\*' -DestinationPath '%SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-mingw.zip' -Force"
 rmdir /s /q "%PKG%"
 echo [OK] %SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-mingw.zip

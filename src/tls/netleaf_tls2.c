@@ -131,6 +131,7 @@ struct nl_tls2_ctx {
     int                       is_server;                   // 0 = 客户端，1 = 服务端
     int                       use_dtls;                    // 0 = TLS(流)，1 = DTLS(数据报)
     int                       handshake_timeout_ms;        // 配置的握手超时(0 = 无限等待)
+    int                       nonblocking;                 // 异步模式：立即返回 WANT_READ/WRITE
     int                       rng_seeded;
     int                       crl_loaded;
     int                       cache_inited;
@@ -584,8 +585,42 @@ static void nl_tls2_setup_bio(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
     (void)ctx; (void)sock; (void)timeout_ms;
 }
 
+// 单步握手：同步/异步共用，WANT 语义映射为公共错误码
+static int nl_tls2_handshake_once(nl_tls2_ctx_t* ctx) {
+    int ret = mbedtls_ssl_handshake(&ctx->ssl);
+    if (ret == 0) {
+        ctx->handshaked = 1;
+        if (ctx->offered) ctx->reused = 0;
+        if (ctx->use_dtls) {
+            mbedtls_ssl_set_timer_cb(&ctx->ssl, &ctx->dtls_timer,
+                                     nl_tls2_timer_set, nl_tls2_timer_get);
+        }
+        return NL_TLS2_OK;
+    }
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ)  return NL_TLS2_WANT_READ;
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) return NL_TLS2_WANT_WRITE;
+    return ret == MBEDTLS_ERR_SSL_CONN_EOF ? NL_TLS2_READ : NL_TLS2_HANDSHAKE;
+}
+
+int nl_tls2_set_nonblocking(nl_tls2_ctx_t* ctx, int enable) {
+    if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
+    ctx->nonblocking = enable ? 1 : 0;
+    return NL_TLS2_OK;
+}
+
+int nl_tls2_is_nonblocking(const nl_tls2_ctx_t* ctx) {
+    return ctx ? ctx->nonblocking : 0;
+}
+
 int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
     if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
+
+    /* 异步模式：同 socket 且尚未握手成功时，连续调用只推进一步，
+     * 不重建 ssl 状态（把等待交给调用方的事件循环）。 */
+    if (ctx->nonblocking && ctx->setup_done &&
+        ctx->server_fd.fd == sock && !ctx->handshaked) {
+        return nl_tls2_handshake_once(ctx);
+    }
 
     /* 绑定 ssl 与 conf：mbedtls_ssl_handshake 要求 ssl->conf 非空，
      * 否则返回 MBEDTLS_ERR_SSL_BAD_INPUT_DATA(-0x7100)。
@@ -613,84 +648,43 @@ int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms) {
                         mbedtls_net_send, mbedtls_net_recv,
                         ctx->use_dtls ? mbedtls_net_recv_timeout : NULL);
 
-    ctx->setup_done = 0;
+    ctx->setup_done = 1;
     ctx->handshaked = 0;
 
-    int ret;
-    // 根据角色选择 客户端/服务端 握手
-    if (ctx->is_server) {
-        // 服务端：用外部 fd 绑定到 mbedTLS 网络层
-        ctx->server_fd.fd = sock;
-        mbedtls_net_set_nonblock(&ctx->server_fd);
-        int ret;
-        do {
-            ret = mbedtls_ssl_handshake(&ctx->ssl);
-            if (ret == 0) break;
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-                ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                return ret == MBEDTLS_ERR_SSL_CONN_EOF ? NL_TLS2_READ : NL_TLS2_HANDSHAKE;
-            }
-            if (ctx->use_dtls) {
-                ctx->dtls_timer.int_ms = 0;
-                ctx->dtls_timer.fin_ms = 0;
-                if (timeout_ms > 0) {
-                    ctx->dtls_timer.start_ms = nl_tls2_now_ms();
-                    ctx->dtls_timer.fin_ms   = timeout_ms;
-                }
-            }
-            int wr = ret == MBEDTLS_ERR_SSL_WANT_WRITE ? 1 : 0;
-            if (timeout_ms >= 0) {
-                if (nl_tls2_sock_wait(ctx->server_fd.fd, wr, timeout_ms) <= 0) {
-                    return NL_TLS2_TIMEOUT;
-                }
-            }
-        } while (1);
-    } else {
-        int ret;
-        do {
-            ret = mbedtls_ssl_handshake(&ctx->ssl);
-            if (ret == 0) break;
-            if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-                ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                return ret == MBEDTLS_ERR_SSL_CONN_EOF ? NL_TLS2_READ : NL_TLS2_HANDSHAKE;
-            }
-            if (ctx->use_dtls) {
-                ctx->dtls_timer.int_ms = 0;
-                ctx->dtls_timer.fin_ms = 0;
-                if (timeout_ms > 0) {
-                    ctx->dtls_timer.start_ms = nl_tls2_now_ms();
-                    ctx->dtls_timer.fin_ms   = timeout_ms;
-                }
-            }
-            int wr = ret == MBEDTLS_ERR_SSL_WANT_WRITE ? 1 : 0;
-            if (timeout_ms >= 0) {
-                if (nl_tls2_sock_wait(ctx->server_fd.fd, wr, timeout_ms) <= 0) {
-                    return NL_TLS2_TIMEOUT;
-                }
-            }
-        } while (1);
+    if (ctx->nonblocking) {
+        return nl_tls2_handshake_once(ctx);
     }
 
-    ctx->handshaked = 1;
-    if (ctx->offered) {
-        /* mbedTLS 2.28 无 mbedtls_ssl_session_id_reset；与 tls3 一致，
-         * 3.x/2.x 下不再可靠区分 session-resume，保持 0 */
-        ctx->reused = 0;
+    if (ctx->is_server) {
+        mbedtls_net_set_nonblock(&ctx->server_fd);
     }
-    if (ctx->use_dtls) {
-        // 绑定 DTLS 定时器回调
-        mbedtls_ssl_set_timer_cb(&ctx->ssl, &ctx->dtls_timer,
-                                 nl_tls2_timer_set, nl_tls2_timer_get);
+
+    while (1) {
+        int r = nl_tls2_handshake_once(ctx);
+        if (r == NL_TLS2_OK) break;
+        if (r != NL_TLS2_WANT_READ && r != NL_TLS2_WANT_WRITE) return r;
+
+        if (ctx->use_dtls) {
+            ctx->dtls_timer.int_ms = 0;
+            ctx->dtls_timer.fin_ms = 0;
+            if (timeout_ms > 0) {
+                ctx->dtls_timer.start_ms = nl_tls2_now_ms();
+                ctx->dtls_timer.fin_ms   = timeout_ms;
+            }
+        }
+        int wr = r == NL_TLS2_WANT_WRITE ? 1 : 0;
+        if (timeout_ms >= 0) {
+            if (nl_tls2_sock_wait(ctx->server_fd.fd, wr, timeout_ms) <= 0) {
+                return NL_TLS2_TIMEOUT;
+            }
+        }
     }
+
     return NL_TLS2_OK;
 }
 
 int nl_tls2_handshake(nl_tls2_ctx_t* ctx, int sock) {
     if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
-    if (!ctx->setup_done) {
-        // 必须已 configure
-        return NL_TLS2_INVALID_STATE;
-    }
     /* 使用 configure() 保存的超时；0 = 无限等待(handshake_ex 用 <0 表示)。
      * 直接传 0 会让 select 以零超时轮询，首个 WANT_READ 即误报超时。 */
     int timeout_ms = ctx->handshake_timeout_ms > 0 ? ctx->handshake_timeout_ms : -1;
@@ -700,6 +694,14 @@ int nl_tls2_handshake(nl_tls2_ctx_t* ctx, int sock) {
 int nl_tls2_send(nl_tls2_ctx_t* ctx, const void* buf, size_t len) {
     if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
     if (!ctx->handshaked) return NL_TLS2_INVALID_STATE;
+    if (ctx->nonblocking) {
+        int r = mbedtls_ssl_write(&ctx->ssl, (const unsigned char*)buf, (int)len);
+        if (r >= 0) return r;
+        if (r == MBEDTLS_ERR_SSL_WANT_READ)  return NL_TLS2_WANT_READ;
+        if (r == MBEDTLS_ERR_SSL_WANT_WRITE) return NL_TLS2_WANT_WRITE;
+        if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return NL_TLS2_READ;
+        return NL_TLS2_WRITE;
+    }
     int ret;
     do {
         ret = mbedtls_ssl_write(&ctx->ssl, (const unsigned char*)buf, (int)len);
@@ -718,6 +720,13 @@ int nl_tls2_send(nl_tls2_ctx_t* ctx, const void* buf, size_t len) {
 int nl_tls2_recv(nl_tls2_ctx_t* ctx, void* buf, size_t len) {
     if (!ctx || !ctx->initialized) return NL_TLS2_INVALID_STATE;
     if (!ctx->handshaked) return NL_TLS2_INVALID_STATE;
+    if (ctx->nonblocking) {
+        int r = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf, (int)len);
+        if (r >= 0) return r;
+        if (r == MBEDTLS_ERR_SSL_WANT_READ)  return NL_TLS2_WANT_READ;
+        if (r == MBEDTLS_ERR_SSL_WANT_WRITE) return NL_TLS2_WANT_WRITE;
+        return NL_TLS2_READ;
+    }
     int ret;
     do {
         ret = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf, (int)len);

@@ -2,7 +2,7 @@
   <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
   <h1>NetLeaf</h1>
   <p><b>NetLeaf</b> 是一个现代化的、高性能的跨平台网络库（Windows/Linux/macOS/Android），采用 <b>NL扩展系统</b> 架构。提供 TCP/UDP、HTTP/1.1 + HTTP/2、WebSocket、MQTT v5.0 协议支持，内置全异步 Web 引擎、TLS/SSL 加密、智能路由、多语言等扩展模块。</p>
-  <img src="https://img.shields.io/badge/NetLeaf-v3.0.0-blue?style=for-the-badge" alt="NetLeaf Version">
+  <img src="https://img.shields.io/badge/NetLeaf-v3.0.1-blue?style=for-the-badge" alt="NetLeaf Version">
   <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
   <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28/3.6-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
   <a href="https://mqttt.com"><img src="https://img.shields.io/badge/MQTT-5.0/3.1.1-yellow?style=for-the-badge" alt="MQTT v5.0/3.1.1"></a>
@@ -286,6 +286,13 @@ ctest --test-dir build --output-on-failure
 
 ## 更新日志
 
+### v3.0.1（2026-11-08）
+
+- **LinkAgg 反向数据池**：链路聚合改为"宿主主动拉取"——接入请求按端点入池，`nl_lagg_pull()` 拉取、`nl_lagg_request_respond()` 回送；客户端等待超时后重试一次，仍超时标记端点异常并返回 503，宿主恢复拉取后自动转健康
+- **TLS2/TLS3 非阻塞异步**：新增 `nl_tls2_set_nonblocking()` / `nl_tls3_set_nonblocking()`，握手/收发直接返回 `WANT_READ`/`WANT_WRITE` 由事件循环驱动；修复 `handshake()` 始终返回 INVALID_STATE 的问题
+- **公共代码提取**：三平台 LinkAgg 重复实现合并为单份共享核心 `netleaf_linkagg_core.c`（约省 47KB）；`nl_lagg_start()` 改为非阻塞启动
+- **Windows 命名管道字节模式**：64KB 缓冲，任意大小载荷正常收发；新增回归测试 `test_linkagg_pull`
+
 ### v3.0.0（2026-10-31）
 
 - **Web 引擎全异步重构（P1-P12）**：`nl_web_engine_t` 事件引擎 + 流式 body/chunked + 多实例 + 30s 空闲扫描；P8 压测（PROXY 超 legacy 池、10MB 文件 RSS -97%）；P10 sendfile/TransmitFile 零拷贝（3.3~5.9x）；P11 macOS/Windows 对齐；P12 测试体系（9 用例，ASan/TSan 全过）
@@ -300,6 +307,7 @@ ctest --test-dir build --output-on-failure
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
+| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE |
 | 3.0.0 | 2026-10-31 | Web 引擎全异步重构（sendfile 零拷贝、多实例、测试体系）；HTTP/2 补完；HTTPS/2；Windows 全 IOCP 化 + UDP 16 槽接收环；QUIC 拆出独立扩展 |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS 重构（`netleaf_https` 独立、tls2/tls3 拆分）；MQTT 默认开启；`nl_util` 公共工具层；H2/QUIC 帧补全；Android 构建支持 |
 | 2.4.1 | 2026-09-24 | Lang 错误码接入多语言、动态/外部变量；清理编译告警；全平台交叉编译 |

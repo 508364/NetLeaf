@@ -1,11 +1,11 @@
 # NetLeaf - CMake Build Configuration (Pure C)
-# NL扩展系统 v3.0.0
+# NL扩展系统 v3.0.1
 # 架构: 核心库 + 独立扩展，运行时自动加载
 # 说明: 各扩展模块的目标定义已拆分到 src/<模块>/CMakeLists.txt，
 #       本文件仅负责核心库、模块装配（add_subdirectory）以及示例与测试。
 
 cmake_minimum_required(VERSION 3.14)
-project(netleaf VERSION 3.0.0 DESCRIPTION "NetLeaf - A Modern High-Performance Network Library" HOMEPAGE_URL "https://github.com/508364/netleaf" LANGUAGES C)
+project(netleaf VERSION 3.0.1 DESCRIPTION "NetLeaf - A Modern High-Performance Network Library" HOMEPAGE_URL "https://github.com/508364/netleaf" LANGUAGES C)
 
 # Allow overriding the C compiler via CC environment variable or cmake -DCMAKE_C_COMPILER=...
 # This supports LLVM-MinGW (clang.exe), MSVC (cl.exe), and any other toolchain.
@@ -15,7 +15,7 @@ if(NOT CMAKE_C_COMPILER)
     endif()
 endif()
 
-set(NETLEAF_VERSION_STRING "3.0.0-00000000")
+set(NETLEAF_VERSION_STRING "${PROJECT_VERSION}")
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)

@@ -16,7 +16,7 @@ REM Output: build-android\<abi>\stage-lib\  (libnetleaf*.so + public headers)
 REM ============================================================
 
 setlocal enabledelayedexpansion
-set "VERSION=3.0.0"
+set "VERSION=3.0.1"
 set "MIN_SDK=21"
 set "SRC_DIR=%~dp0"
 set "SRC_DIR=%SRC_DIR:~0,-1%"
@@ -168,6 +168,6 @@ set "STAGE=%BDIR%\stage-lib"
 if exist "%STAGE%" rmdir /s /q "%STAGE%"
 mkdir "%STAGE%"
 copy /Y "%BDIR%\lib\*netleaf*.so" "%STAGE%\" >nul 2>nul
-copy /Y "%SRC_DIR%\include\*.h" "%STAGE%\" >nul 2>nul
+xcopy "%SRC_DIR%\include\*" "%STAGE%" /E /Y /Q >nul 2>nul
 echo [OK] %ABI% -^> %STAGE%
 exit /b 0

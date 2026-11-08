@@ -261,6 +261,15 @@ NL_TLS2_API int nl_tls2_handshake(nl_tls2_ctx_t* ctx, int sock);
 NL_TLS2_API int nl_tls2_handshake_ex(nl_tls2_ctx_t* ctx, int sock, int timeout_ms);
 
 /**
+ * @brief 切换异步(非阻塞)模式。
+ *
+ * 启用后 handshake_ex / send / recv 不再内部等待，而是立即返回
+ * NL_TLS2_WANT_READ 或 NL_TLS2_WANT_WRITE，由调用方事件循环驱动。
+ */
+NL_TLS2_API int nl_tls2_set_nonblocking(nl_tls2_ctx_t* ctx, int enable);
+NL_TLS2_API int nl_tls2_is_nonblocking(const nl_tls2_ctx_t* ctx);
+
+/**
  * @brief Send data through TLS connection
  */
 NL_TLS2_API int nl_tls2_send(nl_tls2_ctx_t* ctx, const void* buf, size_t len);

@@ -84,6 +84,9 @@ void nlh_resp_header(nl_http_response_t* resp, const char* name, const char* val
 void nlh_resp_body(nl_http_response_t* resp, const char* body, size_t len) {
     nl_http_response_set_body(resp, body, len);
 }
+void nlh_resp_file(nl_http_response_t* resp, const char* path, size_t size) {
+    nl_http_response_set_file(resp, path, size);
+}
 
 /* ------------------------------------------------------------
  * TLS-gated 短名（仅 NL_HTTPS_ENABLE 构建）：原长名符号由 netleaf_https

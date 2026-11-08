@@ -52,7 +52,18 @@ endif()
 add_test(NAME FullTest COMMAND test_full)
 
 # ----------------------------------------------------------------
-# 3. test_variable_substitution — 变量替换回归测试（v2.4.0）
+# 3.1 test_linkagg_pull — 链路聚合反向数据池回归测试（v3.1）
+# ----------------------------------------------------------------
+add_executable(test_linkagg_pull test_linkagg_pull.c)
+target_link_libraries(test_linkagg_pull PRIVATE
+    netleaf_core netleaf_lang netleaf_ipc netleaf_linkagg)
+if(WIN32)
+    target_link_libraries(test_linkagg_pull PRIVATE ${NL_TEST_SYS_LIBS})
+endif()
+add_test(NAME LinkAggPullTest COMMAND test_linkagg_pull)
+
+# ----------------------------------------------------------------
+# 4. test_variable_substitution — 变量替换回归测试（v2.4.0）
 # ----------------------------------------------------------------
 add_executable(test_variable_substitution test_variable_substitution.c)
 target_link_libraries(test_variable_substitution PRIVATE netleaf_core netleaf_lang)

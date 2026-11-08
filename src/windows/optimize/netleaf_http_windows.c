@@ -138,20 +138,20 @@ typedef struct {
     nl_http_server_t* server;
 } http1_client_args_t;
 
-/* 读取单个完整 HTTP/1 请求到 buf（容量 cap）。成功返回实际读取字节数，
- * 连接关闭/出错返回 <=0。配合 nl_http_find_terminator 做增量解析。
- * （原为 http1_client_thread 内的 GNU 嵌套函数，-Wpedantic 报
- * "ISO C forbids nested functions"，提升为文件级 static。） */
-static long nl_http_read_request_win(SOCKET fd, char* buf, size_t cap, size_t* total) {
-    *total = 0;
-    while (*total < cap - 1) {
-        int n = recv(fd, buf + *total, (int)(cap - 1 - *total), 0);
-        if (n <= 0) return (long)*total;
-        *total += (size_t)n;
-        buf[*total] = '\0';
-        if (nl_http_find_terminator(buf, *total) != -1) return (long)*total;
+/* 明文 H1 传输回调：ctx 指向会话内保持有效的 SOCKET。 */
+static long nlh_plain_recv_cb(void* ctx, char* buf, size_t len) {
+    return (long)recv(*(SOCKET*)ctx, buf, (int)len, 0);
+}
+
+static int nlh_plain_write_cb(void* ctx, const char* data, size_t len) {
+    SOCKET s = *(SOCKET*)ctx;
+    size_t off = 0;
+    while (off < len) {
+        int n = send(s, data + off, (int)(len - off), 0);
+        if (n <= 0) return -1;
+        off += (size_t)n;
     }
-    return (long)*total;
+    return 0;
 }
 
 static DWORD WINAPI http1_client_thread(LPVOID arg) {
@@ -165,13 +165,16 @@ static DWORD WINAPI http1_client_thread(LPVOID arg) {
      * 请求头显式指定 close 或为 HTTP/1.0 无 keep-alive 时关闭。 */
     int keep_alive = 1;
     while (keep_alive) {
-        char buffer[BUFFER_SIZE];
         size_t total = 0;
-        long got = nl_http_read_request_win(client_fd, buffer, sizeof(buffer), &total);
-        if (got <= 0 || total == 0) break;
+        /* 读满整个请求（头部 + Content-Length body），与 TLS 会话保持一致 */
+        char* buffer = nl_http_read_request_full(nlh_plain_recv_cb, &client_fd,
+                                                 BUFFER_SIZE, NL_HTTP_MAX_REQUEST,
+                                                 &total);
+        if (!buffer || total == 0) { free(buffer); break; }
 
         nl_http_request_t req;
         nl_http_response_t resp;
+        memset(&req, 0, sizeof(req));
         memset(&resp, 0, sizeof(resp));
         resp.status = 200;
         int parsed = 0;
@@ -204,7 +207,16 @@ static DWORD WINAPI http1_client_thread(LPVOID arg) {
             free(response_data);
         }
 
+        /* 文件响应：头部已带 Content-Length，正文在此分块发出 */
+        if (resp.file_path) {
+            nl_http_stream_file_chunks(resp.file_path, resp.file_size,
+                                       nlh_plain_write_cb, &client_fd);
+            free(resp.file_path);
+            resp.file_path = NULL;
+        }
+        if (resp.body) free(resp.body);
         if (req.body) free(req.body);
+        free(buffer);
     }
 
     closesocket(client_fd);
@@ -225,6 +237,9 @@ static DWORD WINAPI server_thread(LPVOID arg) {
 
         if (client_fd != INVALID_SOCKET) {
             if (server->enable_http2) {
+                /* H2 需要：禁用 Nagle，避免帧/响应头被 TCP 缓冲拖慢 */
+                int _nd = 1;
+                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&_nd, sizeof(_nd));
                 http2_client_args_t* args = malloc(sizeof(http2_client_args_t));
                 args->client_fd = client_fd;
                 args->handler = server->handler;
@@ -257,6 +272,9 @@ static DWORD WINAPI http2_server_thread(LPVOID arg) {
         SOCKET client_fd = accept(server->fd, (struct sockaddr*)&client_addr, &client_len);
 
         if (client_fd != INVALID_SOCKET) {
+            /* H2 需要：禁用 Nagle，避免帧/响应头被 TCP 缓冲拖慢 */
+            int _nd = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&_nd, sizeof(_nd));
             http2_client_args_t* args = malloc(sizeof(http2_client_args_t));
             args->client_fd = client_fd;
             args->handler = server->handler;

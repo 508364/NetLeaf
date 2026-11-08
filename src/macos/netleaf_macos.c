@@ -2160,14 +2160,14 @@ static int nl_web_proxy_ring_capacity(void) {
 }
 
 static int pr_alloc_slot(nl_web_macos_engine_t* eng) {
-    if (eng->pr_count >= eng->pr_cap || eng->pr_free_top < 0) return -1;
-    int idx = eng->pr_free[eng->pr_free_top--];
-    eng->pr_count++;
+    if (eng->count >= eng->cap || eng->free_top < 0) return -1;
+    int idx = eng->free[eng->free_top--];
+    eng->count++;
     return idx;
 }
 
 static void pr_free_slot(nl_web_macos_engine_t* eng, int idx) {
-    if (idx < 0 || idx >= eng->pr_cap) return;
+    if (idx < 0 || idx >= eng->cap) return;
     if (eng->pr_hbuf[idx])     { free(eng->pr_hbuf[idx]);     eng->pr_hbuf[idx] = NULL; }
     if (eng->pr_hbuf_out[idx]) { free(eng->pr_hbuf_out[idx]); eng->pr_hbuf_out[idx] = NULL; }
     if (eng->pr_up_buf[idx])   { free(eng->pr_up_buf[idx]);   eng->pr_up_buf[idx] = NULL; }
@@ -2185,8 +2185,8 @@ static void pr_free_slot(nl_web_macos_engine_t* eng, int idx) {
     if (eng->pr_up_hlen) eng->pr_up_hlen[idx] = 0;
     if (eng->pr_req_is_head) eng->pr_req_is_head[idx] = 0;
     if (eng->pr_last_active_ms) eng->pr_last_active_ms[idx] = 0;  // P7: 归还即清零时间戳
-    eng->pr_free[++(eng->pr_free_top)] = idx;
-    if (eng->pr_count > 0) eng->pr_count--;
+    eng->free[++(eng->free_top)] = idx;
+    if (eng->count > 0) eng->count--;
 }
 
 // 忽略大小写判断 [s, s+n) 是否以 prefix 开头（prefix 为小写字面量）
@@ -2493,7 +2493,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
 
     // 初始化 ring 容量（P6: 多实例时按 ring_cap_override 指定，否则 ncpu*64 自动）
     int cap = (ring_cap_override > 0) ? ring_cap_override : nl_web_proxy_ring_capacity();
-    eng->pr_cap = cap;
+    eng->cap = cap;
     eng->pr_fd_client   = (int*)calloc((size_t)cap, sizeof(int));
     eng->pr_fd_upstream = (int*)calloc((size_t)cap, sizeof(int));
     eng->pr_route_idx   = (int*)calloc((size_t)cap, sizeof(int));
@@ -2503,7 +2503,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     eng->pr_up_buf      = (char**)calloc((size_t)cap, sizeof(char*));
     eng->pr_hdr_len     = (int*)calloc((size_t)cap, sizeof(int));
     eng->pr_remain      = (int*)calloc((size_t)cap, sizeof(int));
-    eng->pr_free        = (int*)malloc((size_t)cap * sizeof(int));
+    eng->free        = (int*)malloc((size_t)cap * sizeof(int));
     // 上游 framing 解析 + 连接池相关数组
     eng->pr_up_parse    = (uint8_t*)calloc((size_t)cap, 1);
     eng->pr_up_cl       = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
@@ -2514,12 +2514,12 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     eng->pr_up_key      = (char**)calloc((size_t)cap, sizeof(char*));
     // P7: 空闲超时（slowloris 防护）
     eng->pr_last_active_ms = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
-    for (int i = 0; i < cap; i++) eng->pr_free[i] = cap - 1 - i;
-    eng->pr_free_top = cap - 1;
-    eng->pr_count = 0;
+    for (int i = 0; i < cap; i++) eng->free[i] = cap - 1 - i;
+    eng->free_top = cap - 1;
+    eng->count = 0;
     if (!eng->pr_fd_client || !eng->pr_fd_upstream || !eng->pr_route_idx ||
         !eng->pr_state || !eng->pr_hbuf || !eng->pr_hbuf_out || !eng->pr_up_buf ||
-        !eng->pr_hdr_len || !eng->pr_remain || !eng->pr_free ||
+        !eng->pr_hdr_len || !eng->pr_remain || !eng->free ||
         !eng->pr_up_parse || !eng->pr_up_cl || !eng->pr_chunk_rem ||
         !eng->pr_chunk_state || !eng->pr_up_hlen || !eng->pr_req_is_head ||
         !eng->pr_up_key || !eng->pr_last_active_ms) {
@@ -2561,7 +2561,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
             int64_t now_ms = pr_pool_now_ms();
             if (now_ms - last_scan_ms >= 500) {   // 每 ~500ms 扫一次（kevent 超时返回 0 时也会走到）
                 last_scan_ms = now_ms;
-                for (int si = 0; si < eng->pr_cap; si++) {
+                for (int si = 0; si < eng->cap; si++) {
                     if (!(eng->pr_state[si] & PR_ST_ACTIVE)) continue;
                     int64_t last = eng->pr_last_active_ms[si];
                     if (last <= 0 || (now_ms - last) >= idle_ms) {
@@ -2582,7 +2582,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
             }
         }
         for (int i = 0; i < n; i++) {
-            uint64_t udata = (uint64_t)(uintptr_t)events[i].ud;
+            uint64_t udata = (uint64_t)(uintptr_t)events[i].udata;
             int is_up      = (udata & PR_UDATA_UP_BIT) ? 1 : 0;
             int idx        = (int)(udata & ~PR_UDATA_UP_BIT);
             if (idx == 0x7FFFFFF) {
@@ -2621,7 +2621,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
                 kevent(eng->kqfd, &ev, 1, NULL, 0, NULL);
                 continue;
             }
-            if (idx >= eng->pr_cap || !(eng->pr_state[idx] & PR_ST_ACTIVE)) continue;
+            if (idx >= eng->cap || !(eng->pr_state[idx] & PR_ST_ACTIVE)) continue;
             int cfd = eng->pr_fd_client[idx];
             int ufd = eng->pr_fd_upstream[idx];
             if (cfd <= 0) continue;
@@ -2897,7 +2897,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     }
 
     // 清理所有活动连接
-    for (int i = 0; i < eng->pr_cap; i++) {
+    for (int i = 0; i < eng->cap; i++) {
         if (eng->pr_state[i] & PR_ST_ACTIVE) {
             if (eng->pr_fd_client[i] > 0) close(eng->pr_fd_client[i]);
             if (eng->pr_fd_upstream[i] > 0) close(eng->pr_fd_upstream[i]);
@@ -2915,7 +2915,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     free(eng->pr_fd_client);   free(eng->pr_fd_upstream);   free(eng->pr_route_idx);
     free(eng->pr_state);       free(eng->pr_hbuf);          free(eng->pr_hbuf_out);
     free(eng->pr_up_buf);
-    free(eng->pr_hdr_len);     free(eng->pr_remain);        free(eng->pr_free);
+    free(eng->pr_hdr_len);     free(eng->pr_remain);        free(eng->free);
     free(eng->pr_up_parse);    free(eng->pr_up_cl);         free(eng->pr_chunk_rem);
     free(eng->pr_chunk_state); free(eng->pr_up_hlen);       free(eng->pr_req_is_head);
     free(eng->pr_up_key);      free(eng->pr_last_active_ms);
@@ -2929,7 +2929,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     eng->pr_up_buf = NULL;
     eng->pr_hdr_len = NULL;
     eng->pr_remain = NULL;
-    eng->pr_free = NULL;
+    eng->free = NULL;
     eng->pr_up_parse = NULL;
     eng->pr_up_cl = NULL;
     eng->pr_chunk_rem = NULL;
@@ -2937,7 +2937,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     eng->pr_up_hlen = NULL;
     eng->pr_req_is_head = NULL;
     eng->pr_up_key = NULL;
-    eng->pr_cap = eng->pr_count = 0;
+    eng->cap = eng->count = 0;
 }
 
 // P6: 多实例引擎线程入口（SO_REUSEPORT）

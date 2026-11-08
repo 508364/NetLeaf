@@ -253,6 +253,7 @@ NL_API NL_HTTP_DEPRECATED size_t nl_http_request_get_body_size(const nl_http_req
 NL_API NL_HTTP_DEPRECATED void nl_http_response_set_status(nl_http_response_t* resp, int status);
 NL_API NL_HTTP_DEPRECATED void nl_http_response_set_header(nl_http_response_t* resp, const char* name, const char* value);
 NL_API NL_HTTP_DEPRECATED void nl_http_response_set_body(nl_http_response_t* resp, const char* body, size_t len);
+NL_API NL_HTTP_DEPRECATED void nl_http_response_set_file(nl_http_response_t* resp, const char* path, size_t size);
 
 /* ============================================================
  * 短名转接层（nlh_*）：与原长名一一对应、签名完全一致、无告警
@@ -283,6 +284,9 @@ NL_API size_t nlh_req_body_size(const nl_http_request_t* req);
 NL_API void nlh_resp_status(nl_http_response_t* resp, int status);
 NL_API void nlh_resp_header(nl_http_response_t* resp, const char* name, const char* value);
 NL_API void nlh_resp_body(nl_http_response_t* resp, const char* body, size_t len);
+/** 以文件内容作为响应体（等价于 TransmitFile/sendfile 语义，但适用于 TLS）。
+ *  size 为文件字节数，用于生成 Content-Length；正文由传输层分块发送。 */
+NL_API void nlh_resp_file(nl_http_response_t* resp, const char* path, size_t size);
 
 #ifdef NL_HTTPS_ENABLE
 NL_API int nlh_server_enable_tls(nl_http_server_t* server,

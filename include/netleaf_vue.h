@@ -17,7 +17,7 @@
     #define NL_VUE_API
 #endif
 
-#define NL_VUE_VERSION "3.0.0"
+#define NL_VUE_VERSION "3.0.1"
 
 #ifdef __cplusplus
 extern "C" {

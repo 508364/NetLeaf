@@ -13,10 +13,10 @@
 #include "netleaf_module.h"
 
 // Version macros
-#define NETLEAF_VERSION "3.0.0"
+#define NETLEAF_VERSION "3.0.1"
 #define NETLEAF_VERSION_MAJOR 3
 #define NETLEAF_VERSION_MINOR 0
-#define NETLEAF_VERSION_PATCH 0
+#define NETLEAF_VERSION_PATCH 1
 
 // Network types
 typedef enum {

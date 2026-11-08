@@ -27,6 +27,7 @@ struct nl_ipc {
 struct nl_ipc_conn {
 #ifdef _WIN32
     HANDLE pipe_handle;
+    int server_side;    // 1 = 服务端管道实例（close 时需 DisconnectNamedPipe）
     OVERLAPPED overlapped;
 #else
     int sock_fd;

@@ -82,6 +82,11 @@ struct nl_http_response {
     int header_count;
     char* body;
     size_t body_size;
+    /* 响应体来自文件：由 nlh_resp_file 设置。非 NULL 时 body 应为空，
+     * 序列化只出头部（Content-Length = file_size），正文由调用方用
+     * nl_http_stream_file 流式发出（TLS 下必须加密，无法内核零拷贝）。 */
+    char* file_path;
+    size_t file_size;
 };
 
 /* h2 帧头：统一用普通 uint32 存 length/stream_id，无位域。 */
@@ -262,6 +267,30 @@ NL_HTTP_INT_API long nl_http_find_terminator(const char* buf, size_t total);
 nlh_http_method_t nl_http_parse_method(const char* method);
 NL_HTTP_INT_API int nl_http_parse_request(nl_http_request_t* req, const char* data, size_t len);
 NL_HTTP_INT_API void nl_http_generate_response_http1(nl_http_response_t* resp, char** out, size_t* out_len);
+
+/* 请求体完整性：头部齐全且已收到 Content-Length 指定的字节数时返回 1。
+ * 无 Content-Length / chunked 编码视为完整（chunked 由上层原样处理）。 */
+NL_HTTP_INT_API int nl_http_request_body_complete(const char* buf, size_t total);
+
+/* 传输无关的读回调：返回读到的字节数，<=0 表示连接关闭或出错。 */
+typedef long (*nl_http_recv_fn)(void* ctx, char* buf, size_t len);
+/* 传输无关的写回调：返回 0 表示成功。 */
+typedef int (*nl_http_write_fn)(void* ctx, const char* data, size_t len);
+
+/* 单个 HTTP/1 请求上限：防御恶意超大 Content-Length 把内存吃光 */
+#define NL_HTTP_MAX_REQUEST (64u * 1024u * 1024u)
+
+/* 读取一个完整 HTTP/1 请求（头部 + Content-Length 指定的 body）。
+ * 内部按需扩容，最大 max_cap 字节；成功返回 malloc 的缓冲（NUL 结尾），
+ * 由调用方 free；连接提前关闭且无任何数据时返回 NULL。 */
+NL_HTTP_INT_API char* nl_http_read_request_full(nl_http_recv_fn recv_fn, void* ctx,
+                                               size_t initial_cap, size_t max_cap,
+                                               size_t* out_len);
+
+/* 把文件内容分块读入并通过 write_cb 写出（供无法内核零拷贝的 TLS 使用）。
+ * 单块 64KB，最多发送 max_size 字节；返回 0 表示成功。 */
+NL_HTTP_INT_API int nl_http_stream_file_chunks(const char* path, size_t max_size,
+                                               nl_http_write_fn write_cb, void* ctx);
 
 /* HPACK */
 int hpack_read_varint(const uint8_t* data, size_t len, uint8_t prefix_bits, uint64_t* value, size_t* consumed);

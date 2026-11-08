@@ -1,21 +1,13 @@
 # LinkAgg 扩展模块构建脚本
-# 同端口链路聚合与负载均衡（v2.2.1 引入）
+# 同端口链路聚合与负载均衡（v3.1 反向数据池模型）
 # 目标产物：libnetleaf_linkagg.dll/.so
+# 说明：三平台共享同一份核心实现，平台差异仅收敛在 core 文件内的少量 #ifdef。
 
 message(STATUS "Building linkagg module...")
 
-# 平台相关源文件
-if(WIN32)
-    set(LINKAGG_PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/src/windows/netleaf_linkagg_windows.c)
-elseif(APPLE)
-    set(LINKAGG_PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/src/macos/netleaf_linkagg_macos.c)
-elseif(UNIX)
-    set(LINKAGG_PLATFORM_SOURCES ${CMAKE_SOURCE_DIR}/src/linux/netleaf_linkagg_linux.c)
-endif()
-
 add_library(netleaf_linkagg SHARED
     netleaf_linkagg.c
-    ${LINKAGG_PLATFORM_SOURCES}
+    netleaf_linkagg_core.c
 )
 set_target_properties(netleaf_linkagg PROPERTIES
     POSITION_INDEPENDENT_CODE ON

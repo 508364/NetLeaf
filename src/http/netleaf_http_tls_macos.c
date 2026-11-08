@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/types.h>
@@ -345,20 +346,35 @@ done:
 }
 
 /* HTTP/1.1 over TLS 会话（keep-alive 语义同核心库 http1_client_thread） */
+
+/* 单个请求上限：防御恶意超大 Content-Length 把内存吃光 */
+#define NL_HTTPS_MAX_REQUEST (64u * 1024u * 1024u)
+
+static long nlh_tls_recv_cb(void* ctx, char* buf, size_t len) {
+    return (long)NL_HTTPS_TLS_recv((NL_HTTPS_TLS_CTX*)ctx, buf, len);
+}
+
+static int nlh_tls_write_cb(void* ctx, const char* data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int n = NL_HTTPS_TLS_send((NL_HTTPS_TLS_CTX*)ctx, data + off, len - off);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 static void nlh_tls_h1_session(NL_HTTPS_TLS_CTX* tls,
                                nl_http_handler handler, void* user_data) {
     int keep_alive = 1;
     while (keep_alive) {
-        char buffer[BUFFER_SIZE];
         size_t total = 0;
-        while (total < sizeof(buffer) - 1) {
-            int n = NL_HTTPS_TLS_recv(tls, buffer + total, sizeof(buffer) - 1 - total);
-            if (n <= 0) { total = 0; break; }
-            total += (size_t)n;
-            buffer[total] = '\0';
-            if (nl_http_find_terminator(buffer, total) != -1) break;
-        }
-        if (total == 0) break;
+        /* 读满整个请求：头部 + Content-Length 指定的 body。
+         * 只读到头部终止符会让带体请求（注册/登录/上传）拿不到 body。 */
+        char* buffer = nl_http_read_request_full(nlh_tls_recv_cb, tls,
+                                                 BUFFER_SIZE, NL_HTTPS_MAX_REQUEST,
+                                                 &total);
+        if (!buffer || total == 0) { free(buffer); break; }
 
         nl_http_request_t req;
         nl_http_response_t resp;
@@ -394,7 +410,16 @@ static void nlh_tls_h1_session(NL_HTTPS_TLS_CTX* tls,
             if (response_len > 0) NL_HTTPS_TLS_send(tls, response_data, response_len);
             free(response_data);
         }
+        /* 文件响应：头部已带 Content-Length，正文在此分块加密发出
+         * （TLS 无法使用内核 sendfile 零拷贝） */
+        if (resp.file_path) {
+            nl_http_stream_file_chunks(resp.file_path, resp.file_size, nlh_tls_write_cb, tls);
+            free(resp.file_path);
+            resp.file_path = NULL;
+        }
+        if (resp.body) free(resp.body);
         if (req.body) free(req.body);
+        free(buffer);
     }
 }
 
@@ -456,6 +481,9 @@ static void* nlh_tls_server_thread(void* arg) {
             if (!srv->running) break;
             continue;
         }
+        /* H2 需要：新连接禁用 Nagle，否则小帧/响应头会被 TCP 缓冲 40ms 拖慢 */
+        int _nd = 1;
+        setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &_nd, sizeof(_nd));
         nlh_tls_conn_args_t* args = malloc(sizeof(nlh_tls_conn_args_t));
         if (!args) { close(client_sock); continue; }
         args->sock = client_sock;

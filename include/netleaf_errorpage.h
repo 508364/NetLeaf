@@ -25,12 +25,12 @@ extern "C" {
 #ifdef NL_VERSION
 #define NL_ERRORPAGE_VERSION NL_VERSION
 #else
-#define NL_ERRORPAGE_VERSION "3.0.0"
+#define NL_ERRORPAGE_VERSION "3.0.1"
 #endif
 
-#define NL_ERRORPAGE_VERSION_MAJOR 2
-#define NL_ERRORPAGE_VERSION_MINOR 2
-#define NL_ERRORPAGE_VERSION_PATCH 2
+#define NL_ERRORPAGE_VERSION_MAJOR 3
+#define NL_ERRORPAGE_VERSION_MINOR 0
+#define NL_ERRORPAGE_VERSION_PATCH 1
 
 // =========================================
 // Module Information

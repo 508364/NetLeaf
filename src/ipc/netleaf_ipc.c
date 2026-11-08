@@ -8,7 +8,8 @@
 
 // Module state
 static int g_ipc_enabled = 0;
-static int g_ipc_available = 0;
+/* -1 表示"未显式设置"，此时按平台能力给出默认可用性 */
+static int g_ipc_available = -1;
 
 // Language (error code) registration for the IPC module
 static int ipc_module_init(void) {
@@ -21,11 +22,12 @@ static nl_module_info_t g_ipc_module_info = {
     .type = NL_MODULE_IPC,
     .name = "ipc",
     .version = NL_IPC_VERSION,
-    .capabilities = NL_CAP_SERVER | NL_CAP_CLIENT | NL_CAP_THREAD_SAFE | NL_CAP_PLATFORM_WIN | NL_CAP_PLATFORM_LINUX,
+    .capabilities = NL_CAP_SERVER | NL_CAP_CLIENT | NL_CAP_THREAD_SAFE |
+                    NL_CAP_PLATFORM_WIN | NL_CAP_PLATFORM_LINUX | NL_CAP_PLATFORM_MACOS,
     .status = NL_MODULE_STATUS_UNINITIALIZED,
     .platform_windows = 1,
     .platform_linux = 1,
-    .platform_macos = 0,
+    .platform_macos = 1,
     .init = ipc_module_init,
     .shutdown = NULL,
     .is_available = nl_ipc_is_available,
@@ -52,16 +54,19 @@ void nl_ipc_enable_ex(const char* enable_str) {
         g_ipc_available = 1;
     } else if (strncasecmp_custom(s, "false", 5) == 0) {
         g_ipc_enabled = 0;
+        g_ipc_available = 0;
     } else if (strncasecmp_custom(s, "on", 2) == 0 || strncasecmp_custom(s, "yes", 3) == 0) {
         g_ipc_enabled = 1;
         g_ipc_available = 1;
     } else if (strncasecmp_custom(s, "off", 3) == 0 || strncasecmp_custom(s, "no", 2) == 0) {
         g_ipc_enabled = 0;
+        g_ipc_available = 0;
     } else if (s[0] == '1') {
         g_ipc_enabled = 1;
         g_ipc_available = 1;
     } else if (s[0] == '0') {
         g_ipc_enabled = 0;
+        g_ipc_available = 0;
     }
 }
 
@@ -75,7 +80,12 @@ void nl_ipc_enable(int enable) {
 }
 
 int nl_ipc_is_available(void) {
-    return g_ipc_available;
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+    /* 默认可用（模块本就是平台自带实现）；仅当显式关闭时才返回 0 */
+    return g_ipc_available < 0 ? 1 : g_ipc_available;
+#else
+    return 0;
+#endif
 }
 
 const char* nl_ipc_version(void) {
@@ -88,7 +98,7 @@ const char* nl_ipc_version(void) {
 
 NL_EXTENSION_DEFINE(ipc, "IPC Communication", NL_IPC_VERSION, "508364",
     "Inter-process communication (Named Pipe/Unix Socket)",
-    "Windows,Linux",
+    "Windows,Linux,macOS",
     NL_CAP_SERVER | NL_CAP_CLIENT | NL_CAP_THREAD_SAFE,
     NULL, NULL, nl_ipc_is_available, nl_ipc_version);
 

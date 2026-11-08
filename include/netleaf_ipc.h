@@ -22,10 +22,10 @@ extern "C" {
     #define NL_IPC_API
 #endif
 
-#define NL_IPC_VERSION "3.0.0"
-#define NL_IPC_VERSION_MAJOR 2
-#define NL_IPC_VERSION_MINOR 4
-#define NL_IPC_VERSION_PATCH 2
+#define NL_IPC_VERSION "3.0.1"
+#define NL_IPC_VERSION_MAJOR 3
+#define NL_IPC_VERSION_MINOR 0
+#define NL_IPC_VERSION_PATCH 1
 
 // =========================================
 // Module Information
@@ -34,7 +34,7 @@ extern "C" {
 // IPC module capabilities
 #define NL_IPC_CAPABILITIES \
     (NL_CAP_SERVER | NL_CAP_CLIENT | NL_CAP_THREAD_SAFE | \
-     NL_CAP_PLATFORM_WIN | NL_CAP_PLATFORM_LINUX)
+     NL_CAP_PLATFORM_WIN | NL_CAP_PLATFORM_LINUX | NL_CAP_PLATFORM_MACOS)
 
 // IPC module info structure (defined in implementation)
 NL_IPC_API nl_module_info_t* nl_ipc_get_module_info(void);

@@ -184,58 +184,243 @@ int nl_http_parse_request(nl_http_request_t* req, const char* data, size_t len) 
 }
 
 void nl_http_generate_response_http1(nl_http_response_t* resp, char** out, size_t* out_len) {
-    size_t initial_size = BUFFER_SIZE + (resp->body ? resp->body_size : 0);
-    char* buffer = malloc(initial_size);
+    /* 文件响应只序列化头部：正文由调用方流式发出（TLS 必须加密，无法内核零拷贝）。
+     * 精确计算所需容量：原先固定 malloc(16KB+body) 让每个响应都申请 16KB，
+     * 小响应（错误页/JSON）下是纯浪费；这里按头部实际长度一次分配。 */
+    size_t body_len = (!resp->file_path && resp->body) ? resp->body_size : 0;
+    size_t cap = 64;                       /* 状态行 + 结尾空行 */
+    int content_len_added = 0;
+    for (int i = 0; i < resp->header_count; i++) {
+        if (strcmp(resp->headers[i].name, "Content-Length") == 0)
+            content_len_added = 1;
+        cap += strlen(resp->headers[i].name) + strlen(resp->headers[i].value) + 4;
+    }
+    if (!content_len_added && (resp->file_path || resp->body))
+        cap += 48;                         /* "Content-Length: %zu\r\n" */
+    cap += body_len + 1;                   /* 正文 + 结尾 NUL */
+
+    char* buffer = (char*)malloc(cap);
     if (!buffer) {
         *out = NULL;
         *out_len = 0;
         return;
     }
 
-    int len = snprintf(buffer, initial_size, "HTTP/1.1 %d OK\r\n", resp->status);
-    if (len < 0) {
-        free(buffer);
-        *out = NULL;
-        *out_len = 0;
-        return;
-    }
+    size_t len = 0;
+    int n = snprintf(buffer, cap, "HTTP/1.1 %d OK\r\n", resp->status);
+    if (n < 0 || (size_t)n >= cap) { free(buffer); *out = NULL; *out_len = 0; return; }
+    len = (size_t)n;
 
-    int content_len_added = 0;
     for (int i = 0; i < resp->header_count; i++) {
-        if (strcmp(resp->headers[i].name, "Content-Length") == 0) {
-            content_len_added = 1;
-        }
-        len += snprintf(buffer + len, initial_size - len, "%s: %s\r\n",
-                        resp->headers[i].name, resp->headers[i].value);
-        /* 累加后校验返回值与剩余空间，防止 size_t 下溢导致越界写 */
-        if (len < 0 || (size_t)len >= initial_size) break;
+        n = snprintf(buffer + len, cap - len, "%s: %s\r\n",
+                     resp->headers[i].name, resp->headers[i].value);
+        if (n < 0) { free(buffer); *out = NULL; *out_len = 0; return; }
+        if ((size_t)n >= cap - len) { len = cap; break; }   /* 理论容量已用尽 */
+        len += (size_t)n;
     }
 
-    if (!content_len_added && resp->body && len >= 0 && (size_t)len < initial_size) {
-        len += snprintf(buffer + len, initial_size - len, "Content-Length: %zu\r\n",
-                        resp->body_size);
+    if (len < cap && !content_len_added && (resp->file_path || resp->body)) {
+        size_t clen = resp->file_path ? resp->file_size : resp->body_size;
+        n = snprintf(buffer + len, cap - len, "Content-Length: %zu\r\n", clen);
+        if (n < 0) { free(buffer); *out = NULL; *out_len = 0; return; }
+        if ((size_t)n >= cap - len) len = cap;
+        else len += (size_t)n;
     }
 
-    if (len >= 0 && (size_t)len < initial_size) {
-        len += snprintf(buffer + len, initial_size - len, "\r\n");
+    if (len < cap) {
+        n = snprintf(buffer + len, cap - len, "\r\n");
+        if (n < 0) { free(buffer); *out = NULL; *out_len = 0; return; }
+        if ((size_t)n >= cap - len) len = cap;
+        else len += (size_t)n;
     }
 
-    if (resp->body && resp->body_size > 0) {
-        if (len >= 0 && (size_t)len + resp->body_size < initial_size) {
-            memcpy(buffer + len, resp->body, resp->body_size);
-            len += resp->body_size;
-        }
+    if (body_len > 0 && len + body_len <= cap) {
+        memcpy(buffer + len, resp->body, body_len);
+        len += body_len;
     }
 
-    /* snprintf 返回的是"理论长度"，头部过多时可能大于实际容量；
-     * 需夹取到实际容量内并保证 out_len <= cap，避免发送侧按 out_len 越界读取 */
-    if (len < 0) {
-        len = 0;
-    } else if ((size_t)len > initial_size) {
-        len = (int)initial_size;
-    }
     *out = buffer;
-    *out_len = (size_t)len;
+    *out_len = len;
+}
+
+/* ============================================================
+ * 传输无关的请求读取 / 文件流式发送
+ *
+ * TLS 会话只能走用户态加密收发，无法复用内核 sendfile/TransmitFile，
+ * 故这里提供一份"读满整个请求（含 Content-Length body）"与"分块读文件"
+ * 的公共实现，三平台 TLS 会话共用，避免三份重复且易漏的逻辑。
+ * ============================================================ */
+
+/* 大小写不敏感前缀比较（不依赖 strncasecmp，MSVC/POSIX 皆可） */
+static int nl_http_ci_prefix(const char* s, size_t len, const char* lit) {
+    size_t n = strlen(lit);
+    if (len < n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char a = s[i], b = lit[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* 扫描请求头：返回 -1 头部未齐，0 头部已齐但 body 未收满，1 视为完整。
+ * need_total 输出"完整请求所需的缓冲字节数（含结尾 NUL）"，未知时为 0。 */
+static int nl_http_scan_request(const char* buf, size_t total, size_t* need_total) {
+    *need_total = 0;
+    long term = nl_http_find_terminator(buf, total);
+    if (term < 0) return -1;
+
+    size_t header_len = (size_t)term + 4;
+    size_t content_len = 0;
+    int has_len = 0;
+    int chunked = 0;
+
+    const char* eoh = buf + (size_t)term;
+    const char* p = buf;
+    const char* eol = memchr(p, '\n', (size_t)(eoh - p));
+    if (!eol) return -1;
+    p = eol + 1;                      /* 跳过请求行 */
+
+    while (p < eoh) {
+        eol = memchr(p, '\n', (size_t)(eoh - p));
+        if (!eol) break;
+        size_t line_len = (size_t)(eol - p);
+        if (line_len && p[line_len - 1] == '\r') line_len--;
+        if (line_len == 0) break;     /* 空行：头部结束 */
+
+        if (nl_http_ci_prefix(p, line_len, "Content-Length")) {
+            const char* colon = memchr(p, ':', line_len);
+            if (colon) {
+                content_len = (size_t)strtoul(colon + 1, NULL, 10);
+                has_len = 1;
+            }
+        } else if (nl_http_ci_prefix(p, line_len, "Transfer-Encoding")) {
+            const char* colon = memchr(p, ':', line_len);
+            if (colon) {
+                const char* send = p + line_len;
+                for (const char* q = colon + 1; q + 7 <= send; q++) {
+                    if (nl_http_ci_prefix(q, (size_t)(send - q), "chunked")) {
+                        chunked = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        p = eol + 1;
+    }
+
+    /* chunked 不在本层解码；无 Content-Length 的请求按无 body 处理 */
+    if (chunked || !has_len) return 1;
+
+    size_t need = header_len + content_len;
+    if (need < header_len) need = header_len;    /* 防 content_len 溢出 */
+    *need_total = need + 1;                      /* 预留 NUL */
+    return total >= need ? 1 : 0;
+}
+
+int nl_http_request_body_complete(const char* buf, size_t total) {
+    size_t need = 0;
+    return nl_http_scan_request(buf, total, &need) == 1;
+}
+
+char* nl_http_read_request_full(nl_http_recv_fn recv_fn, void* ctx,
+                                size_t initial_cap, size_t max_cap,
+                                size_t* out_len) {
+    if (out_len) *out_len = 0;
+    if (!recv_fn) return NULL;
+
+    if (initial_cap < 1024) initial_cap = 1024;
+    if (max_cap < initial_cap) max_cap = initial_cap;
+
+    size_t cap = initial_cap;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return NULL;
+    size_t total = 0;
+    size_t need = 0;
+    int have_need = 0;
+    buf[0] = '\0';
+
+    for (;;) {
+        size_t want;
+        if (have_need) {
+            /* 头部已齐：只读 Content-Length 剩余字节，避免把后续
+             * keep-alive 的下一请求数据一起吞进来 */
+            if (total >= need) break;
+            want = need - total;
+        } else {
+            /* 头部过长撑满缓冲：扩容后继续读（上限 max_cap） */
+            if (total >= cap - 1) {
+                if (cap >= max_cap) break;
+                size_t ncap = cap * 2;
+                if (ncap > max_cap) ncap = max_cap;
+                char* nb = (char*)realloc(buf, ncap);
+                if (!nb) break;
+                buf = nb;
+                cap = ncap;
+            }
+            want = cap - 1 - total;
+        }
+        if (want == 0) break;
+
+        long n = recv_fn(ctx, buf + total, want);
+        if (n <= 0) break;           /* 连接关闭 / 出错 */
+        total += (size_t)n;
+        buf[total] = '\0';
+
+        size_t next_need = 0;
+        int st = nl_http_scan_request(buf, total, &next_need);
+        if (st == 1) break;          /* 完整请求 */
+        if (st < 0) continue;        /* 头部未齐，继续读 */
+
+        /* 头部已齐但 body 不足：按 Content-Length 扩容后继续读 */
+        have_need = 1;
+        need = next_need;
+        if (need > max_cap) break;   /* 超出上限：返回已读部分，不 OOM */
+        if (need > cap) {
+            char* nb = (char*)realloc(buf, need);
+            if (!nb) break;
+            buf = nb;
+            cap = need;
+        }
+    }
+
+    if (total == 0) {
+        free(buf);
+        return NULL;
+    }
+    if (out_len) *out_len = total;
+    return buf;
+}
+
+int nl_http_stream_file_chunks(const char* path, size_t max_size,
+                               nl_http_write_fn write_cb, void* ctx) {
+    if (!path || !write_cb) return -1;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+
+    enum { NL_STREAM_CHUNK = 65536 };
+    char* buf = (char*)malloc(NL_STREAM_CHUNK);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+
+    int rc = 0;
+    size_t sent = 0;
+    while (sent < max_size) {
+        size_t want = max_size - sent;
+        if (want > NL_STREAM_CHUNK) want = NL_STREAM_CHUNK;
+        size_t got = fread(buf, 1, want, f);
+        if (got == 0) break;
+        if (write_cb(ctx, buf, got) != 0) { rc = -1; break; }
+        sent += got;
+    }
+
+    free(buf);
+    fclose(f);
+    return rc;
 }
 
 /* ============================================================
@@ -1400,12 +1585,44 @@ void nl_http_response_set_header(nl_http_response_t* resp, const char* name, con
 void nl_http_response_set_body(nl_http_response_t* resp, const char* body, size_t len) {
     if (!resp) return;
 
+    /* body 与文件响应互斥 */
+    if (resp->file_path) {
+        free(resp->file_path);
+        resp->file_path = NULL;
+        resp->file_size = 0;
+    }
     if (resp->body) free(resp->body);
     resp->body = malloc(len + 1);
     if (resp->body) {
         memcpy(resp->body, body, len);
         resp->body[len] = '\0';
         resp->body_size = len;
+    }
+}
+
+void nl_http_response_set_file(nl_http_response_t* resp, const char* path, size_t size) {
+    if (!resp) return;
+
+    /* 文件响应与内存 body 互斥 */
+    if (resp->body) {
+        free(resp->body);
+        resp->body = NULL;
+        resp->body_size = 0;
+    }
+    if (resp->file_path) {
+        free(resp->file_path);
+        resp->file_path = NULL;
+    }
+    if (!path) {
+        resp->file_size = 0;
+        return;
+    }
+    resp->file_path = (char*)malloc(strlen(path) + 1);
+    if (resp->file_path) {
+        strcpy(resp->file_path, path);
+        resp->file_size = size;
+    } else {
+        resp->file_size = 0;
     }
 }
 

@@ -1,6 +1,6 @@
 <img src="Logo.svg" width="40" height="40" align="left">
 
-# NetLeaf v3.0.0
+# NetLeaf v3.0.1
 
 High-performance cross-platform network library (Windows/Linux/macOS/Android) built on the **NL Extension System**. Supports TCP/UDP, HTTP/1.1 + HTTP/2, WebSocket, and MQTT v5.0, with a fully asynchronous web engine, TLS/SSL encryption, smart routing, and multi-language extensions.
 
@@ -209,6 +209,13 @@ Registered suites: `ModulesTest` / `FullTest` / `VariableSubstitutionTest` / `Al
 
 Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Features, API Reference, Examples, Troubleshooting, plus TLS/MQTT/Vue/IPC/Lang/LinkAgg/Extension topics). Full changelog: [CHANGELOG.md](CHANGELOG.md).
 
+## What's New in v3.0.1 (2026-11-08)
+
+- **LinkAgg reverse data pool**: link aggregation now uses a host-pulls model — requests are queued per endpoint, the host calls `nl_lagg_pull()` / `nl_lagg_request_respond()`; client waits time out, retry once, then mark the endpoint unhealthy and return 503 (auto-recover when the host resumes)
+- **TLS2/TLS3 non-blocking async**: new `nl_tls2_set_nonblocking()` / `nl_tls3_set_nonblocking()` — handshake/I/O return `WANT_READ`/`WANT_WRITE` for your event loop; fixes `handshake()` always returning INVALID_STATE
+- **Shared core extraction**: the three per-platform LinkAgg copies merged into one `netleaf_linkagg_core.c` (~47KB smaller); `nl_lagg_start()` is now non-blocking
+- **Windows named pipes in byte mode**: 64KB buffer, arbitrary payload sizes; new regression test `test_linkagg_pull`
+
 ## What's New in v3.0.0 (2026-10-31)
 
 - **Web engine full async refactor (P1-P12)**: `nl_web_engine_t` event engine with streaming body/chunked, multi-instance, 30s idle scan; benchmarked (PROXY beats legacy worker pool, 10MB file RSS -97%); sendfile/TransmitFile zero-copy (3.3~5.9x); macOS/Windows parity; 9 integration tests (ASan/TSan clean)
@@ -221,6 +228,7 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 
 | Version | Date | Highlights |
 | --- | --- | --- |
+| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix |
 | 3.0.0 | 2026-10-31 | Async web engine (sendfile zero-copy, multi-instance, test suite); HTTP/2 completion; HTTPS/2; Windows full IOCP + UDP receive ring; QUIC split out |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS refactor (`netleaf_https` split, tls2/tls3); MQTT on by default; `nl_util`; H2/QUIC frame fixes; Android build support |
 | 2.4.1 | 2026-09-24 | Lang error-code i18n, dynamic/external variables; warning cleanup; full-platform cross builds |
