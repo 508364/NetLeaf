@@ -10,6 +10,7 @@
 #include <sys/sysinfo.h>
 
 #include "netleaf.h"
+#include "common/netleaf_sysinfo_version.h"
 
 static int sys_info_loaded = 0;
 static nl_ram_unit_t ram_unit = NL_RAM_UNIT_DECIMAL;
@@ -57,16 +58,8 @@ static void load_sys_info(void) {
         total_ram = 0;
     }
     
-#if defined(__ANDROID__)
-    /* Bionic (Android libc) has no GLIBC version macros. The NDK tag is
-     * sufficient to identify the runtime on Android. */
-    snprintf(runtime_version, sizeof(runtime_version), "Bionic (NDK)");
-#elif defined(__GLIBC__)
-    snprintf(runtime_version, sizeof(runtime_version), "glibc %d.%d",
-             __GLIBC__, __GLIBC_MINOR__);
-#else
-    snprintf(runtime_version, sizeof(runtime_version), "unknown C library");
-#endif
+    /* C 运行库版本串由平台后端提供（glibc/Bionic 分支已拆到独立文件） */
+    nl_sysinfo_format_runtime(runtime_version, sizeof(runtime_version));
     
     sys_info_loaded = 1;
 }

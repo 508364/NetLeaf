@@ -279,10 +279,25 @@ static void test_connection_init(void) {
     expect("cleanup 后编码表空", conn.hpack_enc.dynamic_table == NULL, 1);
 }
 
-/* 帧喂入状态机：HEADERS→流状态、DATA END_STREAM、RST→CLOSED、GOAWAY→draining、PRIORITY 忽略。 */
+/* 帧喂入状态机：HEADERS→建流并响应、响应完成立即释放（防长连接 OOM）、
+ * 有正文响应停留 HALF_CLOSED_LOCAL、DATA END_STREAM→释放、RST→释放、
+ * GOAWAY→draining、PRIORITY 忽略。 */
+static char g_seen_path[NL_HTTP_MAX_PATH];
+static int  g_seen_method = -1;
+static int  g_resp_body_on = 0;
+
 static void test_dummy_handler(const nl_http_request_t* req, nl_http_response_t* resp, void* ud) {
-    (void)req; (void)ud;
+    (void)ud;
     resp->status = 200;
+    if (req) {
+        g_seen_method = (int)req->method;
+        snprintf(g_seen_path, sizeof(g_seen_path), "%s", req->path);
+    }
+    if (g_resp_body_on) {
+        /* process_frame 会 free(resp.body)，必须堆分配 */
+        resp->body = (char*)malloc(4);
+        if (resp->body) { memcpy(resp->body, "pong", 4); resp->body_size = 4; }
+    }
 }
 
 static void test_frame_state_machine(void) {
@@ -305,55 +320,87 @@ static void test_frame_state_machine(void) {
 
     expect("喂入 HEADERS", h2_process_frame(&g_mock_io, 0, &conn, frame, sizeof(frame), test_dummy_handler, NULL), 0);
 
-    struct nl_http2_stream* s = conn.streams;
+    /* 无正文响应 + 客户端已 END_STREAM → 双向关闭后立即摘链释放，
+     * 长连接累计请求不再堆积流结构（防 OOM 回归点） */
+    expect("响应完成流已释放", conn.streams == NULL, 1);
+
     g_total++;
-    if (s && s->id == 1) {
-        printf("  [PASS] %-32s id=%u\n", "流已创建", s->id);
-    } else {
-        g_fail++;
-        printf("  [FAIL] %-32s\n", "流已创建");
-    }
-    g_total++;
-    /* 客户端 END_STREAM(半关远端) + handler 无 body 响应 END_STREAM → 双向关闭 */
-    if (s && s->state == NL_H2_ST_CLOSED) {
-        printf("  [PASS] %-32s state=%d\n", "HEADERS+响应 END_STREAM→CLOSED", s->state);
-    } else {
-        g_fail++;
-        printf("  [FAIL] %-32s state=%d\n", "HEADERS+响应 END_STREAM→CLOSED", s ? s->state : -1);
-    }
-    g_total++;
-    if (s && s->request.method == NL_HTTP_GET && strcmp(s->request.path, "/") == 0) {
+    if (g_seen_method == NL_HTTP_GET && strcmp(g_seen_path, "/") == 0) {
         printf("  [PASS] %-32s GET /\n", "头块解析");
     } else {
         g_fail++;
-        printf("  [FAIL] %-32s\n", "头块解析");
+        printf("  [FAIL] %-32s method=%d path=%s\n", "头块解析", g_seen_method, g_seen_path);
     }
+
+    /* 有正文响应：HEADERS 不带 END_STREAM → 流保持 HALF_CLOSED_LOCAL（不释放） */
+    g_resp_body_on = 1;
+    h.flags = 0x04;
+    h.stream_id = 3;
+    h2_frame_header_write(frame, &h);
+    frame[9] = 0x82;
+    frame[10] = 0x84;
+    expect("喂入 HEADERS(无END_STREAM)", h2_process_frame(&g_mock_io, 0, &conn, frame, sizeof(frame), test_dummy_handler, NULL), 0);
+
+    struct nl_http2_stream* s = conn.streams;
+    g_total++;
+    if (s && s->id == 3 && s->state == NL_H2_ST_HALF_CLOSED_LOCAL) {
+        printf("  [PASS] %-32s state=%d\n", "响应后 HALF_CLOSED_LOCAL", s->state);
+    } else {
+        g_fail++;
+        printf("  [FAIL] %-32s id=%u state=%d\n", "响应后 HALF_CLOSED_LOCAL",
+               s ? s->id : 0, s ? s->state : -1);
+    }
+
+    /* 对端 DATA + END_STREAM → 双向关闭 → 立即释放 */
+    uint8_t data[9 + 2] = {0};
+    h.length = 2;
+    h.type = NL_H2_FRAME_DATA;
+    h.flags = 0x01;   /* END_STREAM */
+    h.stream_id = 3;
+    h2_frame_header_write(data, &h);
+    data[9] = 'h';
+    data[10] = 'i';
+    expect("喂入 DATA END_STREAM", h2_process_frame(&g_mock_io, 0, &conn, data, sizeof(data), NULL, NULL), 0);
+    expect("DATA END_STREAM 后释放", conn.streams == NULL, 1);
+    g_resp_body_on = 0;
 
     /* PRIORITY：合法忽略（RFC 7540 §6.3）——5 字节负载 */
     uint8_t prio[9 + 5] = {0};
     h.length = 5;
     h.type = NL_H2_FRAME_PRIORITY;
     h.flags = 0;
-    h.stream_id = 1;
+    h.stream_id = 7;
     h2_frame_header_write(prio, &h);
     expect("喂入 PRIORITY(应忽略)", h2_process_frame(&g_mock_io, 0, &conn, prio, sizeof(prio), NULL, NULL), 0);
 
-    /* RST_STREAM：error_code=8 → 流 CLOSED */
+    /* RST_STREAM：流存在时收到 RST → 立即摘链释放 */
+    g_resp_body_on = 1;
+    h.length = 2;
+    h.type = NL_H2_FRAME_HEADERS;
+    h.flags = 0x04;
+    h.stream_id = 5;
+    h2_frame_header_write(frame, &h);
+    frame[9] = 0x82;
+    frame[10] = 0x84;
+    expect("喂入 HEADERS(RST用)", h2_process_frame(&g_mock_io, 0, &conn, frame, sizeof(frame), test_dummy_handler, NULL), 0);
+    g_total++;
+    if (conn.streams && conn.streams->id == 5) {
+        printf("  [PASS] %-32s id=%u\n", "RST 前流存在", conn.streams->id);
+    } else {
+        g_fail++;
+        printf("  [FAIL] %-32s\n", "RST 前流存在");
+    }
+
     uint8_t rst[9 + 4] = {0};
     h.length = 4;
     h.type = NL_H2_FRAME_RST_STREAM;
     h.flags = 0;
-    h.stream_id = 1;
+    h.stream_id = 5;
     h2_frame_header_write(rst, &h);
     rst[12] = 8;  /* CANCEL */
     expect("喂入 RST_STREAM", h2_process_frame(&g_mock_io, 0, &conn, rst, sizeof(rst), NULL, NULL), 0);
-    g_total++;
-    if (s && s->state == NL_H2_ST_CLOSED) {
-        printf("  [PASS] %-32s state=%d\n", "RST→CLOSED", s->state);
-    } else {
-        g_fail++;
-        printf("  [FAIL] %-32s state=%d\n", "RST→CLOSED", s ? s->state : -1);
-    }
+    expect("RST 后流已释放", conn.streams == NULL, 1);
+    g_resp_body_on = 0;
 
     /* GOAWAY：last_stream=1 → draining */
     uint8_t goaway[9 + 8] = {0};

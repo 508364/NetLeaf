@@ -65,8 +65,14 @@ struct nl_http_client {
 static int io_write_h2_frame(struct nl_http_io* io, nl_http_handle_t handle,
                              const uint8_t* data, size_t len) {
     (void)io;
-    int written = send(handle, (const char*)data, (int)len, 0);
-    return (written < 0) ? -1 : written;
+    /* Winsock send 也可能部分写，循环发完整帧 */
+    size_t off = 0;
+    while (off < len) {
+        int written = send(handle, (const char*)data + off, (int)(len - off), 0);
+        if (written <= 0) return -1;
+        off += (size_t)written;
+    }
+    return (int)len;
 }
 
 static struct nl_http_io nl_http_io = {

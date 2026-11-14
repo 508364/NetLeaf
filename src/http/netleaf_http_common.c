@@ -1082,20 +1082,44 @@ int h2_send_goaway(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_c
     return io->write_h2_frame(io, fd, frame, 17);
 }
 
-int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_connection* conn, struct nl_http2_stream* stream, nl_http_response_t* resp) {
-    /* 单一堆缓冲复用：前段写 HEADERS 头块（offset），后段 [9+chunk..9+chunk+chunk]
-     * 作为 DATA 分块帧体，避免原 16KB(header_block) + 16KB(frame) ≈32KB 双栈占用。
-     * 动态分配（按需、可回收），连接/流生命周期内复用本帧仅一次。 */
-    uint8_t* frame = (uint8_t*)malloc(9 + H2_MAX_FRAME_SIZE + 9 + H2_MAX_FRAME_SIZE);
-    if (!frame) return -1;
-    uint8_t* header_block = frame;             /* 头块区（前 H2_MAX_FRAME_SIZE）*/
-    uint8_t* data_frame   = frame + 9 + H2_MAX_FRAME_SIZE; /* DATA 分块帧区 */
-    size_t offset = 0;
+/* 摘链并释放流：END_STREAM 双向完成或收到 RST 后立即调用，防止
+ * 长连接累计请求把流结构（含内嵌请求头数组 ≈9KB）堆到 OOM。
+ * 迟到帧防护：DATA/WINDOW_UPDATE/RST 改为"只查不建"，已释放流的
+ * 迟到帧直接忽略（RFC 7540 §5.1 允许对 CLOSED 流的帧静默丢弃）。 */
+static void h2_release_stream(struct nl_http2_connection* conn, struct nl_http2_stream* stream) {
+    if (!conn || !stream) return;
+    struct nl_http2_stream** pp = &conn->streams;
+    while (*pp && *pp != stream) pp = &(*pp)->next;
+    if (*pp == stream) *pp = stream->next;
+    if (stream->request.body) free(stream->request.body);
+    if (stream->response.body) free(stream->response.body);
+    free(stream);
+}
 
+int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_connection* conn, struct nl_http2_stream* stream, nl_http_response_t* resp) {
+    /* 攒批发帧：HEADERS 与后续 DATA 帧先写入同一批缓冲，攒满或结束时
+     * 一次写出——把"每请求多次小写"合并成一次 TLS 写，降低记录头/
+     * 系统调用开销（QPS 优化）。底层 write_h2_frame 已保证循环发完
+     * （mbedTLS 单次约 16KB 上限）。 */
+    const size_t cap = 3 * (9 + H2_MAX_FRAME_SIZE);
+    uint8_t* buf = (uint8_t*)malloc(cap);
+    if (!buf) return -1;
+    size_t len = 0;
+    int rc = -1;
+    FILE* fp = NULL;
+
+    /* 文件响应（nlh_resp_file）：先打开文件决定是否有正文；
+     * 打不开则降级为无正文响应（HEADERS 直接 END_STREAM，避免挂住）。 */
+    if (resp->file_path && resp->file_size > 0) {
+        fp = fopen(resp->file_path, "rb");
+    }
+
+    int has_body = (resp->body && resp->body_size > 0) || (fp != NULL);
+
+    /* HEADERS 帧：头块编码进 buf+9（前 H2_MAX_FRAME_SIZE 区域） */
     char status[8];
     snprintf(status, sizeof(status), "%d", resp->status);
-    /* 响应头用编码表（hpack_enc，与对端解码端同步的方向独立表） */
-    offset += hpack_encode_header(&conn->hpack_enc, header_block + offset, H2_MAX_FRAME_SIZE - offset, ":status", status);
+    size_t offset = hpack_encode_header(&conn->hpack_enc, buf + 9, H2_MAX_FRAME_SIZE, ":status", status);
 
     for (int i = 0; i < resp->header_count; i++) {
         /* RFC 7540 §8.1.2：h2 字段名必须全小写。公共 API 按 HTTP/1 习惯
@@ -1107,30 +1131,26 @@ int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_
             lname[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
         }
         lname[n] = '\0';
-        offset += hpack_encode_header(&conn->hpack_enc, header_block + offset, H2_MAX_FRAME_SIZE - offset,
+        offset += hpack_encode_header(&conn->hpack_enc, buf + 9 + offset, H2_MAX_FRAME_SIZE - offset,
                                      lname, resp->headers[i].value);
     }
 
     /* 头块过长（超出 H2 单帧上限）截断以保护帧结构；正常响应头远小于此值。 */
     if (offset > H2_MAX_FRAME_SIZE) offset = H2_MAX_FRAME_SIZE;
 
-    int has_body = (resp->body && resp->body_size > 0);
-
     struct nl_h2_frame_header frame_header = {0};
-    frame_header.length = offset;
+    frame_header.length = (uint32_t)offset;
     frame_header.type = NL_H2_FRAME_HEADERS;
-    /* 无响应体：HEADERS 直接携带 END_STREAM，流随即关闭 */
+    /* 无响应体：HEADERS 直接携带 END_STREAM */
     frame_header.flags = has_body ? 0x04 : (0x04 | 0x01);
     frame_header.stream_id = stream->id;
+    h2_frame_header_write(buf, &frame_header);
+    len = 9 + offset;
 
-    h2_frame_header_write(data_frame, &frame_header);
-    memcpy(data_frame + 9, header_block, offset);
-
-    int result = io->write_h2_frame(io, fd, data_frame, 9 + offset);
-    if (result < 0) { free(frame); return -1; }
-
+    int release = 0;
     if (!has_body) {
         stream->state = NL_H2_ST_CLOSED;
+        release = 1;
     } else {
         if (stream->state == NL_H2_ST_IDLE || stream->state == NL_H2_ST_OPEN) {
             stream->state = NL_H2_ST_HALF_CLOSED_LOCAL;
@@ -1143,38 +1163,72 @@ int h2_send_headers(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2_
             max_chunk = conn->remote_settings.max_frame_size;
         }
 
-        size_t remaining = resp->body_size;
+        size_t remaining = fp ? resp->file_size : resp->body_size;
         const char* body_ptr = resp->body;
+        int eof = 0;   /* 文件读尽 / 读失败 */
 
-        while (remaining > 0) {
+        while (remaining > 0 && !eof) {
             size_t chunk_size = remaining < max_chunk ? remaining : max_chunk;
+
+            /* 本帧放不下当前批：先整批写出再续批 */
+            if (len + 9 + chunk_size > cap) {
+                if (io->write_h2_frame(io, fd, buf, len) < 0) goto done;
+                len = 0;
+            }
+
             uint8_t flags = (remaining == chunk_size) ? 0x01 : 0x00;
 
-            frame_header.length = chunk_size;
+            if (fp) {
+                size_t got = fread(buf + len + 9, 1, chunk_size, fp);
+                if (got < chunk_size) {
+                    /* 文件提前读尽/读失败：以实际字节（可为 0）收尾，
+                     * 不发未初始化内容 */
+                    chunk_size = got;
+                    eof = 1;
+                }
+                if (eof) flags = 0x01;
+            } else {
+                memcpy(buf + len + 9, body_ptr, chunk_size);
+            }
+
+            frame_header.length = (uint32_t)chunk_size;
             frame_header.type = NL_H2_FRAME_DATA;
             frame_header.flags = flags;
             frame_header.stream_id = stream->id;
+            h2_frame_header_write(buf + len, &frame_header);
+            len += 9 + chunk_size;
 
-            h2_frame_header_write(data_frame, &frame_header);
-            memcpy(data_frame + 9, body_ptr, chunk_size);
-
-            result = io->write_h2_frame(io, fd, data_frame, 9 + chunk_size);
-            if (result < 0) { free(frame); return -1; }
-
-            body_ptr += chunk_size;
+            if (!fp) {
+                body_ptr += chunk_size;
+            }
             remaining -= chunk_size;
 
             if (flags & 0x01) {
-                /* 已发 END_STREAM */
-                stream->state = (stream->state == NL_H2_ST_HALF_CLOSED_REMOTE)
-                                    ? NL_H2_ST_CLOSED
-                                    : NL_H2_ST_HALF_CLOSED_LOCAL;
+                /* 已发 END_STREAM：双向都结束才立即释放 */
+                if (stream->state == NL_H2_ST_HALF_CLOSED_REMOTE) {
+                    stream->state = NL_H2_ST_CLOSED;
+                    release = 1;
+                } else {
+                    stream->state = NL_H2_ST_HALF_CLOSED_LOCAL;
+                }
+                break;
             }
         }
+
+        /* 注：无论内存体还是文件体，最后一帧都必然带 END_STREAM 并
+         * break（remaining==chunk_size 或 eof 两条路径都置 0x01）。 */
     }
 
-    free(frame);
-    return 0;
+    /* 整批收尾写出 */
+    if (len > 0 && io->write_h2_frame(io, fd, buf, len) < 0) goto done;
+    rc = 0;
+
+done:
+    if (fp) fclose(fp);
+    free(buf);
+    /* 流释放放在最后：调用方（h2_process_frame）此后不再触碰 stream */
+    if (rc == 0 && release) h2_release_stream(conn, stream);
+    return rc;
 }
 
 struct nl_http2_stream* h2_find_or_create_stream(struct nl_http2_connection* conn, uint32_t stream_id) {
@@ -1311,6 +1365,7 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
                 h2_send_headers(io, fd, conn, stream, &resp);
 
                 if (resp.body) free(resp.body);
+                if (resp.file_path) free(resp.file_path);
             }
             break;
         }
@@ -1357,6 +1412,7 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
                 handler(&stream->request, &resp, user_data);
                 h2_send_headers(io, fd, conn, stream, &resp);
                 if (resp.body) free(resp.body);
+                if (resp.file_path) free(resp.file_path);
             }
             break;
         }
@@ -1386,8 +1442,11 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
         }
 
         case NL_H2_FRAME_DATA: {
-            struct nl_http2_stream* stream = h2_find_or_create_stream(conn, header.stream_id);
-            if (!stream) return -1;
+            /* 只查不建：流已释放（响应完成/RST）时的迟到 DATA 直接忽略，
+             * 否则 h2_find_or_create 会为已关闭流重新分配并再次泄漏 */
+            struct nl_http2_stream* stream = conn->streams;
+            while (stream && stream->id != header.stream_id) stream = stream->next;
+            if (!stream) break;
 
             if (header.length > 0) {
                 char* new_body = realloc(stream->request.body, stream->request.body_size + header.length);
@@ -1401,8 +1460,15 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
             h2_send_window_update(io, fd, conn, header.stream_id, header.length);
             h2_send_window_update(io, fd, conn, 0, header.length);
 
-            if (header.flags & 0x01)  /* END_STREAM：请求体收完 */
-                stream->state = NL_H2_ST_HALF_CLOSED_REMOTE;
+            if (header.flags & 0x01) {  /* END_STREAM：请求体收完 */
+                if (stream->state == NL_H2_ST_HALF_CLOSED_LOCAL) {
+                    /* 双向都结束：立即摘链释放（防长连接累计 OOM） */
+                    stream->state = NL_H2_ST_CLOSED;
+                    h2_release_stream(conn, stream);
+                } else {
+                    stream->state = NL_H2_ST_HALF_CLOSED_REMOTE;
+                }
+            }
             break;
         }
 
@@ -1412,7 +1478,9 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
                     conn->connection_window_size += ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
                                                     ((uint32_t)payload[2] << 8) | payload[3];
                 } else {
-                    struct nl_http2_stream* stream = h2_find_or_create_stream(conn, header.stream_id);
+                    /* 只查不建：迟到的窗口更新不为已释放流重新分配内存 */
+                    struct nl_http2_stream* stream = conn->streams;
+                    while (stream && stream->id != header.stream_id) stream = stream->next;
                     if (stream) {
                         stream->window_size += ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
                                                ((uint32_t)payload[2] << 8) | payload[3];
@@ -1438,17 +1506,11 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
             break;
 
         case NL_H2_FRAME_RST_STREAM: {
-            /* 仅搜索已有流，不创建（对未知流的 RST 无需理会） */
+            /* 仅搜索已有流，不创建（对未知流的 RST 无需理会）；
+             * 收到 RST 立即摘链释放，防止对端反复重置导致流堆积 */
             struct nl_http2_stream* stream = conn->streams;
             while (stream && stream->id != header.stream_id) stream = stream->next;
-            if (stream) {
-                stream->state = NL_H2_ST_CLOSED;
-                if (stream->request.body) {
-                    free(stream->request.body);
-                    stream->request.body = NULL;
-                    stream->request.body_size = 0;
-                }
-            }
+            if (stream) h2_release_stream(conn, stream);
             break;
         }
 

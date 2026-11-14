@@ -20,7 +20,7 @@
 
 - ✅ **Cross-platform**: Windows / Linux / macOS / Android (core library; extensions pending)
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
-- ✅ **Protocols**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, TCP, UDP
+- ✅ **Protocols**: HTTP/1.1, HTTP/2, WebSocket, TCP, UDP (HTTP/3/QUIC split into the standalone `quic` extension)
 - ✅ **Web Server**: Built-in HTML/Vue.js support with server-side variable replacement
 - ✅ **Data Parsing**: JSON + TOML
 - ✅ **Lazy Loading**: All components support lazy loading
@@ -177,11 +177,11 @@ BSD 3-Clause License
 
 ## Version
 
-2.4.0
+3.0.1
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v2.4.1) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v3.0.1) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 

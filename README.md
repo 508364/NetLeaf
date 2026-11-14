@@ -292,6 +292,8 @@ ctest --test-dir build --output-on-failure
 - **TLS2/TLS3 非阻塞异步**：新增 `nl_tls2_set_nonblocking()` / `nl_tls3_set_nonblocking()`，握手/收发直接返回 `WANT_READ`/`WANT_WRITE` 由事件循环驱动；修复 `handshake()` 始终返回 INVALID_STATE 的问题
 - **公共代码提取**：三平台 LinkAgg 重复实现合并为单份共享核心 `netleaf_linkagg_core.c`（约省 47KB）；`nl_lagg_start()` 改为非阻塞启动
 - **Windows 命名管道字节模式**：64KB 缓冲，任意大小载荷正常收发；新增回归测试 `test_linkagg_pull`
+- **HTTP/2 / HTTPS 稳定性修复（2026-11-13）**：HTTPS/1.1 大于 16KB 的内存体响应与 H2 大响应截断挂死修复（写路径循环处理部分写）；`nlh_resp_file` 在 H2 下 body 为 0 修复（文件流式 DATA 帧）；H2 流在 END_STREAM/CLOSED 后立即摘链释放，修复长连接累计请求 OOM；H2 发帧攒批减少 TLS 小写、提升 QPS
+- **安卓独立化（minSdk 21）**：平台差异后端拆入 `src/android/`（Bionic iconv 按 API 28 启用、运行库版本串），三 ABI 交叉编译实测通过（NDK r30）
 
 ### v3.0.0（2026-10-31）
 
@@ -307,7 +309,7 @@ ctest --test-dir build --output-on-failure
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
-| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE |
+| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE；HTTP/2/HTTPS 大响应截断与流泄漏 OOM 修复、安卓后端独立化（2026-11-13） |
 | 3.0.0 | 2026-10-31 | Web 引擎全异步重构（sendfile 零拷贝、多实例、测试体系）；HTTP/2 补完；HTTPS/2；Windows 全 IOCP 化 + UDP 16 槽接收环；QUIC 拆出独立扩展 |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS 重构（`netleaf_https` 独立、tls2/tls3 拆分）；MQTT 默认开启；`nl_util` 公共工具层；H2/QUIC 帧补全；Android 构建支持 |
 | 2.4.1 | 2026-09-24 | Lang 错误码接入多语言、动态/外部变量；清理编译告警；全平台交叉编译 |

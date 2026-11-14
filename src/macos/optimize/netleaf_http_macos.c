@@ -67,8 +67,15 @@ struct nl_http_client {
  * ============================================================ */
 static int io_write_h2_frame(struct nl_http_io* io, nl_http_handle_t handle,
                              const uint8_t* data, size_t len) {
-    ssize_t written = write(handle, data, len);
-    return (written < 0) ? -1 : (int)written;
+    (void)io;
+    /* 阻塞 socket 也可能部分写（POSIX 允许任意短写），循环发完整帧 */
+    size_t off = 0;
+    while (off < len) {
+        ssize_t written = write(handle, data + off, len - off);
+        if (written <= 0) return -1;
+        off += (size_t)written;
+    }
+    return (int)len;
 }
 
 static struct nl_http_io nl_http_io = {

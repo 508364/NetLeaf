@@ -215,6 +215,8 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 - **TLS2/TLS3 non-blocking async**: new `nl_tls2_set_nonblocking()` / `nl_tls3_set_nonblocking()` — handshake/I/O return `WANT_READ`/`WANT_WRITE` for your event loop; fixes `handshake()` always returning INVALID_STATE
 - **Shared core extraction**: the three per-platform LinkAgg copies merged into one `netleaf_linkagg_core.c` (~47KB smaller); `nl_lagg_start()` is now non-blocking
 - **Windows named pipes in byte mode**: 64KB buffer, arbitrary payload sizes; new regression test `test_linkagg_pull`
+- **HTTP/2 & HTTPS stability fixes (2026-11-13)**: >16KB in-memory responses over HTTPS/1.1 and large H2 responses no longer truncate/hang (partial-write loops on all write paths); `nlh_resp_file` now streams files as H2 DATA frames (was 200 with empty body); H2 streams are unlinked and freed right after END_STREAM/CLOSED (fixes cumulative-request OOM on long-lived connections); batched H2 frame writes reduce per-request TLS syscalls and raise QPS
+- **Android split-out (minSdk 21)**: platform backends moved into `src/android/` (Bionic iconv gated on API 28, runtime version string); verified cross-builds for all three ABIs (NDK r30)
 
 ## What's New in v3.0.0 (2026-10-31)
 
@@ -228,7 +230,7 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 
 | Version | Date | Highlights |
 | --- | --- | --- |
-| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix |
+| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix; HTTP/2/HTTPS large-response truncation & stream-leak OOM fixes, Android backend split-out (2026-11-13) |
 | 3.0.0 | 2026-10-31 | Async web engine (sendfile zero-copy, multi-instance, test suite); HTTP/2 completion; HTTPS/2; Windows full IOCP + UDP receive ring; QUIC split out |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS refactor (`netleaf_https` split, tls2/tls3); MQTT on by default; `nl_util`; H2/QUIC frame fixes; Android build support |
 | 2.4.1 | 2026-09-24 | Lang error-code i18n, dynamic/external variables; warning cleanup; full-platform cross builds |

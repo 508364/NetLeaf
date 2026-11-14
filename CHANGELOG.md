@@ -16,6 +16,26 @@
 - 异步模式下握手/收发不再内部 select 等待，直接返回 `WANT_READ` / `WANT_WRITE`，由调用方事件循环驱动；同步行为保持不变
 - 修复 `handshake()` 因 `setup_done` 未置位而始终返回 INVALID_STATE 的问题
 
+### HTTP/2 / HTTPS 稳定性修复与安卓独立化（2026-11-13，第169轮）
+
+**修复:**
+- HTTPS/1.1 内存体响应 >16KB 被截断并挂死：三平台 `nlh_tls_write_cb` 改为循环处理部分写（mbedTLS 单次写约 16KB 上限）
+- HTTP/2 大响应只发一帧（16,384 B）就卡死：六个写帧实现（TLS 三平台 `io_tls_write_h2_frame` + 明文三平台 `io_write_h2_frame`）全部改为循环写，杜绝部分写截断
+- `nlh_resp_file` 在 H2 下返回 200 但 body 为 0：`h2_send_headers` 支持 `file_path` 文件流式 DATA 帧（fopen/fread 分块，EOF 帧带 END_STREAM，两处 handler 调用点补 `free(file_path)`）
+- H2 流泄漏可稳定 OOM（单连接 10 万请求 ≈ 890 MB）：新增 `h2_release_stream` 摘链释放；DATA/WINDOW_UPDATE/RST_STREAM 改为“只查不建”，防止迟到帧把已释放流重新分配导致再次泄漏
+- H2 流释放语义：`END_STREAM` 发出且状态 `CLOSED` 后立即摘链释放（无 body 响应在 HEADERS 后即释放）；`test_frame_state_machine` 重写为新语义
+
+**性能:**
+- `h2_send_headers` 攒批发帧（HEADERS+DATA 同缓冲，约 49KB 批上限，攒满/结束一次写出），减少每请求 TLS 多次小写，提升 QPS
+
+**安卓独立化（minSdk 21）:**
+- 平台差异后端拆分：`src/common/netleaf_encoding_backend.h` + `src/linux/netleaf_encoding_iconv.c`（glibc）+ `src/android/netleaf_encoding_bionic.c`（Bionic iconv 按 `__ANDROID_API__ >= 28` 启用，21–27 回退无转码）；运行库版本串同样拆分为 `netleaf_sysinfo_version_libc.c` / `netleaf_sysinfo_version_bionic.c`
+- `netleaf_encoding_linux.c` / `netleaf_sysinfo_linux.c` 去除平台分支，`src` 树 `__ANDROID__` 编译分支清零；CMake `elseif(ANDROID)` / `elseif(UNIX)` 源列表分别选文件
+- `build_android.sh` / `build_android.bat` 三 ABI（arm64-v8a / armeabi-v7a / x86_64）实测构建通过（NDK r30 / Clang 21，`ANDROID_PLATFORM=android-21`）
+
+**验证:**
+- Windows `ctest` 9/9 通过、`test_http_frames` 52/52 断言；Android 三 ABI 构建通过
+
 ## v3.0.0
 
 > 本版本为大版本升级（2.4.2 → 3.0.0），涵盖 Web 引擎全异步重构（P1-P12）、HTTP/2 协议层补完、HTTPS/2、Windows 通用服务器全 IOCP 化等。版本号升级同步 19 个文件（CMakeLists、netleaf.h、9 个模块头 15 处版本宏、3 个内部头副本、docs/*.md、PROJECT_STRUCTURE.md）。

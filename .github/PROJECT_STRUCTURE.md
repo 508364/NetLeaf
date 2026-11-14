@@ -1,7 +1,7 @@
 # NetLeaf 项目目录结构
 
-**整理时间**: 2026-10-01
-**版本**: v3.0.0
+**整理时间**: 2026-11-13
+**版本**: v3.0.1
 
 ---
 
@@ -26,7 +26,7 @@ flowchart TD
 
     subgraph INCDIR["include/"]
         I1["netleaf.h / netleaf_module.h"]
-        I2["netleaf_tls.h / netleaf_mqtt.h / netleaf_mqtt_tls.h"]
+        I2["netleaf_tls2.h / netleaf_tls3.h / netleaf_mqtt.h / netleaf_mqtt_tls.h"]
         I3["autocomplete / autoroute / errorpage / ipc / lang / linkagg / vue .h"]
         I4["optimize/  (netleaf_http.h / netleaf_optimize.h / netleaf_websocket.h)"]
     end
@@ -34,8 +34,10 @@ flowchart TD
     subgraph SRCDIR["src/"]
         S1["netleaf_module.c"]
         S2["autocomplete/  autoroute/  errorpage/  ipc/  lang/  linkagg/  vue/"]
-        S3["tls/  mqtt/  quic/  (quic 扩展含 QUIC/H3，开发暂缓)"]
+        S3["tls2/  tls3/  mqtt/  quic/  (quic 扩展含 QUIC/H3，开发暂缓)"]
         S4["windows/  linux/  macos/  (各含 optimize/)"]
+        S5["http/  (H1/H2 纯逻辑)  common/  (公共工具层)"]
+        S6["android/  (Bionic 平台后端，minSdk 21)"]
     end
 
     subgraph EX["examples/"]
@@ -90,18 +92,20 @@ flowchart TD
 | `errorpage` | 错误页面 | `netleaf_errorpage.h` |
 | `ipc` | 进程间通信 | `netleaf_ipc.h` |
 | `lang` | 多语言 | `netleaf_lang.h` |
-| `linkagg` | 链路聚合 | `netleaf_linkagg.h` |
+| `linkagg` | 链路聚合（反向数据池，三平台共享核心 `netleaf_linkagg_core.c`） | `netleaf_linkagg.h` |
 | `vue` | Vue.js 支持 | `netleaf_vue.h` |
 | `mqtt` | MQTT 协议（开发中） | `netleaf_mqtt.h` |
+| `tls2` | TLS 扩展（mbedTLS 2.28.10，`BUILD_TLS`） | `netleaf_tls2.h` |
+| `tls3` | TLS 扩展（mbedTLS 3.x，`BUILD_TLS3`） | `netleaf_tls3.h` |
 
 ### 平台支持
 
 | 平台 | 源文件目录 | 状态 |
 |------|-----------|------|
 | Windows | `src/windows/` | 完整支持 |
-| Linux | `src/linux/` | 完整支持 |
+| Linux | `src/linux/` + `src/common/`（iconv/glibc 后端） | 完整支持 |
 | macOS | `src/macos/` | 完整支持 |
-| Android | `src/linux/`（Bionic 交叉编译） | 核心库完整支持；扩展系统暂不支持（代码保留、后续跟进） |
+| Android | `src/linux/` + `src/android/`（Bionic 后端，minSdk 21） | 核心库完整支持；扩展系统暂不支持（代码保留、后续跟进） |
 
 ---
 
@@ -153,4 +157,4 @@ NL_MODULE_DEFINE(ModuleName, "Author", "1.0", "Description");
 
 ---
 
-*最后更新: 2026-09-18*
+*最后更新: 2026-11-13*

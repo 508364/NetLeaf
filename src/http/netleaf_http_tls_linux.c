@@ -269,13 +269,20 @@ struct nlh_tls_server {
     int client_auth;
 };
 
-/* TLS 版 h2 写帧回调：io->user 持有 TLS 上下文 */
+/* TLS 版 h2 写帧回调：io->user 持有 TLS 上下文。
+ * mbedTLS 单次 send 约 16KB 上限，一帧 9+16384 字节会被部分写，
+ * 必须循环发完，否则对端收到截断帧后连接挂死。 */
 static int io_tls_write_h2_frame(struct nl_http_io* io, nl_http_handle_t handle,
                                  const uint8_t* data, size_t len) {
     (void)handle;
     NL_HTTPS_TLS_CTX* tls = (NL_HTTPS_TLS_CTX*)io->user;
-    int n = NL_HTTPS_TLS_send(tls, (const char*)data, len);
-    return (n < 0) ? -1 : n;
+    size_t off = 0;
+    while (off < len) {
+        int n = NL_HTTPS_TLS_send(tls, (const char*)data + off, len - off);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return (int)len;
 }
 
 /* HTTP/2 over TLS 会话（服务端视角） */
@@ -407,10 +414,9 @@ static void nlh_tls_h1_session(NL_HTTPS_TLS_CTX* tls,
         if (keep_alive && parsed)
             nl_http_response_set_header(&resp, "Connection", "keep-alive");
         nl_http_generate_response_http1(&resp, &response_data, &response_len);
-        if (response_data) {
-            if (response_len > 0) NL_HTTPS_TLS_send(tls, response_data, response_len);
-            free(response_data);
-        }
+        if (response_data && response_len > 0)
+            nlh_tls_write_cb(tls, response_data, response_len); /* 循环部分写：mbedTLS 单次约 16KB 上限，只调一次会截断大响应 */
+        free(response_data);
         /* 文件响应：头部已带 Content-Length，正文在此分块加密发出
          * （TLS 无法使用内核 sendfile/TransmitFile 零拷贝） */
         if (resp.file_path) {

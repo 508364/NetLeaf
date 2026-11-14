@@ -169,13 +169,17 @@ elseif(APPLE)
     )
 elseif(ANDROID)
     # Android 复用 Linux/epoll 风格的 POSIX 源（Bionic 提供 epoll/poll/socket）。
-    # Android 没有 /proc/cpuinfo 的 GLIBC 版本概念，sysinfo 源已在 Bionic 下
-    # 做了运行时版本识别（见 netleaf_sysinfo_linux.c 的 __ANDROID__ 分支）。
+    # 平台差异后端已从 Linux 源拆出，安卓专属实现集中在 src/android/：
+    #   - netleaf_encoding_bionic.c    Bionic iconv 回退（minSdk 21 无 iconv，
+    #                                  按 __ANDROID_API__ >= 28 自动启用 Bionic iconv）
+    #   - netleaf_sysinfo_version_bionic.c  运行库版本串（Bionic）
     set(NETLEAF_PLATFORM_SOURCES
         src/linux/netleaf_linux.c
         src/linux/netleaf_encoding_linux.c
+        src/android/netleaf_encoding_bionic.c
         src/linux/netleaf_lazy_linux.c
         src/linux/netleaf_sysinfo_linux.c
+        src/android/netleaf_sysinfo_version_bionic.c
     )
     set(NL_OPTIMIZE_HTTP_SOURCES
         src/http/netleaf_http_common.c
@@ -190,11 +194,15 @@ elseif(ANDROID)
         src/linux/optimize/netleaf_websocket_linux.c
     )
 elseif(UNIX)
+    # Linux 平台差异后端：iconv 转码 + glibc 运行库版本串
+    # （安卓专属版本在 src/android/，见上方 ANDROID 分支）
     set(NETLEAF_PLATFORM_SOURCES
         src/linux/netleaf_linux.c
         src/linux/netleaf_encoding_linux.c
+        src/linux/netleaf_encoding_iconv.c
         src/linux/netleaf_lazy_linux.c
         src/linux/netleaf_sysinfo_linux.c
+        src/linux/netleaf_sysinfo_version_libc.c
     )
     set(NL_OPTIMIZE_HTTP_SOURCES
         src/http/netleaf_http_common.c

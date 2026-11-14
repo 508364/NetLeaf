@@ -5,10 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <iconv.h>
-#include <langinfo.h>
 
 #include "netleaf.h"
+#include "common/netleaf_encoding_backend.h"
+
+/* 转码后端（iconv / Bionic 回退）已按平台拆分，本文件不再包含平台分支：
+ *   - Linux（非 Android）：src/linux/netleaf_encoding_iconv.c
+ *   - Android（minSdk 21）：src/android/netleaf_encoding_bionic.c */
 
 // 编码模块懒加载状态
 static int g_encoding_module_loaded = 0;
@@ -47,44 +50,18 @@ static int contains_chinese(const char* input, size_t input_len) {
 }
 
 struct encoding_converter {
-    iconv_t cd;
+    void* cd;
     char* src_encoding;
     char* dst_encoding;
 };
 
-static iconv_t create_iconv(const char* from, const char* to) {
-    return iconv_open(to, from);
+static void* create_iconv(const char* from, const char* to) {
+    return nl_encoding_backend_open(from, to);
 }
 
-static int do_convert(iconv_t cd, const char* input, size_t input_len, 
+static int do_convert(void* cd, const char* input, size_t input_len, 
                       char** output, size_t* output_len) {
-    if (cd == (iconv_t)-1) {
-        return -1;
-    }
-    
-    size_t buf_size = input_len * 4;
-    *output = (char*)malloc(buf_size);
-    if (!*output) {
-        iconv_close(cd);
-        return -1;
-    }
-    
-    char* inbuf = (char*)input;
-    char* outbuf = *output;
-    size_t inbytesleft = input_len;
-    size_t outbytesleft = buf_size;
-    
-    size_t result = iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
-    *output_len = buf_size - outbytesleft;
-    
-    iconv_close(cd);
-    
-    if (result == (size_t)-1) {
-        free(*output);
-        return -1;
-    }
-    
-    return 0;
+    return nl_encoding_backend_convert(cd, input, input_len, output, output_len);
 }
 
 // 初始化编码模块（懒加载）
@@ -256,8 +233,8 @@ NL_API char* nl_encoding_convert(const char* input, size_t input_len,
         return result;
     }
     
-    iconv_t cd = create_iconv(source_encoding, target_encoding);
-    if (cd == (iconv_t)-1) {
+    void* cd = create_iconv(source_encoding, target_encoding);
+    if (!cd) {
         return NULL;
     }
     
@@ -479,10 +456,10 @@ NL_API const char* nl_encoding_get_system_default(void) {
         }
     }
     
-    const char* codeset = nl_langinfo(CODESET);
+    const char* codeset = nl_encoding_backend_default_codeset();
     if (codeset) {
         return codeset;
     }
-    
+
     return "UTF-8";
 }

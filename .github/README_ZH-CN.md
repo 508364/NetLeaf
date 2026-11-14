@@ -59,10 +59,10 @@ chmod +x build.sh
 
 ```bash
 # Linux - 自动检测可用交叉编译工具链
-./build_all_linux.sh
+./build_all.sh
 
 # Windows
-build_all_windows.bat
+build_all.bat
 ```
 
 ### Android 构建（移动端）
@@ -77,11 +77,12 @@ build_android.bat
 ```
 
 支持 `arm64-v8a`（推荐）/`armeabi-v7a`/`x86_64`，`minSdkVersion` 21。
-需 Android NDK r25+，脚本自动探测 NDK 路径。
+需 Android NDK r25+，脚本自动探测 NDK 路径（环境变量 `ANDROID_NDK*`/`NDK_HOME` → SDK `ndk/` 目录取版本号最大者；已实测 NDK r30 / Clang 21，三 ABI 构建通过）。
 
-> **范围说明**：Android 覆盖**核心库**（`netleaf_core`）；**扩展系统（NL Extension）
+> **范围说明**：Android 一键脚本**仅构建核心库**（`netleaf_core`），产物为
+> `libnetleaf.so` + 公共头文件（不含扩展共享库）；**扩展系统（NL Extension）
 > 暂不支持 Android 运行时**，但源码与构建配置保留，后续按扩展逐个跟进。
-> 各扩展共享库在 Android 目标下仍按 Linux 语义构建。
+> 平台差异后端已拆分至 `src/android/`（Bionic），`src` 树 `__ANDROID__` 编译分支清零。
 
 详细指南见 `docs/android_build.md`。
 
@@ -266,6 +267,11 @@ int main() {
 ```
 
 ## 更新日志
+
+**v3.0.1（2026-11-13）:**
+- HTTP/2 / HTTPS 稳定性修复：HTTPS/1.1 >16KB 内存体响应截断挂死、H2 大响应单帧卡死、`nlh_resp_file` 在 H2 下 body=0、H2 长连接累计请求流泄漏 OOM
+- TLS 写性能：`h2_send_headers` 攒批发帧（HEADERS+DATA 同缓冲），减少小写、提升 QPS
+- 安卓独立化（minSdk 21）：平台后端拆分至 `src/android/`（Bionic），三 ABI（arm64-v8a / armeabi-v7a / x86_64）实测构建通过
 
 **查看完整版本历史:** [CHANGELOG.md](CHANGELOG.md)
 
@@ -593,7 +599,7 @@ gcc myapp.c -I include -L build/lib -lnetleaf -lpthread -o myapp
 ## 功能特性
 
 ✅ **TCP/UDP** - 完整的网络协议支持  
-✅ **HTTP/1.1, HTTP/2, HTTP/3** - 全HTTP协议栈  
+✅ **HTTP/1.1, HTTP/2** - 全HTTP协议栈（HTTP/3/QUIC 已拆为独立 `quic` 扩展）  
 ✅ **内联HTML/Vue** - 直接在代码中嵌入响应式界面  
 ✅ **现代CSS** - 美观的渐变和动画效果  
 ✅ **跨平台** - Windows (IOCP) + Linux (epoll) + macOS (kqueue) 🔶  
