@@ -2307,7 +2307,7 @@ static void* pr_h2_thread_macos(void* param) {
     int idx = a->idx, cfd = a->cfd;
     int init_len = a->init_len, is_upgrade = a->is_upgrade;
     char* init = a->init;
-    int port = eng->port;
+    int port = eng->server->port;
     free(a);
 
     (void)nl_px_h2_bridge_run((intptr_t)cfd, port, init,
@@ -2680,6 +2680,19 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
                     // kqueue 单事件单 filter：可读事件会作为独立 kevent 返回，无需再处理读
                     continue;
                 }
+                // 已建立上游连接（后续 body / 101 升级隧道）：必须先直达转发。
+                // 不能先 recv 到 hbuf 再 pump —— pump 会再次 recv，非阻塞返回 EAGAIN 时
+                // 刚读到的字节会被直接丢弃（WS 隧道回显失败的根因）。
+                if (eng->pr_fd_upstream[idx] > 0) {
+                    int rc = pr_pump_once(eng, idx, cfd, eng->pr_fd_upstream[idx],
+                                          eng->pr_hbuf[idx], 8192, 0);
+                    if (rc < 0) {
+                        if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                        close(cfd);
+                        pr_free_slot(eng, idx);
+                    }
+                    continue;
+                }
                 // 客户端侧：收请求
                 char*  hbuf = eng->pr_hbuf[idx];
                 int*   hlen = &eng->pr_hdr_len[idx];
@@ -2791,10 +2804,10 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
                                 if (ffd >= 0) {
                                     off_t off = 0;
                                     while (off < plan.file_size) {
-                                        size_t len = (size_t)(plan.file_size - off);
+                                        off_t len = (off_t)(plan.file_size - off);
                                         if (len > 1024*1024) len = 1024*1024;  // 每次最多 1MB
                                         int sret = sendfile(ffd, cfd, off, &len, NULL, 0);
-                                        off += (off_t)len;
+                                        off += len;
                                         if (sret == 0) continue;
                                         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
                                         break;
@@ -2886,15 +2899,6 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
                     eng->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
                     continue;
                 }
-
-                // 后续客户端数据（body 等）→ 非阻塞转发上游（该方向不解析）
-                int rc = pr_pump_once(eng, idx, cfd, eng->pr_fd_upstream[idx], hbuf, 8192, 0);
-                if (rc < 0) {
-                    if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
-                    close(cfd);
-                    pr_free_slot(eng, idx);
-                }
-                continue;
             }
 
             // 上游侧：读响应 → 写客户端（该方向旁路喂 framing 解析器）

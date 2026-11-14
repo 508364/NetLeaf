@@ -2577,7 +2577,7 @@ static void* pr_h2_thread_linux(void* param) {
     int idx = a->idx, cfd = a->cfd;
     int init_len = a->init_len, is_upgrade = a->is_upgrade;
     char* init = a->init;
-    unsigned short port = (unsigned short)eng->port;
+    unsigned short port = (unsigned short)eng->server->port;
     free(a);
 
     (void)nl_px_h2_bridge_run((intptr_t)cfd, (int)port, init,
@@ -3324,6 +3324,21 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
                     if (eng->pr_role[idx] == PR_ROLE_PROXY &&
                         !(events[i].events & (EPOLLIN | EPOLLRDHUP))) continue;
                 }
+                // 已建立上游连接（后续 body / 101 升级隧道）：必须先直达转发。
+                // 注意：不能先 recv 到 hbuf 再走 pump —— pump 会再次 recv，
+                // 非阻塞 socket 返回 EAGAIN 时，刚读到的字节会被直接丢弃。
+                if (eng->pr_fd_upstream[idx] > 0) {
+                    int rc = pr_pump_once(eng, idx, eng->pr_fd_client[idx],
+                                          eng->pr_fd_upstream[idx],
+                                          eng->pr_hbuf[idx], 8192, 0);
+                    if (rc < 0) {
+                        if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                        close(eng->pr_fd_client[idx]);
+                        pr_free_slot(eng, idx);
+                    }
+                    continue;
+                }
                 // 客户端侧：收请求
                 // P2: 本地路由处于 SERVE_OUT/SERVE_FILE 阶段时，不再读请求（请求已处理完）
                 if (eng->pr_role[idx] == PR_ROLE_LOCAL &&
@@ -3582,17 +3597,6 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
                     eng->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
                     continue;
                 }
-
-                // 后续客户端数据（body 等）→ 非阻塞转发上游（该方向不解析）
-                int rc = pr_pump_once(eng, idx, eng->pr_fd_client[idx],
-                                       eng->pr_fd_upstream[idx], hbuf, 8192, 0);
-                if (rc < 0) {
-                    if (eng->pr_fd_upstream[idx] > 0) close(eng->pr_fd_upstream[idx]);
-                    epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
-                    close(eng->pr_fd_client[idx]);
-                    pr_free_slot(eng, idx);
-                }
-                continue;
             }
 
             // 上游侧：读响应 → 写客户端（该方向旁路喂 framing 解析器）

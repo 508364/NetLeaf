@@ -56,21 +56,20 @@ option(NETLEAF_LEGACY_WORKER_POOL "Build legacy blocking worker pool (Windows, d
 #       build type 的默认优化等级，避免对下游用户产生非预期的等级抬升。
 option(NETLEAF_ENABLE_LTO "Enable Link-Time Optimization" OFF)
 
-# ---- 体积优先：Release 用 -Os（MSVC /O1）替代默认 -O3，并默认启用 LTO ----
-# 目标：热路径性能不退化（-Os 附带尺寸优化，配合 LTO 跨文件内联），
-#      同时明显减小 netleaf.dll / .so 体积。
-option(NETLEAF_SIZE_OPTIMIZED "Release 使用 -Os/-O1 + LTO 以减小二进制体积" ON)
+# ---- Release 优化：-O2 + LTO（MSVC /O2 + /GL /LTCG）----
+# 热路径优先：避免 -Os 牺牲吞吐；LTO 跨文件内联抵消部分代码膨胀。
+option(NETLEAF_SIZE_OPTIMIZED "Release 使用 -O2（MSVC /O2）并启用 LTO" ON)
 if(NETLEAF_SIZE_OPTIMIZED)
     if(MSVC)
-        set(CMAKE_C_FLAGS_RELEASE "/O1 /DNDEBUG" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_FLAGS_RELEASE "/O1 /DNDEBUG" CACHE STRING "" FORCE)
-        set(CMAKE_C_FLAGS_MINSIZEREL "/O1 /DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_C_FLAGS_RELEASE "/O2 /DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_C_FLAGS_MINSIZEREL "/O2 /DNDEBUG" CACHE STRING "" FORCE)
     else()
-        set(CMAKE_C_FLAGS_RELEASE "-Os -DNDEBUG" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_FLAGS_RELEASE "-Os -DNDEBUG" CACHE STRING "" FORCE)
-        set(CMAKE_C_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_C_FLAGS_MINSIZEREL "-O2 -DNDEBUG" CACHE STRING "" FORCE)
     endif()
-    message(STATUS "NetLeaf: size-optimized Release (-Os/-O1)")
+    message(STATUS "NetLeaf: Release optimization -O2 + LTO")
 endif()
 
 # LTO 只作用于 netleaf_core 自身（见 add_library 之后），不下发到第三方
@@ -270,7 +269,8 @@ target_compile_definitions(netleaf_core PRIVATE NL_EXPORTS)
 # 体积/性能：仅核心库启用 LTO（跨文件内联热路径），第三方库保持原样。
 if(NETLEAF_LTO_ENABLED)
     set_target_properties(netleaf_core PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
-    if(NOT MSVC)
+    # -fno-fat-lto-objects 仅 GCC 支持；Clang 会告警 "optimization flag not supported"。
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
         target_compile_options(netleaf_core PRIVATE -fno-fat-lto-objects)
         target_link_options(netleaf_core PRIVATE -fno-fat-lto-objects)
     endif()

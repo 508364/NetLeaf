@@ -111,7 +111,7 @@ build_arch() {
     local cc_path
     if ! cc_path="$(detect_cc "$arch")"; then
         echo -e "${YELLOW}[SKIP] Linux ${name}: no compiler available${NC}"
-        return 0
+        return 2   # 2 = 跳过（区别于失败），调用方不应打包
     fi
 
     local arch_dir="${BUILD_DIR}/linux_${arch}"
@@ -204,11 +204,19 @@ else
 fi
 
 BUILT=()
+SKIPPED=()
+FAILED=()
 for arch in "${TARGETS[@]}"; do
-    if build_arch "$arch"; then
+    build_arch "$arch"
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
         package_arch "$arch"
         BUILT+=("$arch")
         echo
+    elif [[ $rc -eq 2 ]]; then
+        SKIPPED+=("$arch")
+    else
+        FAILED+=("$arch")
     fi
 done
 
@@ -223,3 +231,10 @@ echo "Packages:"
 for arch in "${BUILT[@]}"; do
     echo "  - ${RELEASES_DIR}/NetLeaf-${VERSION}-linux-${arch}.tar.gz"
 done
+if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}Skipped (no compiler): ${SKIPPED[*]}${NC}"
+fi
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+    echo -e "${RED}Failed: ${FAILED[*]}${NC}"
+    exit 1
+fi

@@ -91,6 +91,8 @@ build_macos() {
     local bdir="${BUILD_DIR}/macos_${arch}"
     echo "----------------------------------------"
     echo "[Build] macOS ${arch} (${triplet})"
+    # 先清掉旧产物，避免构建失败时把上次残留的包误报为成功
+    rm -f "${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz"
     rm -rf "$bdir"
     mkdir -p "$bdir"
 
@@ -139,17 +141,21 @@ build_macos() {
 }
 
 FAILED=()
+BUILT=()
 for arch in "${TARGETS[@]}"; do
-    build_macos "$arch" || FAILED+=("$arch")
+    if build_macos "$arch"; then
+        BUILT+=("$arch")
+    else
+        FAILED+=("$arch")
+    fi
 done
 
 echo
 echo "========================================"
 echo "  macOS build finished"
 echo "========================================"
-for arch in "${TARGETS[@]}"; do
-    [[ -f "${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz" ]] && \
-        echo "  ${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz"
+for arch in "${BUILT[@]}"; do
+    echo "  ${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz"
 done
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     echo -e "${RED}失败: ${FAILED[*]}${NC}"
