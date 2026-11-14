@@ -29,6 +29,7 @@
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <process.h>   /* WS 反代用例的上游线程 */
     static void nl_sleep_ms(int ms) { Sleep((DWORD)ms); }
     /* nl_sock_t 由 netleaf.h 定义（_WIN32 下 = SOCKET） */
     #define NL_SOCK_INVALID INVALID_SOCKET
@@ -43,6 +44,7 @@
     #include <unistd.h>
     #include <signal.h>
     #include <strings.h>
+    #include <pthread.h>   /* WS 反代用例的上游线程 */
     static void nl_sleep_ms(unsigned int ms) { usleep(ms * 1000u); }
     /* nl_sock_t 由 netleaf.h 定义（POSIX 下 = int） */
     #define NL_SOCK_INVALID (-1)
@@ -464,6 +466,164 @@ static void case_abort(void) {
     engine_stop(s);
 }
 
+/* ------------------------------------------------------------------ */
+/* 用例 j：WS 升级隧道反代（101 → 双向裸字节）                          */
+/* 上游为手写 TCP 服务：校验 Upgrade / Sec-WebSocket-Key 是否透传，     */
+/* 回 101 后把收到的字节原样回显。同时验证：p2 头透传、p3 隧道状态机。  */
+/* ------------------------------------------------------------------ */
+#define WS_UPSTREAM_PORT 19002
+
+typedef struct {
+    int port;
+    int ready;
+    int saw_upgrade;
+    int saw_key;
+} ws_up_ctx_t;
+
+#ifdef _WIN32
+static unsigned __stdcall ws_upstream_proc(void* p) {
+#else
+static void* ws_upstream_proc(void* p) {
+#endif
+    ws_up_ctx_t* ctx = (ws_up_ctx_t*)p;
+    nl_sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == NL_SOCK_INVALID) return 0;
+    {
+        int yes = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)ctx->port);
+    a.sin_addr.s_addr = htonl(0x7F000001);
+    if (bind(ls, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 4) != 0) {
+        nl_sock_close(ls);
+        return 0;
+    }
+    ctx->ready = 1;
+    nl_sock_t c = accept(ls, NULL, NULL);
+    if (c != NL_SOCK_INVALID) {
+        char req[4096];
+        int n = nl_sock_recv(c, req, (int)sizeof(req) - 1, 0);
+        if (n > 0) {
+            req[n] = '\0';
+            ctx->saw_upgrade = strstr(req, "Upgrade: websocket") != NULL;
+            ctx->saw_key = strstr(req, "Sec-WebSocket-Key:") != NULL;
+            const char* resp =
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: test-accept\r\n\r\n";
+            nl_sock_send(c, resp, (int)strlen(resp), 0);
+            for (;;) {   /* 原样回显，验证隧道双向 */
+                char b[512];
+                int m = nl_sock_recv(c, b, (int)sizeof(b), 0);
+                if (m <= 0) break;
+                if (nl_sock_send(c, b, m, 0) <= 0) break;
+            }
+        }
+        nl_sock_close(c);
+    }
+    nl_sock_close(ls);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void case_ws_proxy(void) {
+    printf("\n[用例] j. WS 升级隧道反代\n");
+    ws_up_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.port = WS_UPSTREAM_PORT;
+
+#ifdef _WIN32
+    HANDLE th = (HANDLE)_beginthreadex(NULL, 0, ws_upstream_proc, &ctx, 0, NULL);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, ws_upstream_proc, &ctx) != 0) {
+        expect("启动 WS 上游线程", 0);
+        return;
+    }
+#endif
+    nl_sleep_ms(200);
+
+    int port = g_port++;
+    char target[64];
+    snprintf(target, sizeof(target), "http://127.0.0.1:%d", WS_UPSTREAM_PORT);
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start proxy server", 0); return; }
+    nl_web_add_proxy(s, "/ws", target);
+    nl_sleep_ms(50);
+
+    nl_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(0x7F000001);
+    int conn_ok = (fd != NL_SOCK_INVALID &&
+                   connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    expect("连接反代服务器", conn_ok);
+    if (conn_ok) {
+#ifdef _WIN32
+        DWORD rto = 5000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rto, sizeof(rto));
+#else
+        struct timeval tv = {5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        const char* upreq =
+            "GET /ws HTTP/1.1\r\n"
+            "Host: t\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        nl_sock_send(fd, upreq, (int)strlen(upreq), 0);
+
+        char resp[4096];
+        int total = 0;
+        resp[0] = '\0';
+        while (total < (int)sizeof(resp) - 1 && !strstr(resp, "\r\n\r\n")) {
+            int n = nl_sock_recv(fd, resp + total, (int)sizeof(resp) - 1 - total, 0);
+            if (n <= 0) break;
+            total += n;
+            resp[total] = '\0';
+        }
+        expect("下游收到 101 Switching Protocols",
+               strstr(resp, "101 Switching Protocols") != NULL);
+        expect("101 响应头透传 Upgrade",
+               strstr(resp, "Upgrade: websocket") != NULL);
+
+        /* 隧道建立后双向裸字节：发什么回什么 */
+        const char* ping = "PING-PONG-123";
+        nl_sock_send(fd, ping, (int)strlen(ping), 0);
+        char echo[512];
+        int et = 0;
+        echo[0] = '\0';
+        while (et < (int)sizeof(echo) - 1 && et < (int)strlen(ping)) {
+            int n = nl_sock_recv(fd, echo + et, (int)sizeof(echo) - 1 - et, 0);
+            if (n <= 0) break;
+            et += n;
+            echo[et] = '\0';
+        }
+        expect("隧道双向回显", strcmp(echo, ping) == 0);
+        nl_sock_close(fd);
+    }
+
+#ifdef _WIN32
+    if (th) { WaitForSingleObject(th, 5000); CloseHandle(th); }
+#else
+    pthread_join(th, NULL);
+#endif
+    expect("上游收到 Upgrade 头（请求头透传）", ctx.saw_upgrade);
+    expect("上游收到 Sec-WebSocket-Key", ctx.saw_key);
+    engine_stop(s);
+}
+
 int main(void) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -474,6 +634,7 @@ int main(void) {
     case_file();
     case_redirect();
     case_proxy();
+    case_ws_proxy();
     case_head();
     case_404();
     case_sequential();

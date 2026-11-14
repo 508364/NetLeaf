@@ -56,22 +56,32 @@ option(NETLEAF_LEGACY_WORKER_POOL "Build legacy blocking worker pool (Windows, d
 #       build type 的默认优化等级，避免对下游用户产生非预期的等级抬升。
 option(NETLEAF_ENABLE_LTO "Enable Link-Time Optimization" OFF)
 
-if(NETLEAF_ENABLE_LTO)
+# ---- 体积优先：Release 用 -Os（MSVC /O1）替代默认 -O3，并默认启用 LTO ----
+# 目标：热路径性能不退化（-Os 附带尺寸优化，配合 LTO 跨文件内联），
+#      同时明显减小 netleaf.dll / .so 体积。
+option(NETLEAF_SIZE_OPTIMIZED "Release 使用 -Os/-O1 + LTO 以减小二进制体积" ON)
+if(NETLEAF_SIZE_OPTIMIZED)
     if(MSVC)
-        # /GL：生成 LTO 元数据；/LTCG：链接时优化
-        add_compile_options(/GL)
-        add_link_options(/LTCG)
+        set(CMAKE_C_FLAGS_RELEASE "/O1 /DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_CXX_FLAGS_RELEASE "/O1 /DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_C_FLAGS_MINSIZEREL "/O1 /DNDEBUG" CACHE STRING "" FORCE)
     else()
-        # GCC / Clang：编译 + 链接均加 -flto（不改变默认优化等级）
-        add_compile_options(-flto)
-        add_link_options(-flto)
-        # 对 MinGW 额外补 -fno-fat-lto-objects 以减小 dll 体积
-        if(MINGW)
-            add_compile_options(-fno-fat-lto-objects)
-            add_link_options(-fno-fat-lto-objects)
-        endif()
+        set(CMAKE_C_FLAGS_RELEASE "-Os -DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_CXX_FLAGS_RELEASE "-Os -DNDEBUG" CACHE STRING "" FORCE)
+        set(CMAKE_C_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "" FORCE)
     endif()
-    message(STATUS "NetLeaf: LTO enabled (NETLEAF_ENABLE_LTO=ON)")
+    message(STATUS "NetLeaf: size-optimized Release (-Os/-O1)")
+endif()
+
+# LTO 只作用于 netleaf_core 自身（见 add_library 之后），不下发到第三方
+# （mbedTLS/QUIC 等）目标 —— 全局 -flto 会让第三方大文件编译内存暴涨。
+if(NETLEAF_ENABLE_LTO OR NETLEAF_SIZE_OPTIMIZED)
+    set(NETLEAF_LTO_ENABLED ON)
+    if(MSVC)
+        message(STATUS "NetLeaf: LTO enabled (/GL + /LTCG, netleaf_core only)")
+    else()
+        message(STATUS "NetLeaf: LTO enabled (-flto, netleaf_core only)")
+    endif()
 endif()
 
 # ============================================================
@@ -231,6 +241,12 @@ endif()
 # 编入核心库并以 NL_API 导出，供所有扩展（链接 netleaf_core）直接调用。
 set(NETLEAF_COMMON_SOURCES
     src/common/nl_util.c
+    src/common/nl_proxy_core.c
+    src/common/nl_px_tunnel.c
+    src/common/nl_px_pool.c
+    src/common/nl_px_io.c
+    src/common/nl_px_h2.c
+    src/common/nl_px_local.c
 )
 
 set(NETLEAF_CORE_SOURCES
@@ -250,6 +266,15 @@ set_target_properties(netleaf_core PROPERTIES
 )
 target_include_directories(netleaf_core PUBLIC include include/optimize src)
 target_compile_definitions(netleaf_core PRIVATE NL_EXPORTS)
+
+# 体积/性能：仅核心库启用 LTO（跨文件内联热路径），第三方库保持原样。
+if(NETLEAF_LTO_ENABLED)
+    set_target_properties(netleaf_core PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+    if(NOT MSVC)
+        target_compile_options(netleaf_core PRIVATE -fno-fat-lto-objects)
+        target_link_options(netleaf_core PRIVATE -fno-fat-lto-objects)
+    endif()
+endif()
 
 # Platform-specific linking for core
 if(WIN32)
@@ -325,6 +350,7 @@ if(BUILD_TLS OR BUILD_TLS3)
     add_library(netleaf_https SHARED
         ${NL_OPTIMIZE_HTTP_TLS_SOURCES}
         src/http/netleaf_https_ext.c
+        src/http/netleaf_https_session.c
     )
     target_include_directories(netleaf_https PUBLIC
         include

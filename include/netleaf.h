@@ -908,6 +908,23 @@ NL_API int nl_web_set_idle_timeout(nl_web_server_t* server, int ms);
 NL_API int nl_web_force_legacy_pool(nl_web_server_t* server, int enable);
 
 /**
+ * @brief 监听地址族模式（IPv4 / IPv6 / 双栈）
+ */
+typedef enum {
+    NL_WEB_LISTEN_DUAL = 0,  /**< 双栈：IPv6 socket + IPV6_V6ONLY=0（默认，失败回退 IPv4） */
+    NL_WEB_LISTEN_V4   = 1,  /**< 仅 IPv4 */
+    NL_WEB_LISTEN_V6   = 2   /**< 仅 IPv6（IPV6_V6ONLY=1，不做 IPv4 回退） */
+} nl_web_listen_mode_t;
+
+/**
+ * @brief 设置监听地址族模式，须在 nl_web_start 之前调用。
+ * @details 未调用时读取环境变量 NETLEAF_LISTEN_MODE=v4|v6|dual（默认 dual），
+ *          兼容旧开关 NETLEAF_LISTEN_IPV6=0（等价 v4）。
+ * @return NL_OK / NL_EINVAL
+ */
+NL_API int nl_web_set_listen_mode(nl_web_server_t* server, nl_web_listen_mode_t mode);
+
+/**
  * @brief Add a route to web server
  */
 NL_API int nl_web_add_route(nl_web_server_t* server, const char* path, const char* content, const char* content_type);
