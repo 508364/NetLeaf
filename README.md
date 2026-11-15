@@ -28,7 +28,7 @@
 
 - **TLS/SSL 加密** - `netleaf_tls2`（mbedTLS 2.28.10 LTS，TLS 1.0-1.3）与 `netleaf_tls3`（mbedTLS 3.6.x，TLS 1.2/1.3）
 
-- **H1 核心服务端并发可配置** - Linux/macOS worker 池 / Windows 全 IOCP 完成线程（1..64）；UDP Windows 侧 16 槽接收环防突发丢包
+- **H1 核心服务端并发可配置** - Linux/macOS 需先调用 `nl_server_start_workers()` 显式启用 worker 池（默认纯 epoll/kqueue 就地处理），Windows 全 IOCP 完成线程（1..64）；UDP Windows 侧 16 槽接收环防突发丢包
 
 - **智能路由 / 多语言 / Vue 集成** - 404 路由建议、国际化错误消息、后端 Vue 组件生成
 
@@ -294,6 +294,9 @@ ctest --test-dir build --output-on-failure
 - **Windows 命名管道字节模式**：64KB 缓冲，任意大小载荷正常收发；新增回归测试 `test_linkagg_pull`
 - **HTTP/2 / HTTPS 稳定性修复（2026-11-13）**：HTTPS/1.1 大于 16KB 的内存体响应与 H2 大响应截断挂死修复（写路径循环处理部分写）；`nlh_resp_file` 在 H2 下 body 为 0 修复（文件流式 DATA 帧）；H2 流在 END_STREAM/CLOSED 后立即摘链释放，修复长连接累计请求 OOM；H2 发帧攒批减少 TLS 小写、提升 QPS
 - **安卓独立化（minSdk 21）**：平台差异后端拆入 `src/android/`（Bionic iconv 按 API 28 启用、运行库版本串），三 ABI 交叉编译实测通过（NDK r30）
+- **跨协议反代 5 项缺陷修复（2026-11-15）**：`.so` 后缀差一导致 Linux/macOS 扩展无法自动加载修复；扩展发现改为文件名派生优先并移除 `get_module_info` 误用（段错误）、`dlsym` 校验 `library_id` 防跨模块误注册；`nl_proxy_connect_upstream` 改用新 `conn_wrap` TLS 契约（修复 HTTPS/H2 上游 100% 502）；移除 H2 侧 HPACK 容量更新写入错位
+- **HPACK 动态表容量更新解码**：`hpack_decode_header` 支持 RFC 7541 §6.3 容量更新指令，不再整块错位丢 `:path`
+- **worker 池显式启用（2026-11-15）**：Linux/macOS worker 池默认不启动（纯 epoll/kqueue），配置了并发度也需在 `nl_server_start()` 前调用新 API `nl_server_start_workers()` 才建池；修复 stop+destroy 双重 join 段错误
 
 ### v3.0.0（2026-10-31）
 
@@ -309,7 +312,7 @@ ctest --test-dir build --output-on-failure
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
-| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE；HTTP/2/HTTPS 大响应截断与流泄漏 OOM 修复、安卓后端独立化（2026-11-13） |
+| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE；HTTP/2/HTTPS 大响应截断与流泄漏 OOM 修复、安卓后端独立化（2026-11-13）；跨协议反代 5 项缺陷修复、HPACK 容量更新解码、Linux/macOS worker 池改为 `nl_server_start_workers()` 显式启用（2026-11-15） |
 | 3.0.0 | 2026-10-31 | Web 引擎全异步重构（sendfile 零拷贝、多实例、测试体系）；HTTP/2 补完；HTTPS/2；Windows 全 IOCP 化 + UDP 16 槽接收环；QUIC 拆出独立扩展 |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS 重构（`netleaf_https` 独立、tls2/tls3 拆分）；MQTT 默认开启；`nl_util` 公共工具层；H2/QUIC 帧补全；Android 构建支持 |
 | 2.4.1 | 2026-09-24 | Lang 错误码接入多语言、动态/外部变量；清理编译告警；全平台交叉编译 |

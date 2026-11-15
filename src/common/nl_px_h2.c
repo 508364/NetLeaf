@@ -797,8 +797,8 @@ static int nl_h2s_send_response(nl_px_h2sess* s, nl_px_h2st* st,
     char code[16];
     snprintf(code, sizeof(code), "%d", status > 0 ? status : 502);
     int n;
-    /* 首个头块前发一次动态表容量更新（0），与本端"不使用索引"的编码策略一致 */
-    block[off++] = 0x20;
+    /* 编码端不使用动态索引（enc.max_dynamic_table_size = 0），无需发送
+     * HPACK 动态表容量更新（0x20）；部分解码器不识别该表示，会整块错位。 */
     n = hpack_encode_header(&s->enc, block + off, NL_H2_MAX_HDR - off, ":status", code);
     if (n <= 0) { free(block); return -1; }
     off += (size_t)n;
@@ -1031,6 +1031,7 @@ static int nl_h2s_decode_request(nl_px_h2sess* s, uint32_t sid,
             return -1;
         if (consumed == 0) return -1;
         off += consumed;
+        if (name[0] == '\0') continue;   /* 动态表容量更新，无头字段 */
         if (disc) continue;
         if (name[0] == ':') {
             if (nl_h2_ci_eq(name, ":method")) snprintf(st->method, sizeof(st->method), "%s", value);
@@ -1565,6 +1566,7 @@ static int nl_h2u_decode(nl_h2u* u, const void* block_v, size_t len) {
             return -1;
         if (consumed == 0) return -1;
         off += consumed;
+        if (name[0] == '\0') continue;   /* 动态表容量更新，无头字段 */
         if (name[0] == ':') {
             if (nl_h2_ci_eq(name, ":status")) u->status = atoi(value);
             continue;
@@ -1827,7 +1829,6 @@ int nl_px_h2_upstream_run(intptr_t client_fd, intptr_t upstream_fd,
         uint8_t* block = (uint8_t*)malloc(cap);
         if (!block) goto done;
         size_t off = 0;
-        block[off++] = 0x20;    /* 动态表容量更新到 0 */
         int n = hpack_encode_header(&u.enc, block + off, cap - off, ":method",
                                     req.method[0] ? req.method : "GET");
         if (n <= 0) { free(block); goto done; }

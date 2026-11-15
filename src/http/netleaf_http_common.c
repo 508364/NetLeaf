@@ -723,7 +723,8 @@ int hpack_read_varint(const uint8_t* data, size_t len, uint8_t prefix_bits, uint
 
     while (*consumed < len) {
         uint8_t byte = data[*consumed];
-        *value |= (uint64_t)(byte & 0x7F) << shift;
+        /* RFC 7541 §5.1：多字节部分是累加 I += (B & 127) × 2^N，不是按位或 */
+        *value += (uint64_t)(byte & 0x7F) << shift;
         shift += 7;
         (*consumed)++;
 
@@ -800,6 +801,29 @@ int hpack_decode_header(struct hpack_context* ctx, const uint8_t* data, size_t l
     if (len == 0) return -1;
 
     *consumed = 0;
+
+    if ((data[0] & 0xE0) == 0x20) {
+        /* HPACK 动态表容量更新（RFC 7541 §6.3）：001xxxxx，5 位前缀无符号整数。
+         * 按新容量收缩动态表后继续解析同一头块中的下一个字段；若该块只包含
+         * 容量更新，则返回空 name（name[0]=='\0'），调用方据此跳过而不产生头字段。 */
+        uint64_t newsize = 0;
+        size_t c = 0;
+
+        if (hpack_read_varint(data, len, 5, &newsize, &c) != 0) return -1;
+        hpack_set_max_size(ctx, (uint32_t)newsize);
+
+        if (c < len) {
+            size_t c2 = 0;
+            if (hpack_decode_header(ctx, data + c, len - c, name, value, &c2) != 0) return -1;
+            *consumed = c + c2;
+            return 0;
+        }
+
+        if (name) name[0] = '\0';
+        if (value) value[0] = '\0';
+        *consumed = c;
+        return 0;
+    }
 
     if (data[0] & 0x80) {
         /* 索引型 header 字段（RFC 7541 §6.1）：静态表 1..61，动态表 62.. */
@@ -1264,7 +1288,7 @@ int h2_apply_header_block(struct nl_http2_connection* conn, struct nl_http2_stre
                 stream->request.method = nl_http_parse_method(value);
             } else if (strcmp(name, ":path") == 0) {
                 snprintf(stream->request.path, NL_HTTP_MAX_PATH, "%s", value);
-            } else if (name[0] != ':') {
+            } else if (name[0] != '\0' && name[0] != ':') {
                 if (stream->request.header_count < MAX_HEADERS) {
                     snprintf(stream->request.headers[stream->request.header_count].name, MAX_HEADER_NAME, "%s", name);
                     snprintf(stream->request.headers[stream->request.header_count].value, MAX_HEADER_VALUE, "%s", value);

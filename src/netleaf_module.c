@@ -487,9 +487,20 @@ NL_API nl_extension_info_t* nl_extension_access(const char* library_id) {
 NL_API void* nl_extension_get_func(nl_extension_info_t* ext, const char* func_name) {
     if (!ext || !func_name) return NULL;
     if (ext->get_extension_function) {
-        return ext->get_extension_function(ext->library_id, func_name);
+        void* fn = ext->get_extension_function(ext->library_id, func_name);
+        if (fn) return fn;
     }
-    return NULL;
+    /* 扩展未提供解析器（如 https 扩展只有静态信息结构体）时，回退到它自己的
+     * 动态库句柄。只查本扩展句柄，不走全局符号查找，避免命中依赖树中其它
+     * 扩展的同名符号。静态注册（无 dlopen 句柄）的扩展仍需自行提供解析器。 */
+    if (!ext->library_id) return NULL;
+    int idx = find_extension_index(ext->library_id);
+    if (idx < 0 || idx >= MAX_EXTENSIONS || !g_extension_dl_handles[idx]) return NULL;
+#ifdef _WIN32
+    return (void*)GetProcAddress((HMODULE)g_extension_dl_handles[idx], func_name);
+#else
+    return dlsym(g_extension_dl_handles[idx], func_name);
+#endif
 }
 
 NL_API void* nl_extension_get_func_by_id(const char* ext_id, const char* func_name) {
@@ -660,8 +671,61 @@ NL_API uint32_t nl_extension_get_capabilities(const char* library_id) {
 // Auto-Load Extensions
 // ============================================================
 
-// Symbol name patterns to try when loading an extension by filename
-// e.g., "netleaf_lang.dll" → tries "nl_lang_get_extension_info", then "nl_lang_get_module_info"
+// 判断字符串是否以指定后缀结尾（POSIX ".so" 只有 3 字符，不能再按 len-4 截取）
+static int nl_has_suffix(const char* s, const char* suffix) {
+    if (!s || !suffix) return 0;
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+// 从扩展库文件名派生模块名：libnetleaf_<mod>.so/.dll、libnetleaf-<mod>…、netleaf_<mod>…
+// 成功返回 1 并写入 mod，否则返回 0。
+static int nl_ext_module_from_filename(const char* filepath, char* mod, size_t cap) {
+    if (!filepath || !mod || cap == 0) return 0;
+    const char* base = filepath;
+    const char* slash = strrchr(filepath, '/');
+    const char* bslash = strrchr(filepath, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    if (slash) base = slash + 1;
+
+    char tmp[128];
+    if (sscanf(base, "libnetleaf_%127[^.].%*s", tmp) == 1 ||
+        sscanf(base, "libnetleaf-%127[^.].%*s", tmp) == 1 ||
+        sscanf(base, "netleaf_%127[^.].%*s", tmp) == 1 ||
+        sscanf(base, "netleaf-%127[^.].%*s", tmp) == 1) {
+        snprintf(mod, cap, "%s", tmp);
+        return 1;
+    }
+    return 0;
+}
+
+// 尝试用符号 sym 取出扩展信息并注册。
+// mod 非空时，对 *_get_extension_info 符号校验 library_id 与文件名模块名一致，
+// 避免 dlsym 沿依赖树命中其它扩展的符号（如加载 https 却命中 lang）。
+// 返回 1 = 已注册，0 = 该符号不可用/不匹配，-1 = 注册失败。
+static int nl_ext_try_symbol(void* handle, const char* sym, const char* mod) {
+    if (!handle || !sym) return 0;
+    typedef nl_extension_info_t* (*GetExtInfoFunc)(void);
+#ifdef _WIN32
+    GetExtInfoFunc get_info = (GetExtInfoFunc)GetProcAddress((HMODULE)handle, sym);
+#else
+    GetExtInfoFunc get_info = (GetExtInfoFunc)dlsym(handle, sym);
+#endif
+    if (!get_info) return 0;
+    nl_extension_info_t* ext = get_info();
+    if (!ext) return 0;
+    if (mod && mod[0] && strstr(sym, "_get_extension_info") &&
+        (!ext->library_id || strcasecmp(ext->library_id, mod) != 0))
+        return 0;
+    if (nl_extension_register(ext) != 0) return -1;
+    retain_extension_dl_handle(ext, handle);
+    return 1;
+}
+
+// Symbol name patterns to try when loading an extension by filename.
+// 只接受 *_get_extension_info / 通用 nl_get_extension_info：
+// *_get_module_info 返回 nl_module_info_t（字段布局与扩展信息不同），
+// 不能按 nl_extension_info_t 解读，否则会读到越界指针。
 static const char* g_ext_symbol_patterns[] = {
     // Primary: get_extension_info pattern (module_name → nl_module_name_get_extension_info)
     "nl_lang_get_extension_info",
@@ -672,14 +736,6 @@ static const char* g_ext_symbol_patterns[] = {
     "nl_vue_get_extension_info",
     "nl_lagg_get_extension_info",
     "nl_https_get_extension_info",
-    // Fallback: get_module_info (cast to extension info)
-    "nl_lang_get_module_info",
-    "nl_ipc_get_module_info",
-    "nl_autoroute_get_module_info",
-    "nl_autocomplete_get_module_info",
-    "nl_errorpage_get_module_info",
-    "nl_vue_get_module_info",
-    "nl_lagg_get_module_info",
     // Legacy example pattern
     "nl_example_get_extension_info",
     // Generic: nl_get_extension_info — 新扩展可只导出该通用入口
@@ -691,133 +747,37 @@ static int auto_load_extension_file(const char* filepath) {
 #ifdef _WIN32
     HMODULE h = LoadLibraryA(filepath);
     if (!h) return -1;
-
-    typedef nl_extension_info_t* (*GetExtInfoFunc)(void);
-
-    // 1. Try known module symbol patterns
-    for (int i = 0; g_ext_symbol_patterns[i] != NULL; i++) {
-        GetExtInfoFunc get_info = (GetExtInfoFunc)GetProcAddress(h, g_ext_symbol_patterns[i]);
-        if (get_info) {
-            nl_extension_info_t* ext = get_info();
-            if (ext) {
-                if (nl_extension_register(ext) != 0) {
-                    FreeLibrary(h);
-                    return -1;
-                }
-                retain_extension_dl_handle(ext, (void*)h);
-                return 0;
-            }
-        }
-    }
-
-    // 2. Generic fallback: derive module name from filename (libnetleaf_<mod>.dll/.so)
-    //    and probe "nl_<mod>_get_extension_info" / "nl_<mod>_get_module_info".
-    //    这让新扩展无需预注册即可被自动发现。
-    {
-        const char* base = strrchr(filepath, '/');
-        base = base ? base + 1 : strrchr(filepath, '\\');
-        base = base ? base + 1 : filepath;
-        char mod[128];
-        if (sscanf(base, "libnetleaf_%127s.%*s", mod) == 1 ||
-            sscanf(base, "libnetleaf-%127s.%*s", mod) == 1 ||
-            sscanf(base, "netleaf_%127s.%*s", mod) == 1 ||
-            sscanf(base, "netleaf-%127s.%*s", mod) == 1) {
-            char sym[160];
-            snprintf(sym, sizeof(sym), "nl_%s_get_extension_info", mod);
-            GetExtInfoFunc get_info = (GetExtInfoFunc)GetProcAddress(h, sym);
-            if (get_info) {
-                nl_extension_info_t* ext = get_info();
-                if (ext) {
-                    if (nl_extension_register(ext) != 0) {
-                        FreeLibrary(h);
-                        return -1;
-                    }
-                    retain_extension_dl_handle(ext, (void*)h);
-                    return 0;
-                }
-            }
-            snprintf(sym, sizeof(sym), "nl_%s_get_module_info", mod);
-            get_info = (GetExtInfoFunc)GetProcAddress(h, sym);
-            if (get_info) {
-                nl_extension_info_t* ext = (nl_extension_info_t*)(uintptr_t)get_info();
-                if (ext) {
-                    if (nl_extension_register(ext) != 0) {
-                        FreeLibrary(h);
-                        return -1;
-                    }
-                    retain_extension_dl_handle(ext, (void*)h);
-                    return 0;
-                }
-            }
-        }
-    }
-
-    FreeLibrary(h);
-    return -1;
 #else
     void* h = dlopen(filepath, RTLD_NOW | RTLD_LOCAL);
     if (!h) return -1;
-
-    typedef nl_extension_info_t* (*GetExtInfoFunc)(void);
-
-    // 1. Try known module symbol patterns
-    for (int i = 0; g_ext_symbol_patterns[i] != NULL; i++) {
-        GetExtInfoFunc get_info = (GetExtInfoFunc)dlsym(h, g_ext_symbol_patterns[i]);
-        if (get_info) {
-            nl_extension_info_t* ext = get_info();
-            if (ext) {
-                if (nl_extension_register(ext) != 0) {
-                    dlclose(h);
-                    return -1;
-                }
-                retain_extension_dl_handle(ext, h);
-                return 0;
-            }
-        }
-    }
-
-    // 2. Generic fallback: derive module name from filename
-    {
-        const char* base = strrchr(filepath, '/');
-        base = base ? base + 1 : filepath;
-        char mod[128];
-        if (sscanf(base, "libnetleaf_%127s.%*s", mod) == 1 ||
-            sscanf(base, "libnetleaf-%127s.%*s", mod) == 1 ||
-            sscanf(base, "netleaf_%127s.%*s", mod) == 1 ||
-            sscanf(base, "netleaf-%127s.%*s", mod) == 1) {
-            char sym[160];
-            snprintf(sym, sizeof(sym), "nl_%s_get_extension_info", mod);
-            GetExtInfoFunc get_info = (GetExtInfoFunc)dlsym(h, sym);
-            if (get_info) {
-                nl_extension_info_t* ext = get_info();
-                if (ext) {
-                    if (nl_extension_register(ext) != 0) {
-                        dlclose(h);
-                        return -1;
-                    }
-                    retain_extension_dl_handle(ext, h);
-                    return 0;
-                }
-            }
-            snprintf(sym, sizeof(sym), "nl_%s_get_module_info", mod);
-            get_info = (GetExtInfoFunc)dlsym(h, sym);
-            if (get_info) {
-                nl_extension_info_t* ext = (nl_extension_info_t*)(uintptr_t)get_info();
-                if (ext) {
-                    if (nl_extension_register(ext) != 0) {
-                        dlclose(h);
-                        return -1;
-                    }
-                    retain_extension_dl_handle(ext, h);
-                    return 0;
-                }
-            }
-        }
-    }
-
-    dlclose(h);
-    return -1;
 #endif
+
+    char mod[128];
+    int have_mod = nl_ext_module_from_filename(filepath, mod, sizeof(mod));
+    int rc = 0;
+
+    // 1. 先按文件名派生模块名，只探测该模块自己的符号。
+    //    这样 https 扩展不会被依赖树中 lang 的同名模式抢先命中。
+    if (have_mod) {
+        char sym[192];
+        snprintf(sym, sizeof(sym), "nl_%s_get_extension_info", mod);
+        rc = nl_ext_try_symbol(h, sym, mod);
+    }
+
+    // 2. 回退：遍历已知符号模式（含通用 nl_get_extension_info）。
+    //    文件名可派生模块名时校验 library_id，避免跨模块误注册。
+    for (int i = 0; g_ext_symbol_patterns[i] != NULL && rc == 0; i++) {
+        rc = nl_ext_try_symbol(h, g_ext_symbol_patterns[i], have_mod ? mod : NULL);
+    }
+
+    if (rc > 0) return 0;
+
+#ifdef _WIN32
+    FreeLibrary(h);
+#else
+    dlclose(h);
+#endif
+    return -1;
 }
 
 NL_API int nl_extension_auto_load(void) {
@@ -859,10 +819,8 @@ NL_API int nl_extension_auto_load_from_dir(const char* directory) {
     int loaded = 0;
     struct dirent* ent;
     while ((ent = readdir(dir)) != NULL) {
-        size_t len = strlen(ent->d_name);
-        if (len < 4) continue;
-        const char* ext = ent->d_name + len - 4;
-        if (strcmp(ext, ".so") != 0 && strcmp(ext, ".so.1") != 0) continue;
+        if (!nl_has_suffix(ent->d_name, ".so") &&
+            !nl_has_suffix(ent->d_name, ".so.1")) continue;
         char filepath[1024];
         snprintf(filepath, sizeof(filepath), "%s/%s", directory, ent->d_name);
         if (auto_load_extension_file(filepath) == 0) loaded++;
@@ -1805,9 +1763,8 @@ NL_API int nl_plugin_discover(const char* directory, nl_plugin_handle_t** plugin
     if (!dir) return 0;
     struct dirent* ent;
     while ((ent = readdir(dir)) != NULL && count < max_count) {
-        size_t len = strlen(ent->d_name);
-        if (len < 4) continue;
-        if (strcmp(ent->d_name + len - 4, ".so") != 0) continue;
+        if (!nl_has_suffix(ent->d_name, ".so") &&
+            !nl_has_suffix(ent->d_name, ".so.1")) continue;
         char filepath[1024];
         snprintf(filepath, sizeof(filepath), "%s/%s", directory, ent->d_name);
         nl_plugin_handle_t ph = nl_plugin_load(filepath);

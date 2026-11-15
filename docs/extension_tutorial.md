@@ -570,15 +570,21 @@ const char* nl_extension_get_auto_load_dir(void);
 自动加载会按约定的导出符号名识别扩展库。与 [src/netleaf_module.c](../src/netleaf_module.c) 中
 `g_ext_symbol_patterns` 的符号发现约定一致：
 
-1. **已知符号表**：优先尝试内置扩展的标准导出符号——
+1. **文件名推导规则（优先）**：先按扩展库文件名推导模块名——
+   文件名以 `libnetleaf_` / `libnetleaf-` / `netleaf_` / `netleaf-` 前缀开头时，
+   去掉前缀与扩展名得到模块名 `<mod>`，探测 `nl_<mod>_get_extension_info`，
+   并校验返回结构的 `library_id` 与文件名推导出的 `<mod>` 一致（不一致则视为未命中，
+   防止 `dlsym` 在依赖树中命中其它模块的符号而误注册）。
+2. **已知符号表（兜底）**：文件名派生未命中时，再依次尝试内置扩展的标准导出符号——
    `nl_lang_get_extension_info`、`nl_ipc_get_extension_info`、`nl_autoroute_get_extension_info`、
    `nl_autocomplete_get_extension_info`、`nl_errorpage_get_extension_info`、`nl_vue_get_extension_info`、
    `nl_lagg_get_extension_info`、`nl_https_get_extension_info`；旧示例为 `nl_example_get_extension_info`；
    另有通用入口 `nl_get_extension_info`（新扩展可只导出该符号即可被自动发现）。
-2. **文件名推导规则**：若上述符号均未命中，则按扩展库文件名推导模块名——
-   文件名以 `libnetleaf_` / `libnetleaf-` / `netleaf_` / `netleaf-` 前缀开头时，
-   去掉前缀与扩展名得到模块名 `<mod>`，依次探测 `nl_<mod>_get_extension_info` 与
-   `nl_<mod>_get_module_info`。
+
+> 注意：候选符号中**不包含** `*_get_module_info`——其返回的 `nl_module_info_t` 与
+> `nl_extension_info_t` 结构布局不同，旧版本对其强转曾导致段错误，现已彻底移除。
+> Linux/macOS 上 `.so` / `.so.1` 后缀判断使用 `nl_has_suffix()`（修复早期 `len-4`
+> 差一导致扩展永远无法自动加载的问题）。
 
 目录不存在时返回 `0`（正常情况，不报错）。
 

@@ -273,6 +273,11 @@ int main() {
 - TLS 写性能：`h2_send_headers` 攒批发帧（HEADERS+DATA 同缓冲），减少小写、提升 QPS
 - 安卓独立化（minSdk 21）：平台后端拆分至 `src/android/`（Bionic），三 ABI（arm64-v8a / armeabi-v7a / x86_64）实测构建通过
 
+**v3.0.1（2026-11-15）:**
+- 跨协议反代 5 项缺陷修复：`.so` 后缀差一（Linux/macOS 扩展无法自动加载）、扩展发现改文件名派生优先并移除 `get_module_info` 误用（段错误）、`dlsym` 校验 `library_id` 防跨模块误注册、`nl_proxy_connect_upstream` 改用新 `conn_wrap` TLS 契约（修复 HTTPS/H2 上游 100% 502）、移除 H2 侧 HPACK 容量更新写入错位
+- HPACK 动态表容量更新解码：`hpack_decode_header` 支持 RFC 7541 §6.3，不再整块错位丢 `:path`
+- worker 池显式启用：Linux/macOS worker 池默认不启动（纯 epoll/kqueue），需在 `nl_server_start()` 前调用新 API `nl_server_start_workers()` 才建池；修复 stop+destroy 双重 join 段错误
+
 **查看完整版本历史:** [CHANGELOG.md](CHANGELOG.md)
 
 ## Wiki - 最佳实践

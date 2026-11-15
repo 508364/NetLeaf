@@ -66,6 +66,9 @@ struct nl_server {
     pthread_cond_t queue_not_full;
     int queue_init;
     int pool_used;
+    /* worker 池必须经 nl_server_start_workers() 显式启用；
+     * 未启用时 TCP/HTTP/WS 由 epoll 监听线程就地处理。 */
+    int worker_pool_enabled;
 };
 
 struct nl_client {
@@ -640,7 +643,7 @@ int nl_server_start(nl_server_t* server) {
             return NL_ERROR;
         }
         
-        int use_pool = (server->protocol != NL_PROTO_UDP) ? 1 : 0;
+        int use_pool = (server->worker_pool_enabled && server->protocol != NL_PROTO_UDP) ? 1 : 0;
         int target = (server->concurrency >= 1 && server->concurrency <= MAX_CONCURRENCY)
                      ? server->concurrency : DEFAULT_CONCURRENCY;
         if (use_pool && !server->pool_used) {
@@ -712,6 +715,7 @@ void nl_server_stop(nl_server_t* server) {
     }
     if (server->thread_id) {
         pthread_join(server->thread_id, NULL);
+        server->thread_id = 0;
     }
     linux_log(NL_LOG_INFO, "Linux: Server stopped");
 }
@@ -720,6 +724,13 @@ int nl_server_set_concurrency(nl_server_t* server, int threads) {
     if (!server) return NL_EINVAL;
     if (threads <= 0 || threads > MAX_CONCURRENCY) return NL_EINVAL;
     server->concurrency = threads;
+    return NL_OK;
+}
+
+int nl_server_start_workers(nl_server_t* server) {
+    if (!server) return NL_EINVAL;
+    if (server->running) return NL_ERROR;
+    server->worker_pool_enabled = 1;
     return NL_OK;
 }
 
@@ -786,8 +797,9 @@ void nl_server_destroy(nl_server_t* server) {
     if (server->pool_used) stop_worker_pool(server);
     if (server->fd != -1) close(server->fd);
     if (server->epoll_fd != -1) close(server->epoll_fd);
-    /* Join the listener thread so it cannot run after free(server) below. */
-    pthread_join(server->thread_id, NULL);
+    /* Join the listener thread so it cannot run after free(server) below.
+     * stop() 已 join 过时 thread_id 已被清零，避免重复 join 已失效的线程句柄。 */
+    if (server->thread_id) pthread_join(server->thread_id, NULL);
     free(server);
 }
 
@@ -2260,19 +2272,8 @@ static int nl_proxy_connect_upstream(const nl_web_route_t* route) {
             close(up_sock);
             return -1;
         }
-        if (!api.client_impl || !api.handshake) {
-            linux_log(NL_LOG_ERROR,
-                      "proxy: https upstream %s 需要 TLS 会话收发能力（conn_read/conn_write），当前扩展仅提供握手钩子",
-                      host);
-            close(up_sock);
-            return -1;
-        }
-        if (!api.handshake(up_sock, host)) {
-            linux_log(NL_LOG_ERROR,
-                      "proxy: TLS handshake failed for upstream %s (refusing plaintext fallback)", host);
-            close(up_sock);
-            return -1;
-        }
+        /* TLS 握手/加密由后端隧道线程的连接会话（api.conn_wrap）完成；
+         * 此处只确认契约完整，不能要求旧版 api.handshake 钩子。 */
     }
 
     return up_sock;
@@ -3938,6 +3939,40 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                         memcpy(upstream_req_full + total, buffer + hi, body_len2);
                         total += (int)body_len2;
                     }
+                }
+                // HTTPS 上游：请求必须经 TLS 会话发送，禁止明文回退
+                if (route->protocol == NL_PROXY_HTTPS) {
+                    nl_px_tls_api tls_api;
+                    char up_host[512];
+                    int up_port = 443;
+                    up_host[0] = '\0';
+                    (void)nl_px_split_hostport(route->upstream, up_host, sizeof(up_host),
+                                               &up_port, 443);
+                    if (!nl_px_tls_contract_get(&tls_api) || !tls_api.conn_wrap) {
+                        linux_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
+                        free(proxy_buf);
+                        close(up_sock);
+                        send_http_error(client, 502, "Bad Gateway");
+                        close(client);
+                        return;
+                    }
+                    void* tls_conn = tls_api.conn_wrap(up_sock, up_host, NULL);
+                    if (!tls_conn) {
+                        linux_log(NL_LOG_ERROR,
+                                  "proxy: TLS session unavailable for upstream %s (refusing plaintext fallback)",
+                                  up_host);
+                        free(proxy_buf);
+                        close(up_sock);
+                        send_http_error(client, 502, "Bad Gateway");
+                        close(client);
+                        return;
+                    }
+                    /* 隧道内部完成握手后的双向收发，并负责关闭双方 fd 与释放会话 */
+                    (void)nl_px_tls_tunnel_run((intptr_t)client, (intptr_t)up_sock,
+                                               tls_conn, &tls_api,
+                                               upstream_req_full, total, 60000);
+                    free(proxy_buf);
+                    return;
                 }
                 ssize_t sent2 = send(up_sock, upstream_req_full, total, 0);
                 if (sent2 <= 0) {

@@ -36,6 +36,23 @@
 **验证:**
 - Windows `ctest` 9/9 通过、`test_http_frames` 52/52 断言；Android 三 ABI 构建通过
 
+### 跨协议反代修复与 worker 池显式启用（2026-11-15，第181-182轮）
+
+**跨协议反代 5 项缺陷修复（第181轮）:**
+- 扩展自动加载 `.so` 后缀判断差一（`len-4` 比较 3 字符 `".so"`）→ 新增 `nl_has_suffix()`，Linux/macOS 扩展现在可正常自动加载
+- 扩展发现顺序调整为**文件名派生优先**（`nl_ext_module_from_filename` → `nl_<mod>_get_extension_info`，校验 `library_id` 与文件名一致）→ 已知符号表兜底；候选列表彻底移除 `*_get_module_info`（其返回结构与 `nl_extension_info_t` 布局不同，强转导致段错误）
+- `dlsym` 依赖树误命中修复：`nl_ext_try_symbol()` 校验 `library_id`，加载 `libnetleaf_https.so` 不再因依赖树中 `libnetleaf_lang.so` 的符号而误注册为 `lang`
+- `nl_proxy_connect_upstream` 改用新 TLS 契约 `conn_wrap/conn_read/conn_write/conn_free`（`nl_px_tls_contract_get/missing`），不再要求已废弃的 `api.handshake`；worker 路径 HTTPS 改走 `nl_px_tls_tunnel_run`（此前 100% 打成 502）
+- `nl_px_h2.c` 移除两处 `0x20` HPACK 动态表容量更新写入（H2 服务端解码器原先不认，整块错位导致 `:path` 丢失）
+
+**HPACK 动态表容量更新解码（第182轮）:**
+- `hpack_decode_header` 支持 RFC 7541 §6.3 动态表容量更新（`001xxxxx` 5 位前缀无符号整数）：识别并收缩动态表；空 name 表示该指令非头字段，调用方 `continue` 跳过
+
+**worker 池改为显式启用（第182轮）:**
+- Linux/macOS worker 池**默认不启动**，`nl_server_start()` 走纯 epoll/kqueue 就地处理；即使调用 `nl_server_set_concurrency()` / `NL_OPT_CONCURRENCY` 配置了池大小，未显式调用新公开 API `nl_server_start_workers(nl_server_t*)` 则池不运行
+- 新增 `nl_server_start_workers()`：在 `nl_server_start()` 之前调用以启用 worker 池（`worker_pool_enabled` 字段门控；UDP 协议不建池）；Windows 为 IOCP 完成线程，该函数为空操作
+- 修复 `nl_server_stop()` + `nl_server_destroy()` 双重 `pthread_join` 同一线程导致的段错误（stop 后 `thread_id` 置 0，destroy 判空才 join）
+
 ## v3.0.0
 
 > 本版本为大版本升级（2.4.2 → 3.0.0），涵盖 Web 引擎全异步重构（P1-P12）、HTTP/2 协议层补完、HTTPS/2、Windows 通用服务器全 IOCP 化等。版本号升级同步 19 个文件（CMakeLists、netleaf.h、9 个模块头 15 处版本宏、3 个内部头副本、docs/*.md、PROJECT_STRUCTURE.md）。

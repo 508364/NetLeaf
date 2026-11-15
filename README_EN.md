@@ -20,7 +20,7 @@ High-performance cross-platform network library (Windows/Linux/macOS/Android) bu
 - ✅ **HTTP/2 Complete (v3.0.0)**: HPACK dynamic tables + RFC 7541 Huffman codec, stream state machine, RST_STREAM/GOAWAY
 - ✅ **HTTPS/2 (v3.0.0)**: `nlh_tls_server_*` TLS server with ALPN h2 negotiation, H2 over TLS
 - ✅ **TLS/SSL**: `netleaf_tls2` (mbedTLS 2.28.10 LTS, TLS 1.0-1.3) and `netleaf_tls3` (mbedTLS 3.6.x, TLS 1.2/1.3)
-- ✅ **Configurable Concurrency**: Linux/macOS worker pool / Windows full IOCP completion threads (1..64); Windows UDP 16-slot receive ring prevents burst packet loss
+- ✅ **Configurable Concurrency**: Linux/macOS worker pool requires an explicit `nl_server_start_workers()` call before `nl_server_start()` (default is plain epoll/kqueue, in-place handling); Windows full IOCP completion threads (1..64); Windows UDP 16-slot receive ring prevents burst packet loss
 - ✅ **Web Server**: Built-in HTML/Vue.js support with server-side variable replacement, file hot reload, 301/302 redirects
 - ✅ **Smart Routing / i18n / Vue**: 404 route suggestions, multi-language error messages, backend Vue component generation
 - ✅ **IPC / Link Aggregation**: Named Pipe / Unix Socket IPC, same-port load balancing
@@ -217,6 +217,9 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 - **Windows named pipes in byte mode**: 64KB buffer, arbitrary payload sizes; new regression test `test_linkagg_pull`
 - **HTTP/2 & HTTPS stability fixes (2026-11-13)**: >16KB in-memory responses over HTTPS/1.1 and large H2 responses no longer truncate/hang (partial-write loops on all write paths); `nlh_resp_file` now streams files as H2 DATA frames (was 200 with empty body); H2 streams are unlinked and freed right after END_STREAM/CLOSED (fixes cumulative-request OOM on long-lived connections); batched H2 frame writes reduce per-request TLS syscalls and raise QPS
 - **Android split-out (minSdk 21)**: platform backends moved into `src/android/` (Bionic iconv gated on API 28, runtime version string); verified cross-builds for all three ABIs (NDK r30)
+- **Cross-protocol reverse-proxy fixes, 5 defects (2026-11-15)**: `.so` suffix off-by-one that prevented Linux/macOS extension auto-loading; extension discovery now derives the module name from the filename first and no longer probes `get_module_info` (struct mismatch → segfault); `dlsym` results are validated against `library_id` so `libnetleaf_https.so` can no longer register as `lang`; `nl_proxy_connect_upstream` now uses the new `conn_wrap` TLS contract (fixes HTTPS/H2 upstreams always returning 502); removed the H2-side HPACK capacity-update write that desynchronized decoding
+- **HPACK dynamic table capacity-update decoding**: `hpack_decode_header` implements RFC 7541 §6.3 capacity updates, so the header block no longer desyncs and `:path` is preserved
+- **Worker pool explicit enablement (2026-11-15)**: the Linux/macOS worker pool no longer starts by default (plain epoll/kqueue); even with a configured concurrency value you must call the new `nl_server_start_workers()` before `nl_server_start()` to build the pool; fixes a double `pthread_join` segfault on `nl_server_stop()` + `nl_server_destroy()`
 
 ## What's New in v3.0.0 (2026-10-31)
 
@@ -230,7 +233,7 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 
 | Version | Date | Highlights |
 | --- | --- | --- |
-| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix; HTTP/2/HTTPS large-response truncation & stream-leak OOM fixes, Android backend split-out (2026-11-13) |
+| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix; HTTP/2/HTTPS large-response truncation & stream-leak OOM fixes, Android backend split-out (2026-11-13); cross-protocol reverse-proxy fixes, HPACK capacity-update decoding, Linux/macOS worker pool now gated behind `nl_server_start_workers()` (2026-11-15) |
 | 3.0.0 | 2026-10-31 | Async web engine (sendfile zero-copy, multi-instance, test suite); HTTP/2 completion; HTTPS/2; Windows full IOCP + UDP receive ring; QUIC split out |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS refactor (`netleaf_https` split, tls2/tls3); MQTT on by default; `nl_util`; H2/QUIC frame fixes; Android build support |
 | 2.4.1 | 2026-09-24 | Lang error-code i18n, dynamic/external variables; warning cleanup; full-platform cross builds |

@@ -1009,6 +1009,12 @@ int nl_server_set_concurrency(nl_server_t* server, int threads) {
     return NL_OK;
 }
 
+int nl_server_start_workers(nl_server_t* server) {
+    if (!server) return NL_EINVAL;
+    /* Windows 服务端是纯 IOCP（listener 线程自身参与完成处理），没有 worker 池 */
+    return NL_OK;
+}
+
 void nl_server_set_handler(nl_server_t* server, nl_request_handler handler, void* user_data) {
     if (!server) return;
     server->handler = handler;

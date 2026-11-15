@@ -169,7 +169,8 @@ typedef enum {
     NL_OPT_SO_BROADCAST,
     NL_OPT_CONCURRENCY      /**< 并发度 (1..64), default 4; TCP/HTTP/WEBSOCKET.
                                  Windows: IOCP 完成线程数（worker 池已废弃）；
-                                 Linux/macOS: worker 池大小 */
+                                 Linux/macOS: worker 池大小（须先调用
+                                 nl_server_start_workers() 显式启用，默认不建池） */
 } nl_socket_option_t;
 
 // Server handle
@@ -317,10 +318,27 @@ NL_API int nl_server_set_option(nl_server_t* server, nl_socket_option_t option, 
  * @brief Set concurrency level for server
  * @details Windows (TCP/HTTP/WEBSOCKET): IOCP 完成线程数（listener 线程自身
  *          即线程 0，故总完成线程数 = concurrency）；worker 池已彻底废弃。
- *          Linux/macOS: worker 池大小。
+ *          Linux/macOS: worker 池大小——但仅设置本项**不会**创建池，
+ *          须先调用 nl_server_start_workers() 显式启用（默认纯 epoll/kqueue）。
  *          合法范围 1..64，默认 4。UDP 不受此项影响（接收环固定 16 槽）。
+ * @see nl_server_start_workers
  */
 NL_API int nl_server_set_concurrency(nl_server_t* server, int concurrency);
+
+/**
+ * @brief 显式启用 TCP/HTTP/WebSocket 服务的 worker 线程池
+ *
+ * Linux/macOS 默认不创建任何 worker 线程：listen 事件由 epoll/kqueue 监听线程
+ * 就地处理（单线程事件驱动）。只有调用本函数后，nl_server_start 才会按
+ * 并发度（nl_server_set_concurrency，默认 4）创建 worker 池。
+ * 仅设置并发度而未调用本函数时，仍然走纯 epoll/kqueue 路径。
+ * 必须在 nl_server_start 之前调用。
+ *
+ * Windows 为 IOCP 模型，本就没有 worker 池，调用为无操作。
+ *
+ * @return NL_OK 成功；NL_EINVAL 参数为空；NL_ERROR 服务器已启动
+ */
+NL_API int nl_server_start_workers(nl_server_t* server);
 
 /**
  * @brief Get socket option for server
