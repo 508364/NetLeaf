@@ -170,14 +170,40 @@ target_include_directories(test_web_engine PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME WebEngineTest COMMAND test_web_engine)
 
 # ----------------------------------------------------------------
-# 11. bench_web — P8 引擎压测工具（Linux/macOS 专用）
-#     对比 legacy pool / engine 单实例 / engine 多实例
+# 11. test_uri — RFC 3986 URI 端点 + 物理文件隔离回归测试（第192轮）
+#     覆盖 percent-decode/encode、dot-segment 规范化、越根拒绝、
+#     resolve_file 根目录约束（含符号链接逃逸）、is_under 边界
 # ----------------------------------------------------------------
-if(NOT WIN32)
-    add_executable(bench_web bench_web.c)
-    target_link_libraries(bench_web PRIVATE netleaf_core netleaf_lang)
-    find_package(Threads REQUIRED)
-    target_link_libraries(bench_web PRIVATE Threads::Threads)
-    target_include_directories(bench_web PRIVATE ${CMAKE_SOURCE_DIR}/include)
-    # 压测工具不注册为 ctest（手动运行）
+add_executable(test_uri test_uri.c)
+target_link_libraries(test_uri PRIVATE netleaf_core)
+if(WIN32)
+    target_link_libraries(test_uri PRIVATE ${NL_TEST_SYS_LIBS})
 endif()
+target_include_directories(test_uri PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME UriTest COMMAND test_uri)
+
+# ----------------------------------------------------------------
+# 12. test_log — 统一日志系统回归测试（第193轮）
+#     覆盖级别过滤/回调分发/debug模式/文件sink/大小轮转/close
+# ----------------------------------------------------------------
+add_executable(test_log test_log.c)
+target_link_libraries(test_log PRIVATE netleaf_core)
+if(WIN32)
+    target_link_libraries(test_log PRIVATE ${NL_TEST_SYS_LIBS})
+endif()
+target_include_directories(test_log PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME LogSystemTest COMMAND test_log)
+
+# ----------------------------------------------------------------
+# 11. bench_web — P8 引擎压测工具（Linux/macOS/Windows 全平台，第189轮跨平台移植）
+#     对比 legacy pool / engine 单实例 / engine 多实例 / auto 自动伸缩
+# ----------------------------------------------------------------
+add_executable(bench_web bench_web.c)
+target_link_libraries(bench_web PRIVATE netleaf_core netleaf_lang)
+find_package(Threads REQUIRED)
+target_link_libraries(bench_web PRIVATE Threads::Threads)
+target_include_directories(bench_web PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(WIN32)
+    target_link_libraries(bench_web PRIVATE ${NL_TEST_SYS_LIBS} psapi)
+endif()
+# 压测工具不注册为 ctest（手动运行）

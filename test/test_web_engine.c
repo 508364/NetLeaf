@@ -356,6 +356,57 @@ static void case_404(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 用例 f2：RFC 3986 端点规范化 + 路径穿越拒绝（第192轮）              */
+/* ------------------------------------------------------------------ */
+static void case_uri(void) {
+    printf("\n[用例] f2. RFC 3986 端点规范化 / 路径穿越\n");
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start server", 0); return; }
+    nl_web_add_route(s, "/c", "uri-ok", "text/plain");
+    nl_sleep_ms(50);
+
+    char buf[4096];
+
+    /* 1) 带 query 的请求命中路由（规范化剥掉 ?query，旧行为 404） */
+    int n = http_exchange(port,
+        "GET /c?a=1&b=2 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        buf, sizeof(buf));
+    expect("query 剥离后命中路由(200)", n > 0 && http_status(buf) == 200);
+    expect("body 来自路由", n > 0 && strstr(buf, "uri-ok") != NULL);
+
+    /* 2) percent-decode 后命中（%63 = 'c'） */
+    n = http_exchange(port,
+        "GET /%63 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        buf, sizeof(buf));
+    expect("percent-decode 命中路由(200)", n > 0 && http_status(buf) == 200);
+
+    /* 3) dot-segment 归一：/./c 与 /x/../c 均归一到 /c */
+    n = http_exchange(port,
+        "GET /./c HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        buf, sizeof(buf));
+    expect("dot-segment /./c 归一(200)", n > 0 && http_status(buf) == 200);
+    n = http_exchange(port,
+        "GET /x/../c HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        buf, sizeof(buf));
+    expect("dot-segment /x/../c 归一(200)", n > 0 && http_status(buf) == 200);
+
+    /* 4) 越根 ../ 一律拒绝（403/404，绝不 200） */
+    n = http_exchange(port,
+        "GET /../c HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        buf, sizeof(buf));
+    expect("越根 /../c 被拒", n > 0 && http_status(buf) != 200);
+
+    /* 5) 反斜杠端点一律 400（Windows 路径分隔符逃逸面） */
+    n = http_exchange(port,
+        "GET /..\\c HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        buf, sizeof(buf));
+    expect("反斜杠端点被拒", n > 0 && http_status(buf) != 200);
+
+    engine_stop(s);
+}
+
+/* ------------------------------------------------------------------ */
 /* 用例 g：连续 3 次独立请求全部成功                                   */
 /* ------------------------------------------------------------------ */
 static void case_sequential(void) {
@@ -637,6 +688,7 @@ int main(void) {
     case_ws_proxy();
     case_head();
     case_404();
+    case_uri();
     case_sequential();
     case_slowloris();
     case_abort();

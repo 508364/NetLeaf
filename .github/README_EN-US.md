@@ -1,7 +1,7 @@
 <div align="center">
   <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
   <h1>NetLeaf</h1>
-  <p>High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2/HTTP3, and inline HTML/Vue reactive web server.</p>
+  <p>High-performance cross-platform network library supporting TCP/UDP/HTTP/HTTP2, and inline HTML/Vue reactive web server.</p>
   <img src="https://img.shields.io/badge/NetLeaf-v2.4.1-blue?style=for-the-badge" alt="NetLeaf Version">
   <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
   <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28.10-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
@@ -20,7 +20,7 @@
 
 - ✅ **Cross-platform**: Windows / Linux / macOS / Android (core library; extensions pending)
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
-- ✅ **Protocols**: HTTP/1.1, HTTP/2, WebSocket, TCP, UDP (HTTP/3/QUIC split into the standalone `quic` extension)
+- ✅ **Protocols**: HTTP/1.1, HTTP/2, WebSocket, TCP, UDP (HTTP/3/QUIC split into the standalone `quic` extension — discontinued, no longer updated)
 - ✅ **Web Server**: Built-in HTML/Vue.js support with server-side variable replacement
 - ✅ **Data Parsing**: JSON + TOML
 - ✅ **Lazy Loading**: All components support lazy loading

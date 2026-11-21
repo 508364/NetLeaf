@@ -25,7 +25,10 @@
 #include <limits.h>
 
 #include "../include/netleaf.h"
+#include "../include/nl_util.h"
 #include "../common/nl_proxy_core.h"
+#include "../common/nl_uri.h"
+#include "../common/nl_filesrv.h"
 #include "../common/nl_px_pool.h"
 #include "../common/nl_px_io.h"
 #include "../common/nl_px_h2.h"
@@ -39,6 +42,18 @@
 #define WEB_WORKER_DEFAULT 16
 #define MAX_CONCURRENCY 64
 #define MAX_WORKER_QUEUE 1024
+
+/* ---- 第188轮：Web 引擎实例自动伸缩（auto 模式，engine_threads_cfg<=0）----
+ * 与 Linux 同构：高负载自动增实例、持续空闲自动减实例，区间
+ * [1, min(逻辑核数, NL_ENGINE_MAX_INSTANCES)]；显式 set_engine_threads(n) 固定不伸缩。 */
+#define NL_ENGINE_MIN_INSTANCES      1
+#define NL_ENGINE_MAX_INSTANCES      32
+#define NL_ENGINE_SCALE_SAMPLE_MS    100
+#define NL_ENGINE_SCALE_COOLDOWN_MS  3000
+#define NL_ENGINE_SCALE_DOWN_TICKS   100    // 100ms ×100 = 连续空闲 10s 才缩容
+#define NL_ENGINE_SCALE_UP_PER_CONN  16
+#define NL_ENGINE_SCALE_DOWN_PER_CONN 2
+#define NL_ENGINE_DRAIN_MS           10000
 
 struct nl_server {
     int fd;
@@ -98,106 +113,10 @@ struct nl_event_loop {
     pthread_t thread_id;
 };
 
-static nl_log_level_t current_log_level = NL_LOG_INFO;
-static nl_log_callback log_callback = NULL;
-static void* log_user_data = NULL;
-static int debug_mode = 0;
-
-static void macos_log(nl_log_level_t level, const char* fmt, ...) {
-    if (level < current_log_level) return;
-    
-    va_list args;
-    va_start(args, fmt);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
-    
-    if (log_callback) {
-        log_callback(level, msg, log_user_data);
-    } else {
-        const char* prefix[] = {"DEBUG", "INFO", "WARN", "ERROR"};
-        time_t now = time(NULL);
-        struct tm tm_buf;
-        localtime_r(&now, &tm_buf);
-        char time_str[32];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
-        fprintf(stderr, "[%s] [%s] %s\n", time_str, prefix[level], msg);
-    }
-}
-
-void nl_debug_enable(int enable) {
-    debug_mode = enable;
-    if (enable) {
-        current_log_level = NL_LOG_DEBUG;
-        macos_log(NL_LOG_INFO, "Debug mode enabled");
-    } else {
-        macos_log(NL_LOG_INFO, "Debug mode disabled");
-    }
-}
-
-int nl_debug_is_enabled(void) {
-    return debug_mode;
-}
-
-void nl_log(nl_log_level_t level, const char* format, ...) {
-    if (level < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    macos_log(level, "%s", msg);
-}
-
-void nl_log_debug(const char* format, ...) {
-    if (NL_LOG_DEBUG < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    macos_log(NL_LOG_DEBUG, "%s", msg);
-}
-
-void nl_log_info(const char* format, ...) {
-    if (NL_LOG_INFO < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    macos_log(NL_LOG_INFO, "%s", msg);
-}
-
-void nl_log_warn(const char* format, ...) {
-    if (NL_LOG_WARN < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    macos_log(NL_LOG_WARN, "%s", msg);
-}
-
-void nl_log_error(const char* format, ...) {
-    if (NL_LOG_ERROR < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    macos_log(NL_LOG_ERROR, "%s", msg);
-}
+/* 日志系统已下沉到 src/common/nl_logsys.c（第193轮）：
+ * 级别状态、格式化输出（毫秒时间戳+线程ID）、callback 分发、
+ * debug 模式、文件落盘/轮转统一由平台无关实现提供，
+ * 本文件的业务日志调用点直接使用 nl_log*()。 */
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -350,7 +269,7 @@ static void* listener_thread(void* arg) {
         int nfds = kevent(server->kqueue_fd, NULL, 0, server->events, MAX_EVENTS, &timeout);
         if (nfds == -1) {
             if (errno == EINTR) continue;
-            macos_log(NL_LOG_ERROR, "macOS: kevent() failed: %s", strerror(errno));
+            nl_log(NL_LOG_ERROR, "macOS: kevent() failed: %s", strerror(errno));
             break;
         }
         
@@ -374,7 +293,7 @@ static void* listener_thread(void* arg) {
                         if (len < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                             if (errno == EINTR) continue;
-                            macos_log(NL_LOG_ERROR, "macOS: UDP recvfrom failed: %s", strerror(errno));
+                            nl_log(NL_LOG_ERROR, "macOS: UDP recvfrom failed: %s", strerror(errno));
                             break;
                         }
                         if (len == 0) break;
@@ -405,7 +324,7 @@ static void* listener_thread(void* arg) {
                                 break;
                             }
                             if (errno != EINTR) {
-                                macos_log(NL_LOG_ERROR, "macOS: accept() failed: %s", strerror(errno));
+                                nl_log(NL_LOG_ERROR, "macOS: accept() failed: %s", strerror(errno));
                             }
                             break;
                         }
@@ -426,11 +345,19 @@ static void* listener_thread(void* arg) {
                         pthread_mutex_unlock(&server->queue_lock);
                     }
                 } else {
-                    // Legacy single-thread path
-                    struct sockaddr_in client_addr;
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
-                    if (client_fd != -1) {
+                    // Legacy single-thread path：循环 accept 排空 backlog，
+                    // 突发建连时每轮只 accept 一个会把 QPS 锁死在建连开销上
+                    for (;;) {
+                        struct sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
+                        if (client_fd == -1) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                                errno != ECONNABORTED && errno != EINTR) {
+                                nl_log(NL_LOG_ERROR, "macOS: accept() failed: %s", strerror(errno));
+                            }
+                            break;
+                        }
                         set_nonblocking(client_fd);
                         struct kevent ev;
                         EV_SET(&ev, client_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
@@ -666,7 +593,7 @@ nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
         return NULL;
     }
     
-    macos_log(NL_LOG_INFO, "macOS: Server created on port %d (kqueue)", port);
+    nl_log(NL_LOG_INFO, "macOS: Server created on port %d (kqueue)", port);
     return server;
 }
 
@@ -691,7 +618,7 @@ int nl_server_start(nl_server_t* server) {
     if (server->protocol == NL_PROTO_TCP || server->protocol == NL_PROTO_HTTP || 
         server->protocol == NL_PROTO_WEBSOCKET) {
         if (listen(server->fd, SOMAXCONN) == -1) {
-            macos_log(NL_LOG_ERROR, "macOS: listen() failed: %s", strerror(errno));
+            nl_log(NL_LOG_ERROR, "macOS: listen() failed: %s", strerror(errno));
             return NL_ERROR;
         }
         
@@ -712,7 +639,7 @@ int nl_server_start(nl_server_t* server) {
                 server->queue = NULL;
                 server->workers = NULL;
                 server->num_workers = 0;
-                macos_log(NL_LOG_ERROR, "macOS: failed to allocate worker pool");
+                nl_log(NL_LOG_ERROR, "macOS: failed to allocate worker pool");
                 return NL_ERROR;
             }
             pthread_mutex_init(&server->queue_lock, NULL);
@@ -724,7 +651,7 @@ int nl_server_start(nl_server_t* server) {
             for (int i = 0; i < server->num_workers; i++) {
                 if (pthread_create(&server->workers[i], NULL, worker_thread, server) != 0) {
                     cleanup_start_failure(server);
-                    macos_log(NL_LOG_ERROR, "macOS: failed to create worker thread %d", i);
+                    nl_log(NL_LOG_ERROR, "macOS: failed to create worker thread %d", i);
                     return NL_ERROR;
                 }
             }
@@ -735,7 +662,7 @@ int nl_server_start(nl_server_t* server) {
     EV_SET(&ev, server->fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
     
     if (kevent(server->kqueue_fd, &ev, 1, NULL, 0, NULL) == -1) {
-        macos_log(NL_LOG_ERROR, "macOS: kevent() failed: %s", strerror(errno));
+        nl_log(NL_LOG_ERROR, "macOS: kevent() failed: %s", strerror(errno));
         if (pool_created) stop_worker_pool(server);
         return NL_ERROR;
     }
@@ -750,7 +677,7 @@ int nl_server_start(nl_server_t* server) {
         return NL_ERROR;
     }
     
-    macos_log(NL_LOG_INFO, "macOS: Server started (kqueue), fd=%d, workers=%d",
+    nl_log(NL_LOG_INFO, "macOS: Server started (kqueue), fd=%d, workers=%d",
               server->fd, server->pool_used ? server->num_workers : 0);
     return NL_OK;
 }
@@ -767,7 +694,7 @@ void nl_server_stop(nl_server_t* server) {
     if (server->thread_id) {
         pthread_join(server->thread_id, NULL);
     }
-    macos_log(NL_LOG_INFO, "macOS: Server stopped");
+    nl_log(NL_LOG_INFO, "macOS: Server stopped");
 }
 
 int nl_server_set_concurrency(nl_server_t* server, int threads) {
@@ -897,7 +824,7 @@ nl_client_t* nl_client_create(nl_protocol_t protocol) {
     }
     
     set_buffer_sizes(client->fd, 262144, 262144);
-    macos_log(NL_LOG_DEBUG, "macOS: Client created (socket=%d)", client->fd);
+    nl_log(NL_LOG_DEBUG, "macOS: Client created (socket=%d)", client->fd);
     return client;
 }
 
@@ -922,13 +849,13 @@ int nl_client_connect(nl_client_t* client, const char* host, int port) {
     
     if (connect(client->fd, (struct sockaddr*)&client->addr, sizeof(client->addr)) == -1) {
         if (errno != EINPROGRESS) {
-            macos_log(NL_LOG_ERROR, "macOS: connect() failed: %s", strerror(errno));
+            nl_log(NL_LOG_ERROR, "macOS: connect() failed: %s", strerror(errno));
             return NL_ECONNECT;
         }
     }
     
     client->connected = 1;
-    macos_log(NL_LOG_INFO, "macOS: Client connected to %s:%d", host, port);
+    nl_log(NL_LOG_INFO, "macOS: Client connected to %s:%d", host, port);
     return NL_OK;
 }
 
@@ -1107,7 +1034,7 @@ int nl_config_load(nl_config_t* config, const char* path) {
     pthread_mutex_unlock(&config->mutex);
     fclose(fp);
     
-    macos_log(NL_LOG_INFO, "macOS: Config loaded from %s", path);
+    nl_log(NL_LOG_INFO, "macOS: Config loaded from %s", path);
     return NL_OK;
 }
 
@@ -1244,14 +1171,7 @@ size_t nl_buffer_size(nl_buffer_t* buffer) {
     return size;
 }
 
-void nl_log_set_level(nl_log_level_t level) {
-    current_log_level = level;
-}
-
-void nl_log_set_callback(nl_log_callback callback, void* user_data) {
-    log_callback = callback;
-    log_user_data = user_data;
-}
+/* nl_log_set_level / nl_log_set_callback 已下沉到 src/common/nl_logsys.c */
 
 const char* nl_version_string(void) {
     return NETLEAF_VERSION;
@@ -1294,154 +1214,15 @@ struct nl_router {
     pthread_mutex_t mutex;
 };
 
-static void get_file_extension(const char* filename, char* ext, size_t ext_len) {
-    const char* dot = strrchr(filename, '.');
-    if (dot) {
-        strncpy(ext, dot + 1, ext_len - 1);
-        ext[ext_len - 1] = '\0';
-        for (size_t i = 0; i < strlen(ext); i++) {
-            ext[i] = tolower(ext[i]);
-        }
-    } else {
-        ext[0] = '\0';
-    }
-}
-
-static const char* get_mime_type(const char* ext) {
-    if (strcmp(ext, "html") == 0 || strcmp(ext, "htm") == 0) return "text/html";
-    if (strcmp(ext, "css") == 0) return "text/css";
-    if (strcmp(ext, "js") == 0) return "application/javascript";
-    if (strcmp(ext, "json") == 0) return "application/json";
-    if (strcmp(ext, "png") == 0) return "image/png";
-    if (strcmp(ext, "jpg") == 0 || strcmp(ext, "jpeg") == 0) return "image/jpeg";
-    if (strcmp(ext, "gif") == 0) return "image/gif";
-    if (strcmp(ext, "svg") == 0) return "image/svg+xml";
-    if (strcmp(ext, "ico") == 0) return "image/x-icon";
-    if (strcmp(ext, "xml") == 0) return "application/xml";
-    if (strcmp(ext, "txt") == 0) return "text/plain";
-    if (strcmp(ext, "pdf") == 0) return "application/pdf";
-    if (strcmp(ext, "zip") == 0) return "application/zip";
-    return "application/octet-stream";
-}
-
-static char* read_file(const char* filepath, size_t* out_size) {
-    FILE* fp = fopen(filepath, "rb");
-    if (!fp) {
-        if (out_size) *out_size = 0;
-        return NULL;
-    }
-    
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    if (size < 0) {
-        fclose(fp);
-        if (out_size) *out_size = 0;
-        return NULL;
-    }
-    
-    char* content = (char*)malloc((size_t)size + 1);
-    if (!content) {
-        fclose(fp);
-        if (out_size) *out_size = 0;
-        return NULL;
-    }
-    
-    size_t read = fread(content, 1, (size_t)size, fp);
-    fclose(fp);
-    content[read] = '\0';
-    
-    if (out_size) *out_size = read;
-    return content;
-}
-
-static char* normalize_path(const char* base_dir, const char* req_path, char* result, size_t result_len) {
-    char full_path[8192];
-    
-    if (req_path[0] == '/') {
-        snprintf(full_path, sizeof(full_path), "%s%s", base_dir, req_path);
-    } else {
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, req_path);
-    }
-    
-    strncpy(result, full_path, result_len);
-    result[result_len - 1] = '\0';
-    return result;
-}
-
-static int is_path_safe(const char* base_dir, const char* filepath) {
-    char normalized_base[8192];
-    char normalized_file[8192];
-    
-    if (realpath(base_dir, normalized_base) == NULL) return 0;
-    if (realpath(filepath, normalized_file) == NULL) return 0;
-    
-    // 目录边界校验：前缀相同还需下一字符为路径结束或 '/'，避免 /base 误匹配 /baseXXX
-    size_t base_len = strlen(normalized_base);
-    if (strncmp(normalized_file, normalized_base, base_len) != 0) return 0;
-    if (base_len > 0 && normalized_base[base_len - 1] == '/') return 1;
-    return normalized_file[base_len] == '\0' || normalized_file[base_len] == '/';
-}
-
-static int send_http_response(int client, const char* content_type, const char* content, size_t content_len) {
-    char header[8192];
-    int header_len = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        content_type, content_len);
-    
-    send(client, header, header_len, 0);
-    if (content && content_len > 0) {
-        send(client, content, content_len, 0);
-    }
-    
-    return 0;
-}
-
-static int send_http_error(int client, int status_code, const char* message) {
-    char response[8192];
-    int len = snprintf(response, sizeof(response),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "<html><body><h1>%d %s</h1></body></html>",
-        status_code, message,
-        strlen(message) + 32,
-        status_code, message);
-    
-    send(client, response, len, 0);
-    return 0;
-}
-
-static int send_418_response(int client) {
-    const char* teapot_html = 
-        "<html><head><title>418 I'm a teapot</title></head><body><h1>418 I'm a teapot</h1></body></html>";
-    char response[8192];
-    int len = snprintf(response, sizeof(response),
-        "HTTP/1.1 418 I'm a teapot\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        strlen(teapot_html),
-        teapot_html);
-    send(client, response, len, 0);
-    return 0;
-}
-
-static int is_april_fools_day(void) {
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
-    return (tm_buf.tm_mon == 3 && tm_buf.tm_mday == 1);
-}
+/* 第192轮：以下文件服务辅助已下沉 src/common/nl_filesrv.c（三平台一份实现）。
+ * 保留旧名字的宏别名，全部调用点零改动。 */
+#define get_file_extension nl_filesrv_ext
+#define get_mime_type      nl_filesrv_mime
+#define read_file          nl_filesrv_read
+#define send_http_response nl_filesrv_send_response
+#define send_http_error    nl_filesrv_send_error
+#define send_418_response  nl_filesrv_send_teapot
+#define is_april_fools_day nl_filesrv_is_teapot_day
 
 static void* file_server_thread(void* arg) {
     nl_file_server_t* server = (nl_file_server_t*)arg;
@@ -1476,28 +1257,45 @@ static void* file_server_thread(void* arg) {
             continue;
         }
         
+        /* 第192轮：RFC 3986 端点规范化（剥 query/fragment、percent-decode、
+         * dot-segment 归一）。非法端点 400，越根 403。 */
+        char norm_path[4096];
+        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (uri_rc != NL_URI_OK) {
+            int esc = (uri_rc == NL_URI_ESCAPES);
+            send_http_error(client, esc ? 403 : 400,
+                            esc ? "Forbidden" : "Bad Request");
+            close(client);
+            continue;
+        }
+
         if (server->enable_easter_egg && is_april_fools_day()) {
-            if (strncmp(path, "/tea", 4) == 0) {
+            if (strncmp(norm_path, "/tea", 4) == 0) {
                 send_418_response(client);
                 close(client);
                 continue;
             }
         }
-        
+
+        /* 物理文件隔离：请求路径 → 磁盘的拼接统一经 nl_uri_resolve_file */
         char filepath[8192];
-        normalize_path(server->directory, path, filepath, sizeof(filepath));
-        
-        if (!is_path_safe(server->directory, filepath)) {
-            send_http_error(client, 403, "Forbidden");
+        int fr = nl_uri_resolve_file(server->directory, norm_path,
+                                     filepath, sizeof(filepath));
+        if (fr != NL_URI_OK) {
+            int deny403 = (fr == NL_URI_ESCAPES || fr == NL_URI_EROOT);
+            send_http_error(client, deny403 ? 403 : 400,
+                            deny403 ? "Forbidden" : "Bad Request");
             close(client);
             continue;
         }
-        
+
         struct stat path_stat;
         if (stat(filepath, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
             char index_path[8192];
             snprintf(index_path, sizeof(index_path), "%s/%s", filepath, server->index_file);
-            if (stat(index_path, &path_stat) == 0) {
+            /* index_file 来自配置，拼接后仍做一次根目录隔离二次校验 */
+            if (stat(index_path, &path_stat) == 0 &&
+                nl_uri_is_under(server->directory, index_path)) {
                 strncpy(filepath, index_path, sizeof(filepath));
             } else {
                 send_http_error(client, 404, "Not Found");
@@ -1734,7 +1532,19 @@ static void* router_server_thread(void* arg) {
             body_size = (size_t)(received - (body - buffer));
         }
         
-        struct nl_route* route = router_find_route(rs->router, path, method);
+        /* 第192轮：RFC 3986 端点规范化；路由匹配用 norm_path，
+         * handler 仍收原始 path（既有 handler 会自行从 path 截取 query）。 */
+        char norm_path[4096];
+        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (uri_rc != NL_URI_OK) {
+            int esc = (uri_rc == NL_URI_ESCAPES);
+            send_http_error(client, esc ? 403 : 400,
+                            esc ? "Forbidden" : "Bad Request");
+            close(client);
+            continue;
+        }
+
+        struct nl_route* route = router_find_route(rs->router, norm_path, method);
         if (route) {
             char* response = NULL;
             size_t response_size = 0;
@@ -1897,6 +1707,7 @@ static const nl_px_pool_ops g_pr_pool_ops = {
 typedef struct {
     int      kqfd;              // kqueue fd（-1=未启用）
     int      sock;              // 本实例 listen socket
+    int      idx;               // 槽位号（伸缩/日志用）
     int      cap;               // ring 容量（按核数动态定，上限 4096）
     int      count;             // 当前活动 proxy 连接数
     int      free_top;          // 回收栈顶（O(1) 取 free slot）
@@ -1922,6 +1733,14 @@ typedef struct {
     int*     pr_tls_done;       // [idx] -> 隧道线程已结束，等待引擎回收
     int      wake_pipe[2];      // [0]=读端（注册 kqueue），[1]=隧道线程写端
     volatile int pr_tls_threads; // 存活隧道线程数（拆卸时等待归零）
+    volatile int scale_state;    // 0=空闲槽 1=运行中 2=退役排空中
+    volatile int retire;         // 1=请求停止 accept 并排空后退出
+    volatile int exited;         // 1=引擎线程已返回（等待 join）
+    volatile int overload;       // ring 满触发次数（扩容信号，评估时清零）
+    // 第190轮：ring 满背压。ring 满时把 listen 从 kqueue 摘除，让连接留在内核
+    // backlog 排队（而不是 accept 后直接 close 造成无响应 RST）；有槽位归还时
+    // 由 pr_free_slot 重新挂回，避免电平触发 listen 事件忙等。
+    int ring_full;               // 1=listen 已摘除（仅引擎线程读写）
     // 回指针
     nl_web_server_t* server;
 } nl_web_macos_engine_t;
@@ -1954,12 +1773,17 @@ struct nl_web_server {
     // 不为每个连接建对象，状态编码为 8 位无状态字节 + fd 映射整数数组。
     // P1: 引擎状态抽为 nl_web_macos_engine_t 子结构；P6: server 持有 engines[N]，
     // N>1 时 N 个 listen fd（SO_REUSEPORT）+ N 线程各跑一个引擎循环。
-    nl_web_macos_engine_t* engines;  // 引擎实例数组（P6：[engine_count]）
-    int engine_count;                // 引擎实例数（单实例=1，多实例=N）
+    nl_web_macos_engine_t* engines;  // 引擎槽位数组（P6：[engine_slots]，伸缩复用）
+    int engine_count;                // 引擎实例数（=槽位数：单实例=1，多实例=N）
+    int engine_slots;                // 伸缩上限（auto: min(逻辑核数,32)；fixed: n）
+    int engine_autoscale;            // 1=auto 模式按负载在 [1, engine_slots] 间伸缩
+    pthread_mutex_t engine_lock;     // 保护 engines[] 槽位状态与线程句柄增减
+    pthread_t scaler_thread;         // 伸缩监督线程（auto 模式存在）
+    int scaler_alive;                // 1=监督线程已启动（stop 先 join 它）
     pthread_t* engine_threads;       // P6: [engine_count] 引擎线程句柄（多实例时各线程 join）
     int engine_threads_ready;        // P6: 已就绪线程数（用于启动失败回滚）
     // P6/P7 配置字段（与 Linux 对齐，均已生效）
-    int engine_threads_cfg;   // P6: 引擎实例数（0=单实例；>1 时 SO_REUSEPORT 多实例）
+    int engine_threads_cfg;   // P6: 引擎实例数（0=auto 自动伸缩；>0 固定实例数）
     int max_conns_cfg;        // P6: 总连接预算（0=自动 ncpu*64，按 N 均分每引擎 ring cap）
     int idle_timeout_ms;      // P7: 空闲超时 ms（0=默认 30000）
     int force_legacy_pool;    // P5: 强制走 legacy worker 池（0=默认引擎）
@@ -1974,12 +1798,8 @@ static int g_auto_cleanup_enabled = 0;
 static const int NL_ROUTE_HASH_SIZE = 128;
 
 static unsigned nl_route_hash(const char* path) {
-    unsigned h = 2166136261u;
-    for (; *path; path++) {
-        h ^= (unsigned char)*path;
-        h *= 16777619u;
-    }
-    return h % NL_ROUTE_HASH_SIZE;
+    /* 第192轮：FNV-1a 实现已下沉 src/common/nl_util.c（三平台一份实现） */
+    return nl_hash_fnv1a(path) % NL_ROUTE_HASH_SIZE;
 }
 
 static void nl_route_hash_init(nl_web_server_t* server) {
@@ -2058,7 +1878,8 @@ static int nl_web_proxy_ring_capacity(void) {
 static int pr_alloc_slot(nl_web_macos_engine_t* eng) {
     if (eng->count >= eng->cap || eng->free_top < 0) return -1;
     int idx = eng->free[eng->free_top--];
-    eng->count++;
+    /* 第188轮：count 会被伸缩监督线程跨线程读取，写侧改原子 */
+    __atomic_add_fetch(&eng->count, 1, __ATOMIC_RELAXED);
     return idx;
 }
 
@@ -2077,23 +1898,22 @@ static void pr_free_slot(nl_web_macos_engine_t* eng, int idx) {
     if (eng->pr_up) nl_px_upstate_reset(&eng->pr_up[idx]);
     if (eng->pr_last_active_ms) eng->pr_last_active_ms[idx] = 0;  // P7: 归还即清零时间戳
     eng->free[++(eng->free_top)] = idx;
-    if (eng->count > 0) eng->count--;
+    if (__atomic_load_n(&eng->count, __ATOMIC_RELAXED) > 0)
+        __atomic_sub_fetch(&eng->count, 1, __ATOMIC_RELAXED);
+    // 第190轮：背压解除 —— ring 满时 listen 已被摘除，有空闲槽位就挂回 kqueue。
+    // 必须在 count-- / free_top++ 之后，保证挂回后 accept 立刻拿得到槽。
+    if (eng->ring_full && eng->kqfd >= 0 && eng->sock >= 0) {
+        struct kevent ev;
+        EV_SET(&ev, eng->sock, EVFILT_READ, EV_ADD, 0, 0,
+               (void*)((uintptr_t)0x7FFFFFFF));   /* listen 哨兵（与注册处一致） */
+        if (kevent(eng->kqfd, &ev, 1, NULL, 0, NULL) == 0)
+            eng->ring_full = 0;
+    }
 }
 
-// 忽略大小写判断 [s, s+n) 是否以 prefix 开头（prefix 为小写字面量）
-static int pr_ci_starts(const char* s, size_t n, const char* prefix) {
-    size_t i = 0;
-    for (; prefix[i]; i++) {
-        if (i >= n) return 0;
-        char c = s[i];
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        if (c != prefix[i]) return 0;
-    }
-    return 1;
-}
-// 忽略大小写判断 [s, s+n) 是否包含 needle 等解析逻辑已下沉至
-// src/common/nl_proxy_core.c（三平台共用）；此处只保留路径匹配与逐行透传
-// 仍需的 pr_ci_starts / pr_memfind 小工具。
+// 忽略大小写判断 [s, s+n) 是否以 prefix 开头 / 是否包含 needle 等解析逻辑
+// 已下沉至 src/common/nl_proxy_core.c（三平台共用）；此处只保留路径匹配
+// 仍需的 pr_memfind 小工具。
 // 在 [s, s+n) 中查找 needle（可移植，替代非标准 memmem）
 static const char* pr_memfind(const char* s, size_t n, const char* needle, size_t nl) {
     if (nl == 0) return s;
@@ -2155,7 +1975,7 @@ static void* pr_tls_tunnel_thread_macos(void* param) {
         tls_conn = api.conn_wrap(ufd, host, &alpn);
 
     if (!tls_conn) {
-        macos_log(NL_LOG_ERROR,
+        nl_log(NL_LOG_ERROR,
                   "proxy: TLS session unavailable for upstream %s (refusing plaintext fallback)", host);
         send_http_error(cfd, 502, "Bad Gateway");
         close(cfd);
@@ -2478,6 +2298,9 @@ static int pr_build_upstream_http(nl_web_macos_engine_t* eng, int idx,
                                raw_hdrs, raw_hdrs_len, peer_ip[0] ? peer_ip : NULL);
 }
 
+// 第188轮：排空 listen backlog（事件分支与退役排空共用）。ring 满计 overload。
+static void pr_engine_accept_all(nl_web_macos_engine_t* eng, int listen_fd);
+
 // kqueue 数据驱动主循环：每个引擎实例单线程 kevent 驱动 N 条 proxy 连接
 // 通过 kevent(256) + 1000ms 超时实现极低占用（空闲 1s 退避）
 // 上游侧用 data->ident 标记（高位 0x40000000），listen fd 用哨兵 0xFFFFFFFF
@@ -2554,7 +2377,26 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     if (idle_ms <= 0) idle_ms = 30000;
     int64_t last_scan_ms = pr_pool_now_ms();
 
+    // 第188轮：缩容退役状态。lfd_open=本实例 listen fd 是否仍注册在 kqueue
+    int lfd_open = 1;
+    int64_t retire_since = 0;
+
     while (s->running) {
+        // 第188轮：缩容退役 —— 先排空 backlog（否则关 listen fd 会 RST 未 accept 连接），
+        // 再摘除并关闭本实例独占 listen fd，等活跃连接归零（或排空超时兜底）后退出线程。
+        if (__atomic_load_n(&eng->retire, __ATOMIC_ACQUIRE)) {
+            if (retire_since == 0) retire_since = pr_pool_now_ms();
+            if (lfd_open) {
+                pr_engine_accept_all(eng, listen_fd);
+                // kqueue 在 close 时自动 detach，无需 EV_DELETE
+                if (listen_fd != s->sock) close(listen_fd);   // engine 0 的 listen fd 归 stop 关
+                lfd_open = 0;
+                eng->sock = -1;
+            }
+            int left = __atomic_load_n(&eng->count, __ATOMIC_RELAXED);
+            if (left == 0) break;
+            if (pr_pool_now_ms() - retire_since >= NL_ENGINE_DRAIN_MS) break;
+        }
         struct timespec timeout;
         timeout.tv_sec = 1;
         timeout.tv_nsec = 0;
@@ -2576,7 +2418,7 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
                         int ufd = eng->pr_fd_upstream[si];
                         if (ufd > 0) {
                             int poolable = (eng->pr_up[si].up_parse == PR_UP_DONE &&
-                                            eng->pr_up_key && eng->pr_up_key[si][0] && eng->up_pool);
+                                            eng->pr_up_key && eng->pr_up_key[si] && eng->pr_up_key[si][0] && eng->up_pool);
                             if (poolable)
                                 nl_px_pool_put(eng->up_pool, eng->pr_up_key[si], ufd);
                             else
@@ -2607,35 +2449,8 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
             int is_up      = (udata & PR_UDATA_UP_BIT) ? 1 : 0;
             int idx        = (int)(udata & ~PR_UDATA_UP_BIT);
             if (idx == 0x7FFFFFF) {
-                // accept 客户端连接
-                int cfd = accept(listen_fd, NULL, NULL);
-                if (cfd < 0) continue;
-                int cf = fcntl(cfd, F_GETFL, 0);
-                fcntl(cfd, F_SETFL, cf | O_NONBLOCK);
-                int si = pr_alloc_slot(eng);
-                if (si < 0) { close(cfd); continue; }
-                eng->pr_fd_client[si] = cfd;
-                eng->pr_state[si] = PR_ST_ACTIVE;
-                // 每连接独立 8KB 首包缓冲 + 8KB 上游请求构造缓冲 + 64KB 上游响应缓冲（归还即释放）
-                // 首包缓冲多留 1 字节，供 hbuf[*hlen]='\0' 之类的串操作使用
-                eng->pr_hbuf[si]     = (char*)malloc(8193);
-                eng->pr_hbuf_out[si] = (char*)malloc(8192);
-                eng->pr_up_buf[si]   = (char*)malloc(PR_PROXY_BUF_SZ);
-                eng->pr_up_key[si]   = (char*)malloc(576);
-                eng->pr_hdr_len[si]  = 0;
-                eng->pr_remain[si]   = 0;
-                // P7: 空闲超时（slowloris 防护）
-                eng->pr_last_active_ms[si] = pr_pool_now_ms();
-                // 重置上游响应 framing 状态
-                nl_px_upstate_reset(&eng->pr_up[si]);
-                if (!eng->pr_hbuf[si] || !eng->pr_hbuf_out[si] || !eng->pr_up_buf[si] || !eng->pr_up_key[si]) {
-                    close(cfd);
-                    pr_free_slot(eng, si);
-                    continue;
-                }
-                struct kevent ev;
-                EV_SET(&ev, cfd, EVFILT_READ, EV_ADD, 0, 0, (void*)PR_UDATA(si, 0));
-                kevent(eng->kqfd, &ev, 1, NULL, 0, NULL);
+                // accept 客户端连接：循环排空 backlog（突发建连下每轮一个会锁死 QPS）
+                if (lfd_open) pr_engine_accept_all(eng, listen_fd);
                 continue;
             }
             if (idx >= eng->cap || !(eng->pr_state[idx] & PR_ST_ACTIVE)) continue;
@@ -2833,6 +2648,19 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
                         continue;
                     }
                     // proxy 路由：连接上游（优先复用池中空闲连接，未命中再新建）
+                    // 第190轮：proxy 专用缓冲延迟到这里才分配（本地路由 64KB+8KB+576B 全省掉）
+                    if (!eng->pr_up_buf[idx])
+                        eng->pr_up_buf[idx] = (char*)malloc(PR_PROXY_BUF_SZ);
+                    if (!eng->pr_hbuf_out[idx])
+                        eng->pr_hbuf_out[idx] = (char*)malloc(8192);
+                    if (!eng->pr_up_key[idx])
+                        eng->pr_up_key[idx] = (char*)malloc(576);
+                    if (!eng->pr_up_buf[idx] || !eng->pr_hbuf_out[idx] || !eng->pr_up_key[idx]) {
+                        send_http_error(cfd, 500, "Internal Server Error");
+                        close(cfd);
+                        pr_free_slot(eng, idx);
+                        continue;
+                    }
                     eng->pr_up[idx].req_is_head = (strcmp(method, "HEAD") == 0) ? 1 : 0;
                     char up_host[512];
                     int  up_port = 0;
@@ -2945,6 +2773,13 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
         }
     }
 
+    // 第188轮：退出兜底 —— 引擎异常退出时若本实例 listen fd 仍开着，先关闭（防 fd 泄漏）
+    if (lfd_open && listen_fd >= 0 && listen_fd != s->sock) {
+        close(listen_fd);
+        lfd_open = 0;
+    }
+    eng->sock = -1;
+
     // 先唤醒并等待 TLS 隧道线程退出，之后才能释放 ring 数组
     if (__atomic_load_n(&eng->pr_tls_threads, __ATOMIC_ACQUIRE) > 0) {
         for (int i = 0; i < eng->cap; i++) {
@@ -2996,7 +2831,56 @@ void nl_web_proxy_engine(nl_web_macos_engine_t* eng, int listen_fd, int ring_cap
     eng->free = NULL;
     eng->pr_up = NULL;
     eng->pr_up_key = NULL;
-    eng->cap = eng->count = 0;
+    eng->cap = 0;
+    __atomic_store_n(&eng->count, 0, __ATOMIC_RELAXED);   // 第188轮：与监督线程读侧配对
+}
+
+// 第188轮：排空 listen backlog（事件分支与退役排空共用）。ring 满计 overload。
+static void pr_engine_accept_all(nl_web_macos_engine_t* eng, int listen_fd) {
+    for (;;) {
+        /* 第190轮：ring 满背压 —— 不 accept、不 close，把 listen 从 kqueue 摘除，
+         * 连接留在内核 backlog 排队，等 pr_free_slot 归还槽位时再挂回。
+         * 旧实现 accept 后直接 close，客户端收到无响应 RST。 */
+        if (__atomic_load_n(&eng->count, __ATOMIC_RELAXED) >= eng->cap || eng->free_top < 0) {
+            if (!eng->ring_full) {
+                eng->ring_full = 1;
+                __atomic_add_fetch(&eng->overload, 1, __ATOMIC_RELAXED);
+                struct kevent dev;
+                EV_SET(&dev, listen_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                kevent(eng->kqfd, &dev, 1, NULL, 0, NULL);
+            }
+            return;
+        }
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) break;
+        int cf = fcntl(cfd, F_GETFL, 0);
+        fcntl(cfd, F_SETFL, cf | O_NONBLOCK);
+        int si = pr_alloc_slot(eng);
+        if (si < 0) {
+            __atomic_add_fetch(&eng->overload, 1, __ATOMIC_RELAXED);
+            close(cfd);
+            continue;
+        }
+        eng->pr_fd_client[si] = cfd;
+        eng->pr_state[si] = PR_ST_ACTIVE;
+        // 第190轮：accept 只分配必需的 8KB 首包缓冲；
+        // hbuf_out(8KB)/up_buf(64KB)/up_key(576B) 全部延迟到 proxy 路由分发时按需分配
+        eng->pr_hbuf[si]     = (char*)malloc(8193);
+        eng->pr_hdr_len[si]  = 0;
+        eng->pr_remain[si]   = 0;
+        // P7: 空闲超时（slowloris 防护）
+        eng->pr_last_active_ms[si] = pr_pool_now_ms();
+        // 重置上游响应 framing 状态
+        nl_px_upstate_reset(&eng->pr_up[si]);
+        if (!eng->pr_hbuf[si]) {
+            close(cfd);
+            pr_free_slot(eng, si);
+            continue;
+        }
+        struct kevent ev;
+        EV_SET(&ev, cfd, EVFILT_READ, EV_ADD, 0, 0, (void*)PR_UDATA(si, 0));
+        kevent(eng->kqfd, &ev, 1, NULL, 0, NULL);
+    }
 }
 
 // P6: 多实例引擎线程入口（SO_REUSEPORT）
@@ -3013,6 +2897,7 @@ static void* nl_web_proxy_engine_thread_multi(void* arg) {
     nl_web_macos_engine_t* eng = &s->engines[a->index];
     eng->sock = a->listen_fd;
     nl_web_proxy_engine(eng, a->listen_fd, a->ring_cap);
+    __atomic_store_n(&eng->exited, 1, __ATOMIC_RELEASE);   // 第188轮：通知监督线程可 join
     free(a);   // P6: 线程自释放 arg（start 不持有，避免泄漏）
     return NULL;
 }
@@ -3093,7 +2978,7 @@ static int nl_proxy_connect_upstream(const nl_web_route_t* route) {
     if (proto == NL_PROXY_HTTPS) {
         nl_px_tls_api api;
         if (!nl_px_tls_contract_get(&api)) {
-            macos_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
+            nl_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
             close(up_sock);
             return -1;
         }
@@ -3140,12 +3025,30 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
         }
     }
 
+    /* 第192轮：RFC 3986 端点规范化（剥 query/fragment、percent-decode、
+     * dot-segment 归一）。路由查找与本地响应用 norm_path；代理转发
+     * （反代请求行 / TCP 透传）保留原始 path（含 query，字节原样）。 */
+    char norm_path[4096];
+    if (strcmp(path, "*") == 0) {
+        norm_path[0] = '*';        /* OPTIONS *（RFC 7230 §7.1）：无路由，维持 404 */
+        norm_path[1] = '\0';
+    } else {
+        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (uri_rc != NL_URI_OK) {
+            int esc = (uri_rc == NL_URI_ESCAPES);
+            send_http_error(client, esc ? 403 : 400,
+                            esc ? "Forbidden" : "Bad Request");
+            close(client);
+            return;
+        }
+    }
+
     pthread_mutex_lock(&server->mutex);
     // 使用 hash 表 O(1) 查找路由；若 hash 未初始化则回退到线性链表
-    nl_web_route_t* route = nl_route_hash_lookup_simple(server, path);
+    nl_web_route_t* route = nl_route_hash_lookup_simple(server, norm_path);
     if (!route) {
         for (nl_web_route_t* r = server->routes; r; r = r->next) {
-            if (strcmp(r->path, path) == 0) { route = r; break; }
+            if (strcmp(r->path, norm_path) == 0) { route = r; break; }
         }
     }
     if (route) {
@@ -3296,9 +3199,9 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                             const char* le = nl;
                             if (le > p && le[-1] == '\r') le--;
                             size_t llen = (size_t)(le - p);
-                            int skip = pr_ci_starts(p, llen, "host:") ||
-                                       pr_ci_starts(p, llen, "x-forwarded-for:") ||
-                                       pr_ci_starts(p, llen, "connection:");
+                            int skip = nl_px_ci_starts(p, llen, "host:") ||
+                                       nl_px_ci_starts(p, llen, "x-forwarded-for:") ||
+                                       nl_px_ci_starts(p, llen, "connection:");
                             if (!skip && llen > 0 && memchr(p, ':', llen) &&
                                 (size_t)total + llen + 2 < sizeof(upstream_req_full)) {
                                 memcpy(upstream_req_full + total, p, llen);
@@ -3337,7 +3240,7 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                     (void)nl_px_split_hostport(route->upstream, up_host, sizeof(up_host),
                                                &up_port, 443);
                     if (!nl_px_tls_contract_get(&tls_api) || !tls_api.conn_wrap) {
-                        macos_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
+                        nl_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
                         free(proxy_buf);
                         close(up_sock);
                         send_http_error(client, 502, "Bad Gateway");
@@ -3346,7 +3249,7 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                     }
                     void* tls_conn = tls_api.conn_wrap(up_sock, up_host, NULL);
                     if (!tls_conn) {
-                        macos_log(NL_LOG_ERROR,
+                        nl_log(NL_LOG_ERROR,
                                   "proxy: TLS session unavailable for upstream %s (refusing plaintext fallback)",
                                   up_host);
                         free(proxy_buf);
@@ -3392,11 +3295,28 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
     close(client);
 }
 
+/* 第189轮 stop 死锁修复：同 Linux —— worker 的 accept 无限阻塞时不检查
+ * running，nl_web_stop 必须先 join 再关 listen fd → 空闲时 stop 卡死。
+ * 先 poll(200ms) 等可读再 accept，空闲时最多 200ms 唤醒一次检查 running。 */
+static int web_worker_accept(nl_web_server_t* server) {
+    struct pollfd pfd;
+    pfd.fd = server->sock;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, 200);
+    if (rc <= 0) return -1;
+    int c = accept(server->sock, NULL, NULL);
+    /* BSD/macOS：accept 的新 fd 继承 listener 非阻塞位，须恢复阻塞 */
+    if (c >= 0) set_blocking(c);
+    return c;
+}
+
 static void* nl_worker_thread(void* arg) {
     nl_web_server_t* server = (nl_web_server_t*)arg;
     while (server->running) {
-        int client = accept(server->sock, NULL, NULL);
+        int client = web_worker_accept(server);
         if (client < 0) {
+            if (!server->running) break;
             usleep(10000);
             continue;
         }
@@ -3431,8 +3351,9 @@ static void* web_server_thread(void* arg) {
 
     // 回退：worker 未启动（启动失败或 worker_count=0），accept 线程自己承担主 accept 循环
     while (server->running) {
-        int client = accept(server->sock, NULL, NULL);
+        int client = web_worker_accept(server);
         if (client < 0) {
+            if (!server->running) break;
             usleep(10000);
             continue;
         }
@@ -3465,6 +3386,7 @@ nl_web_server_t* nl_web_create(int port) {
     server->sock = -1;  // P6: listen socket 由 nl_web_start 创建
     server->redirect_type = NL_REDIRECT_TEMPORARY; // 默认 302
     pthread_mutex_init(&server->mutex, NULL);
+    pthread_mutex_init(&server->engine_lock, NULL);   // 第188轮：伸缩保护
     nl_route_hash_init(server);
     strncpy(server->encoding, "UTF-8", sizeof(server->encoding) - 1);
     server->next = g_web_servers;
@@ -3502,6 +3424,7 @@ void nl_web_destroy(nl_web_server_t* server) {
     }
     pthread_mutex_unlock(&server->mutex);
     pthread_mutex_destroy(&server->mutex);
+    pthread_mutex_destroy(&server->engine_lock);   // 第188轮
     free(server->route_hash);
     free(server->workers);
     // P6: 兜底释放引擎状态块（正常已在 nl_web_stop 释放）
@@ -3550,8 +3473,8 @@ static int nl_web_open_listens(nl_web_server_t* server, int* fds, int n,
                 setsockopt(sk, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
             }
             setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            if (n > 1) {
-                // P6: 仅多实例设 SO_REUSEPORT（单实例保持原语义）
+            if (n > 1 || server->engine_autoscale) {
+                // P6/第188轮：多实例或 auto 伸缩模式（扩容实例需与既有实例共 bind）
                 setsockopt(sk, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
             }
             fds[cnt++] = sk;
@@ -3579,6 +3502,167 @@ static int nl_web_open_listens(nl_web_server_t* server, int* fds, int n,
     return -1;
 }
 
+/* ---- 第188轮：Web 引擎实例自动伸缩（与 Linux 同构） ---- */
+
+static int nl_web_engine_slots_used(nl_web_server_t* s) {
+    if (!s->engines || s->engine_count <= 0) return 0;
+    int n = 0;
+    for (int i = 0; i < s->engine_count; i++)
+        if (s->engines[i].scale_state != 0) n++;
+    return n;
+}
+
+/* 为新实例创建 listen socket（macOS 要求所有 socket bind 前设 SO_REUSEPORT） */
+static int nl_web_engine_listen(nl_web_server_t* s, int opt) {
+    struct sockaddr_storage addr;
+    socklen_t alen = 0;
+    int mode = nl_px_listen_mode_resolve(s->listen_mode);
+    int af = nl_web_listen_addr(s, &addr, &alen);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int sk = socket(af, SOCK_STREAM, 0);
+        if (sk < 0) return -1;
+        if (af == AF_INET6) {
+            int v6only = (mode == NL_PX_LISTEN_V6) ? 1 : 0;
+            setsockopt(sk, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        }
+        setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sk, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));   // 与既有实例共存
+        if (bind(sk, (struct sockaddr*)&addr, alen) == 0 &&
+            listen(sk, SOMAXCONN) == 0) {
+            s->af = af;
+            return sk;
+        }
+        close(sk);
+        if (af != AF_INET6 || mode == NL_PX_LISTEN_V6) return -1;   // 显式 V6 不静默回退
+        struct sockaddr_in* a4 = (struct sockaddr_in*)&addr;
+        memset(&addr, 0, sizeof(addr));
+        a4->sin_family = AF_INET;
+        a4->sin_addr.s_addr = INADDR_ANY;
+        a4->sin_port = htons((unsigned short)s->port);
+        alen = (socklen_t)sizeof(*a4);
+        af = AF_INET;
+    }
+    return -1;
+}
+
+/* 扩容：在空闲槽位上开一个新引擎实例。调用方必须持有 engine_lock。 */
+static int nl_web_engine_scale_up(nl_web_server_t* s) {
+    if (!s->engines || !s->engine_threads || s->engine_count <= 0) return -1;
+    int slot = -1;
+    for (int i = 0; i < s->engine_count; i++) {
+        if (s->engines[i].scale_state == 0) { slot = i; break; }
+    }
+    if (slot < 0) return -1;   // 无空闲槽位 = 已到上限
+
+    int opt = 1;
+    int sk = nl_web_engine_listen(s, opt);
+    if (sk < 0) return -1;
+
+    int live = nl_web_engine_slots_used(s) + 1;
+    int total = s->max_conns_cfg > 0 ? s->max_conns_cfg : nl_web_proxy_ring_capacity();
+    int per_cap = total / (live > 0 ? live : 1);
+    if (per_cap < 64) per_cap = 64;
+    if (per_cap > 4096) per_cap = 4096;
+
+    nl_web_macos_engine_t* e = &s->engines[slot];
+    memset(e, 0, sizeof(*e));
+    e->server = s;
+    e->kqfd = -1;
+    e->sock = sk;
+    e->idx = slot;
+    e->scale_state = 1;
+
+    struct pr_engine_thread_arg* a =
+        (struct pr_engine_thread_arg*)malloc(sizeof(struct pr_engine_thread_arg));
+    if (!a) { close(sk); e->sock = -1; e->scale_state = 0; return -1; }
+    a->server = s;
+    a->listen_fd = sk;
+    a->ring_cap = per_cap;
+    a->index = slot;
+    if (pthread_create(&s->engine_threads[slot], NULL,
+                       nl_web_proxy_engine_thread_multi, a) != 0) {
+        free(a); close(sk); e->sock = -1; e->scale_state = 0;
+        return -1;
+    }
+    s->engine_threads_ready++;
+    nl_log(NL_LOG_INFO, "Web: 引擎扩容 -> %d 实例（槽位 %d）",
+              nl_web_engine_slots_used(s), slot);
+    return 0;
+}
+
+/* 缩容：请求最高槽位的运行中实例退役。调用方必须持有 engine_lock。 */
+static int nl_web_engine_scale_down(nl_web_server_t* s) {
+    int slot = -1;
+    for (int i = s->engine_count - 1; i >= 1; i--) {   // engine 0 永不退役
+        if (s->engines[i].scale_state == 1) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+    s->engines[slot].scale_state = 2;   // 退役排空中
+    __atomic_store_n(&s->engines[slot].retire, 1, __ATOMIC_RELEASE);
+    nl_log(NL_LOG_INFO, "Web: 引擎缩容请求 -> %d 实例（槽位 %d 排空中）",
+              nl_web_engine_slots_used(s), slot);
+    return 0;
+}
+
+/* 回收已退出的退役线程，释放槽位。调用方必须持有 engine_lock。 */
+static void nl_web_engine_reap(nl_web_server_t* s) {
+    for (int i = 0; i < s->engine_count; i++) {
+        nl_web_macos_engine_t* e = &s->engines[i];
+        if (e->scale_state == 2 &&
+            __atomic_load_n(&e->exited, __ATOMIC_ACQUIRE) &&
+            s->engine_threads[i] != 0) {
+            pthread_join(s->engine_threads[i], NULL);
+            s->engine_threads[i] = 0;
+            e->scale_state = 0;
+        }
+    }
+}
+
+static void* nl_web_engine_scaler(void* arg) {
+    nl_web_server_t* s = (nl_web_server_t*)arg;
+    int64_t last_scale_ms = pr_pool_now_ms();
+    int idle_ticks = 0;
+    while (__atomic_load_n(&s->running, __ATOMIC_RELAXED)) {
+        usleep(NL_ENGINE_SCALE_SAMPLE_MS * 1000);
+        if (!__atomic_load_n(&s->running, __ATOMIC_RELAXED)) break;
+
+        int64_t now = pr_pool_now_ms();
+        pthread_mutex_lock(&s->engine_lock);
+        nl_web_engine_reap(s);
+        int live = nl_web_engine_slots_used(s);
+        if (live <= 0 || s->engine_slots <= 0 || !s->engines) {
+            pthread_mutex_unlock(&s->engine_lock);
+            continue;
+        }
+        int total = 0, over = 0;
+        for (int i = 0; i < s->engine_count; i++) {
+            nl_web_macos_engine_t* e = &s->engines[i];
+            if (e->scale_state != 1) continue;
+            total += __atomic_load_n(&e->count, __ATOMIC_RELAXED);
+            over += __atomic_exchange_n(&e->overload, 0, __ATOMIC_RELAXED);
+        }
+        if (over > 0 || total >= live * NL_ENGINE_SCALE_UP_PER_CONN) {
+            idle_ticks = 0;   // 高负载：先清空闲计数再扩容
+            if (live < s->engine_slots && now - last_scale_ms >= 500) {
+                if (nl_web_engine_scale_up(s) == 0) last_scale_ms = now;
+            }
+        } else if (total <= live * NL_ENGINE_SCALE_DOWN_PER_CONN) {
+            idle_ticks++;
+            if (idle_ticks >= NL_ENGINE_SCALE_DOWN_TICKS &&
+                live > NL_ENGINE_MIN_INSTANCES &&
+                now - last_scale_ms >= NL_ENGINE_SCALE_COOLDOWN_MS) {
+                if (nl_web_engine_scale_down(s) == 0) {
+                    last_scale_ms = now; idle_ticks = 0;
+                }
+            }
+        } else {
+            idle_ticks = 0;
+        }
+        pthread_mutex_unlock(&s->engine_lock);
+    }
+    return NULL;
+}
+
 int nl_web_start(nl_web_server_t* server) {
     if (!server || server->running) return -1;
 
@@ -3603,22 +3687,33 @@ int nl_web_start(nl_web_server_t* server) {
     if (server->force_legacy_pool) has_proxy = 0;
 
     // P5/P6: 默认走数据驱动引擎（kqueue），除非显式 nl_web_force_legacy_pool(1)
-    // P6: engine_threads_cfg > 1 时走 SO_REUSEPORT 多实例
-    int n_engines = 0;
+    // 第188轮：engine_threads_cfg <= 0 = auto 模式（按负载在 [1, slots] 间伸缩）
+    int n_engines = 0;   // 初始实例数
+    int slots = 0;       // 槽位数组容量 = 伸缩上限
+    int autoscale = 0;
     if (!has_proxy) {
         n_engines = 0;  // legacy worker 池
+    } else if (server->engine_threads_cfg <= 0) {
+        autoscale = 1;
+        n_engines = 1;
+        slots = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (slots < 1) slots = 1;
+        if (slots > NL_ENGINE_MAX_INSTANCES) slots = NL_ENGINE_MAX_INSTANCES;
     } else {
         n_engines = server->engine_threads_cfg;
-        if (n_engines <= 0) n_engines = 1;  // 默认单实例
+        if (n_engines > 256) n_engines = 256;   // listen_fds[256]
+        slots = n_engines;
     }
 
     if (n_engines >= 1) {
-        // P6: 引擎分支（单实例/多实例统一走此路径）
-        // 正确顺序（macOS 要求所有 socket 在 bind 前均已设 SO_REUSEPORT）：
-        // 创建 N 个 socket → 全部 setsockopt(SO_REUSEADDR+SO_REUSEPORT) → 全部 bind → 全部 listen
+        // 第188轮：只开初始实例数的 listen fd（扩容实例由 nl_web_engine_listen 按需创建，
+        // 每个 socket 各自 bind 前设 SO_REUSEPORT 即可，无需批量预开）；
+        // 槽位数组仍按伸缩上限 slots 分配。
         int listen_fds[256];
         int sock_cnt = 0;
-        if (n_engines > 256) n_engines = 256;
+        if (slots > 256) slots = 256;
+        if (n_engines > slots) n_engines = slots;
+        server->engine_autoscale = autoscale;   // open_listens 据此决定是否设 SO_REUSEPORT
         {
             int got = nl_web_open_listens(server, listen_fds, n_engines, &af, opt);
             if (got < 0) return -1;
@@ -3627,48 +3722,62 @@ int nl_web_start(nl_web_server_t* server) {
         }
         // 主 sock 记第一个（兜底 nl_web_stop 清理）；其余由 engines[i].sock 持有
         server->sock = listen_fds[0];
-        server->engines = (nl_web_macos_engine_t*)calloc((size_t)n_engines, sizeof(nl_web_macos_engine_t));
+
+        // 第188轮：重启清理上一轮残留（防指针覆盖泄漏）
+        if (server->engines) { free(server->engines); server->engines = NULL; }
+        if (server->engine_slots > 0 && server->engine_threads) {
+            free(server->engine_threads); server->engine_threads = NULL;
+        }
+        server->engine_count = 0;
+        server->engine_slots = 0;
+
+        server->engines = (nl_web_macos_engine_t*)calloc((size_t)slots, sizeof(nl_web_macos_engine_t));
         if (!server->engines) {
             for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
             server->sock = -1;
             return -1;
         }
-        for (int i = 0; i < n_engines; i++) {
+        for (int i = 0; i < slots; i++) {
             server->engines[i].server = server;
             server->engines[i].kqfd = -1;
-            server->engines[i].sock = listen_fds[i];
+            server->engines[i].sock = -1;
+            server->engines[i].idx = i;
+            server->engines[i].scale_state = 0;   // 线程创建成功后才置 1
         }
-        server->engine_count = n_engines;
-        // P6: 总连接预算按 N 均分（0=自动 ncpu*64）
+        for (int i = 0; i < n_engines && i < sock_cnt; i++) {
+            server->engines[i].sock = listen_fds[i];   // 启动前记归属
+        }
+        server->engine_count = slots;
+        server->engine_slots = slots;
+        server->engine_autoscale = autoscale;
+
+        // P6: 总连接预算按槽位均分（auto 按上限均分，扩容不破 max_conns 预算）
         int total_conns = server->max_conns_cfg;
         if (total_conns <= 0) total_conns = nl_web_proxy_ring_capacity();
-        int per_cap = total_conns / n_engines;
+        int per_cap = total_conns / slots;
         if (per_cap < 64) per_cap = 64;
         if (per_cap > 4096) per_cap = 4096;
 
-        server->engine_threads = (pthread_t*)calloc((size_t)n_engines, sizeof(pthread_t));
+        server->engine_threads = (pthread_t*)calloc((size_t)slots, sizeof(pthread_t));
         if (!server->engine_threads) {
             free(server->engines);
             server->engines = NULL;
+            server->engine_count = 0;
+            server->engine_slots = 0;
             for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
             server->sock = -1;
             return -1;
         }
         server->engine_threads_ready = 0;
-        server->running = 1;  // P6: 先置 running，再创建线程（引擎循环检查 s->running）
+        server->running = 1;  // 先置 running，再创建线程（引擎循环检查 s->running）
         for (int i = 0; i < n_engines; i++) {
             struct pr_engine_thread_arg* a =
                 (struct pr_engine_thread_arg*)malloc(sizeof(struct pr_engine_thread_arg));
             if (!a) {
-                server->running = 0;
-                for (int j = 0; j < i; j++) pthread_join(server->engine_threads[j], NULL);
-                free(server->engine_threads);
-                free(server->engines);
-                server->engine_threads = NULL;
-                server->engines = NULL;
-                for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
-                server->sock = -1;
-                return -1;
+                for (int j = i; j < sock_cnt; j++) close(listen_fds[j]);
+                if (i == 0) server->sock = -1;
+                nl_log(NL_LOG_ERROR, "Web: 引擎参数分配失败，已启动 %d 个实例", i);
+                break;
             }
             a->server = server;
             a->listen_fd = listen_fds[i];
@@ -3677,23 +3786,44 @@ int nl_web_start(nl_web_server_t* server) {
             if (pthread_create(&server->engine_threads[i], NULL,
                                nl_web_proxy_engine_thread_multi, a) != 0) {
                 free(a);
-                server->running = 0;
-                for (int j = 0; j < i; j++) pthread_join(server->engine_threads[j], NULL);
-                free(server->engine_threads);
-                free(server->engines);
-                server->engine_threads = NULL;
-                server->engines = NULL;
-                for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
-                server->sock = -1;
-                return -1;
+                for (int j = i; j < sock_cnt; j++) {
+                    close(listen_fds[j]);
+                    if (j < slots) {
+                        server->engines[j].sock = -1;
+                        server->engines[j].scale_state = 0;
+                    }
+                }
+                if (i == 0) server->sock = -1;
+                nl_log(NL_LOG_ERROR, "Web: 引擎线程创建失败，已启动 %d 个实例", i);
+                break;
             }
+            // 第188轮：把已开的 listen fd 记到本槽位（后续槽位的 fd 留给扩容时使用）
+            server->engines[i].sock = listen_fds[i];
+            server->engines[i].scale_state = 1;
             server->engine_threads_ready++;
         }
-        if (n_engines == 1) {
-            // 单实例：记录到 server->thread（nl_web_stop 通过 server->thread join），
-            // engine_threads[0] 置 0 防止 stop 重复 join
-            server->thread = server->engine_threads[0];
-            server->engine_threads[0] = 0;
+        if (server->engine_threads_ready == 0) {
+            // 一个引擎都没起来：回滚
+            server->running = 0;
+            free(server->engine_threads);
+            free(server->engines);
+            server->engine_threads = NULL;
+            server->engines = NULL;
+            server->engine_count = 0;
+            server->engine_slots = 0;
+            for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
+            server->sock = -1;
+            return -1;
+        }
+        if (autoscale) {
+            // 第188轮：伸缩监督线程（auto 模式）
+            if (pthread_create(&server->scaler_thread, NULL,
+                               nl_web_engine_scaler, server) == 0) {
+                server->scaler_alive = 1;
+            } else {
+                nl_log(NL_LOG_WARN, "Web: 伸缩监督线程创建失败，实例数固定为 %d",
+                          server->engine_threads_ready);
+            }
         }
         return 0;
     }
@@ -3705,6 +3835,8 @@ int nl_web_start(nl_web_server_t* server) {
         if (got < 1) return -1;
         server->af = af;
         server->sock = one[0];
+        /* 第189轮：listen 非阻塞，防多 worker 竞争 accept 时输家永久挂起（同 Linux） */
+        set_nonblocking(server->sock);
     }
     server->running = 1;
 
@@ -3733,7 +3865,8 @@ int nl_web_set_worker_count(nl_web_server_t* server, int target) {
     return 0;
 }
 
-// P6: 引擎实例数。macOS kqueue 引擎已支持多实例（SO_REUSEPORT，nl_web_start 生效）。
+// P6: 引擎实例数（0 = 自动伸缩：按负载在 [1, min(逻辑核数,32)] 间增减；>0 = 固定实例数）。
+// 在 nl_web_start 前调用生效；已 start 的服务器下次重启后生效。
 int nl_web_set_engine_threads(nl_web_server_t* server, int n) {
     if (!server) return -1;
     if (n < 0) n = 0;
@@ -3777,14 +3910,18 @@ int nl_web_set_listen_mode(nl_web_server_t* server, nl_web_listen_mode_t mode) {
 
 void nl_web_stop(nl_web_server_t* server) {
     if (!server || !server->running) return;
-    server->running = 0;
-    // 单实例引擎或 legacy worker 主线程：经 server->thread join（start 已把
-    // engines[0] 线程句柄挪到 server->thread，engine_threads[0] 置 0 防重复 join）
+    __atomic_store_n(&server->running, 0, __ATOMIC_RELAXED);
+    // 第188轮：先 join 伸缩监督线程（它会做最后一轮 reap），再 join 引擎线程
+    if (server->scaler_alive) {
+        pthread_join(server->scaler_thread, NULL);
+        server->scaler_alive = 0;
+    }
+    // legacy worker 主线程（引擎模式下 server->thread 为 0）
     if (server->thread) {
         pthread_join(server->thread, NULL);
         server->thread = 0;
     }
-    // P6: join 多实例引擎线程（engine_threads_ready 记录实际创建成功的线程数）
+    // 第188轮：join 全部引擎线程（含退役排空中实例；已被 reap join 过的句柄为 0，跳过）
     if (server->engine_threads) {
         for (int i = 0; i < server->engine_count; i++) {
             if (server->engine_threads[i]) {
@@ -4395,6 +4532,7 @@ static void cleanup_all_web_servers(void) {
         }
         pthread_mutex_unlock(&server->mutex);
         pthread_mutex_destroy(&server->mutex);
+        pthread_mutex_destroy(&server->engine_lock);   // 第188轮
         free(server->route_hash);
         free(server->workers);
         // P6: 兜底释放引擎状态块（正常已在 nl_web_stop 释放）

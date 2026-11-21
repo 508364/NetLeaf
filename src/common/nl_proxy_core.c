@@ -4,6 +4,7 @@
  * pr_up_parse_chunked / pr_parse_upstream_bytes（已修好的版本），三平台共用。
  */
 #include "nl_proxy_core.h"
+#include "nl_uri.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -347,9 +348,31 @@ int nl_px_feed_response(nl_px_ctx* c, const char* data, size_t len) {
 
 int nl_px_path_match(const char* route_path, const char* req_path) {
     if (!route_path || !req_path) return 0;
-    size_t plen = strcspn(req_path, "?");
-    size_t rlen = strlen(route_path);
-    return rlen == plen && strncmp(route_path, req_path, plen) == 0;
+
+    /* 第192轮：RFC 3986 规范化——两侧统一剥 query/fragment、percent-decode、
+     * dot-segment 归一（`%2e%2e%2f` ≡ `..`），规范化失败（坏编码 / 越根 /
+     * 反斜杠）视为不匹配。两端都可能含特殊字符；常见纯字面路径（无
+     * '%' '.' '?' '#' '\'）跳过拷贝，直接比较，热路径零额外开销。 */
+    int need = 0;
+    for (const char* p = route_path; *p; p++)
+        if (*p == '%' || *p == '.' || *p == '?' || *p == '#' || *p == '\\') {
+            need = 1; break;
+        }
+    if (!need)
+        for (const char* p = req_path; *p; p++)
+            if (*p == '%' || *p == '.' || *p == '?' || *p == '#' || *p == '\\') {
+                need = 1; break;
+            }
+
+    char rbuf[4096], qbuf[4096];
+    const char* r = route_path, *q = req_path;
+    if (need) {
+        if (nl_uri_normalize(route_path, rbuf, sizeof(rbuf)) != NL_URI_OK) return 0;
+        if (nl_uri_normalize(req_path, qbuf, sizeof(qbuf)) != NL_URI_OK) return 0;
+        r = rbuf;
+        q = qbuf;
+    }
+    return strcmp(r, q) == 0;
 }
 
 /* ---------------- 每上游连接的 framing 状态 ---------------- */

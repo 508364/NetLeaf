@@ -116,7 +116,8 @@ Android 的 Bionic libc 与 glibc 差异通过**平台后端拆分**处理（min
   `netleaf_sysinfo_linux.c` 中原 `__ANDROID__` 分支已移除。
 - **随机数**：`netleaf_http_linux.c` 保留无条件 `#include <sys/random.h>`
   （NDK r25+ 提供该头文件，实测 NDK r30 编译通过）；主库已无 `getrandom()` 调用
-  （v3.0.0 起 QUIC/H3 拆分至独立 `quic` 扩展，连接 ID 生成改用 mbedTLS CTR_DRBG）。
+  （v3.0.0 起 QUIC/H3 拆分至独立 `quic` 扩展，连接 ID 生成改用 mbedTLS CTR_DRBG；
+  该扩展已于 2026-11-21 停止支持，不再更新）。
 - 核心库链接：`dl`/`iconv` 在 Bionic 已并入 libc，`ANDROID` 分支仅显式链
   `Threads::Threads` 与 `log`（Bionic `__android_log` 由 liblog 提供）。
 - `epoll_create1`（API 21+）/`flock`/`/proc/cpuinfo` 均受 Bionic 支持。

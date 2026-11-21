@@ -71,6 +71,12 @@
 #include "netleaf_http.h"
 #include "http/netleaf_http_internal.h"
 
+/* nl_log_error 定义于 netleaf_core（src/common/nl_logsys.c）。
+ * 本目标（netleaf_https）已定义 NL_EXPORTS，直接包含 netleaf.h 会把
+ * NL_API 展开为 dllexport，而该符号并非本 DLL 定义，故此处以无属性
+ * 声明引用，链接器经 netleaf_core 导入库解析（同 NL_HTTP_STATIC 模式）。 */
+void nl_log_error(const char* format, ...);
+
 /* HTTPS 客户端：封装 socket + TLS 上下文 + 目标主机名 */
 struct nl_http_client {
     int sock;
@@ -442,7 +448,7 @@ static void* nlh_tls_conn_thread(void* arg) {
     free(args);
 
     NL_HTTPS_TLS_CTX* tls = NL_HTTPS_TLS_create();
-    if (!tls) { fprintf(stderr, "[nlh-tls] TLS_create 失败\n"); close(sock); return NULL; }
+    if (!tls) { nl_log_error("[nlh-tls] TLS_create 失败"); close(sock); return NULL; }
 
     NL_HTTPS_TLS_CONFIG cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -458,14 +464,14 @@ static void* nlh_tls_conn_thread(void* arg) {
 
     int rc_cfg = NL_HTTPS_TLS_configure(tls, &cfg);
     if (rc_cfg != NL_HTTPS_TLS_OK) {
-        fprintf(stderr, "[nlh-tls] configure 失败 rc=%d\n", rc_cfg);
+        nl_log_error("[nlh-tls] configure 失败 rc=%d", rc_cfg);
         NL_HTTPS_TLS_destroy(tls);
         close(sock);
         return NULL;
     }
     int rc_hs = NL_HTTPS_TLS_handshake_ex(tls, sock, 10000);
     if (rc_hs != NL_HTTPS_TLS_OK) {
-        fprintf(stderr, "[nlh-tls] handshake 失败 rc=%d\n", rc_hs);
+        nl_log_error("[nlh-tls] handshake 失败 rc=%d", rc_hs);
         NL_HTTPS_TLS_destroy(tls);
         close(sock);
         return NULL;

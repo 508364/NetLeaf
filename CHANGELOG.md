@@ -1,5 +1,41 @@
 # NetLeaf 版本历史
 
+## v3.0.1（2026-11-21）
+
+### 统一日志系统升级（第193-194轮）
+
+**三平台去重：**
+- linux/windows/macos 各 ~120 行重复日志实现（独立级别状态、格式化输出、回调分发、debug 模式）整体下沉为单份平台无关核心 `src/common/nl_logsys.c`（净删约 360 行）；`linux_log`/`windows_log`/`macos_log` 调用点（17/49/12 处）全部改走 `nl_log`
+
+**输出格式增强（第194轮定稿，级别在前）：**
+- `[级别] [T线程ID] [YYYY-MM-DD HH:MM:SS.mmm] 消息`——毫秒级时间戳（旧为秒级）、线程 ID（Linux `gettid` / macOS `pthread_threadid_np` / Windows `GetCurrentThreadId`）、级别定宽对齐 `[INFO ]`
+
+**ANSI 颜色（仅 stderr）：**
+- 按级别着色级别字段：DEBUG 青 / INFO 绿 / WARN 黄 / ERROR 红
+- 仅控制台启用（Windows 显式开启 `ENABLE_VIRTUAL_TERMINAL_PROCESSING`）；重定向到文件/管道或设置 `NO_COLOR` 环境变量时自动禁用；文件 sink 永不着色（保证落盘内容可被 grep/解析）
+
+**新增 API：**
+- `nl_log_set_file(path, max_bytes, keep)` 文件落盘 + 按大小轮转（`path → path.1 → … → path.keep`，兼容 Windows rename 不覆盖语义）；`nl_log_close_file()`；`nl_log_get_level()`
+
+**并发安全：**
+- 文件写入/轮转由互斥锁保护（Win `INIT_ONCE`+`CRITICAL_SECTION` / POSIX `PTHREAD_MUTEX_INITIALIZER`），逐条 `fflush` 崩溃不丢日志
+
+**裸 fprintf 收敛：**
+- `src/http/netleaf_http_tls_linux.c` 3 处 TLS 失败输出（TLS_create/configure/handshake）改走 `nl_log_error`（受级别过滤/回调/落盘统一管理）
+
+**新增测试：**
+- `test/test_log.c`（ctest `LogSystemTest`）：级别过滤、回调分发、debug 模式、文件写入格式断言（毫秒时间戳/线程ID/定宽级别/无 ANSI 转义）、轮转链（`path.1`/`path.2` 存在且 `path.3` 不存在）、close 后不再写
+- Windows/Linux 双平台 ctest **11/11 通过**；bench（`engineN A 256×8`）落在第192轮波动区间 37k~41k 内，无回归
+
+### QUIC/H3 停止支持（2026-11-21）
+
+- `quic` 扩展因协议栈缺陷无法修复，自 2026-11-21 起**停止支持、不再更新**
+- 源码保留，`BUILD_QUIC` 默认 OFF，`QuicTlsTest` 仅在 `BUILD_QUIC=ON` 时注册
+
+**变更说明：**
+- stderr 日志格式变为 `[级别] [T线程ID] [时间戳] 消息`（原为 `[时间戳] [级别] 消息`），依赖旧格式的日志解析脚本需适配
+- 三平台此前的时间戳格式差异（Windows 与 POSIX 不同）已统一
+
 ## v3.0.1（2026-11-08）
 
 ### LinkAgg 反向数据池（第166轮）

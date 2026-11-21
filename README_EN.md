@@ -14,7 +14,8 @@ High-performance cross-platform network library (Windows/Linux/macOS/Android) bu
 
 - ✅ **Cross-platform**: Windows / Linux / macOS / Android (core)
 - ✅ **Multi-architecture**: x86, x64, ARM, ARM64, RISC-V, etc.
-- ✅ **Protocols**: TCP, UDP, HTTP/1.1, HTTP/2, WebSocket, MQTT v3.1.1/v5.0 (HTTP/3 QUIC is a separate optional `quic` extension)
+- ✅ **Protocols**: TCP, UDP, HTTP/1.1, HTTP/2, WebSocket, MQTT v3.1.1/v5.0 (HTTP/3 QUIC is a separate optional `quic` extension — **discontinued, no longer updated**)
+- ✅ **Unified logging (v3.0.1)**: single platform-independent core shared by all three platforms — millisecond timestamps + thread ID + padded level field (`[INFO ] [T12345] [2026-11-20 17:30:45.123] message`), per-level ANSI colors on consoles (DEBUG cyan / INFO green / WARN yellow / ERROR red, honors `NO_COLOR`), optional file sink with size-based rotation (`nl_log_set_file`)
 - ✅ **Async Web Engine (v3.0.0)**: Data-driven event engine with streaming body (64KB chunks) + chunked encoding, SO_REUSEPORT multi-instance, 30s idle timeout scan (slowloris protection)
 - ✅ **sendfile Zero-copy (v3.0.0)**: Static file routes via Linux `sendfile` / macOS BSD `sendfile` / Windows `TransmitFile` — measured 3~6x speedup, -97% memory
 - ✅ **HTTP/2 Complete (v3.0.0)**: HPACK dynamic tables + RFC 7541 Huffman codec, stream state machine, RST_STREAM/GOAWAY
@@ -39,7 +40,7 @@ NetLeaf/
 ├── src/
 │   ├── common/         nl_util.c (shared utilities)
 │   ├── http/           common HTTP logic + nlh_* shortname layer
-│   ├── quic/           QUIC/H3 extension (BUILD_QUIC)
+│   ├── quic/           QUIC/H3 extension (discontinued, no longer updated)
 │   ├── tls/(tls2) tls3/ mqtt/ lang/ vue/ ipc/ linkagg/ autocomplete/ autoroute/ errorpage/
 │   └── windows/ linux/ macos/  platform backends (+ optimize/)
 ├── third-party/        mbedtls (2.28.10 LTS), mbedtls3 (3.6.x)
@@ -49,7 +50,7 @@ NetLeaf/
 └── build_all.sh / build_all.bat / build_macos.sh
 ```
 
-**Libraries built (all SHARED):** `netleaf_core`, `netleaf_https`, `netleaf_tls2`, `netleaf_tls3`, `netleaf_quic` (optional), `netleaf_mqtt`, `netleaf_mqtt_server`, `netleaf_lang`, `netleaf_ipc`, `netleaf_linkagg`, `netleaf_vue`, `netleaf_autocomplete`, `netleaf_autoroute`, `netleaf_errorpage`.
+**Libraries built (all SHARED):** `netleaf_core`, `netleaf_https`, `netleaf_tls2`, `netleaf_tls3`, `netleaf_quic` (optional, discontinued), `netleaf_mqtt`, `netleaf_mqtt_server`, `netleaf_lang`, `netleaf_ipc`, `netleaf_linkagg`, `netleaf_vue`, `netleaf_autocomplete`, `netleaf_autoroute`, `netleaf_errorpage`.
 
 ## Build Requirements
 
@@ -67,7 +68,7 @@ NetLeaf/
 | `BUILD_MQTT` / `BUILD_MQTT_SERVER` | ON | MQTT client / server |
 | `BUILD_TLS3` | ON | Build `netleaf_tls3` (mbedTLS 3.x, TLS 1.2/1.3) |
 | `BUILD_TLS` | OFF | Build `netleaf_tls2` (mbedTLS 2.28.10); mutually exclusive with `BUILD_TLS3` |
-| `BUILD_QUIC` | OFF | Separate QUIC/H3 extension (core library has no QUIC) |
+| `BUILD_QUIC` | OFF | Separate QUIC/H3 extension (core library has no QUIC) — **discontinued, no longer updated** |
 | `BUILD_LANG` | ON | Multi-language error messages |
 | `BUILD_TESTS` / `BUILD_EXAMPLES` | OFF | Tests / examples |
 | `NETLEAF_ENABLE_LTO` | OFF | LTO (adds `-flto`/`/GL /LTCG` only) |
@@ -203,11 +204,16 @@ nl_extension_shutdown_all();
 ctest --test-dir build --output-on-failure
 ```
 
-Registered suites: `ModulesTest` / `FullTest` / `VariableSubstitutionTest` / `AllModulesTest` / `MqttFramesTest` / `HttpFramesTest` / `MqttServerLoopbackTest` / `WebEngineTest` / `QuicTlsTest` (with `BUILD_QUIC`). Benchmark tool `test/bench_web.c` covers CONTENT/FILE/PROXY/slow-client scenarios.
+Registered suites: `ModulesTest` / `FullTest` / `VariableSubstitutionTest` / `AllModulesTest` / `MqttFramesTest` / `HttpFramesTest` / `MqttServerLoopbackTest` / `WebEngineTest` / `LogSystemTest` / `QuicTlsTest` (with `BUILD_QUIC`; QUIC is discontinued). Benchmark tool `test/bench_web.c` covers CONTENT/FILE/PROXY/slow-client scenarios.
 
 ## Documentation
 
 Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Features, API Reference, Examples, Troubleshooting, plus TLS/MQTT/Vue/IPC/Lang/LinkAgg/Extension topics). Full changelog: [CHANGELOG.md](CHANGELOG.md).
+
+## What's New in v3.0.1 (2026-11-21)
+
+- **Unified logging**: the three per-platform logging copies (~120 lines each) merged into one platform-independent core `src/common/nl_logsys.c` (~360 lines removed); millisecond timestamps, thread IDs, padded level fields; new file sink with size-based rotation (`nl_log_set_file` / `nl_log_close_file`) and level query (`nl_log_get_level`); per-level ANSI colors on consoles (honors `NO_COLOR`); bare `fprintf` calls in `http_tls` now go through `nl_log_error`; new regression test `LogSystemTest` (11/11 on both Windows and Linux)
+- **QUIC/H3 discontinued**: the `quic` extension is frozen due to unfixable protocol-stack defects — no further updates as of 2026-11-21 (source retained, `BUILD_QUIC` remains OFF by default)
 
 ## What's New in v3.0.1 (2026-11-08)
 
@@ -233,7 +239,7 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 
 | Version | Date | Highlights |
 | --- | --- | --- |
-| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix; HTTP/2/HTTPS large-response truncation & stream-leak OOM fixes, Android backend split-out (2026-11-13); cross-protocol reverse-proxy fixes, HPACK capacity-update decoding, Linux/macOS worker pool now gated behind `nl_server_start_workers()` (2026-11-15) |
+| 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix; HTTP/2/HTTPS large-response truncation & stream-leak OOM fixes, Android backend split-out (2026-11-13); cross-protocol reverse-proxy fixes, HPACK capacity-update decoding, Linux/macOS worker pool now gated behind `nl_server_start_workers()` (2026-11-15); unified logging (ms timestamps/thread IDs/colors/file rotation), QUIC/H3 discontinued (2026-11-21) |
 | 3.0.0 | 2026-10-31 | Async web engine (sendfile zero-copy, multi-instance, test suite); HTTP/2 completion; HTTPS/2; Windows full IOCP + UDP receive ring; QUIC split out |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS refactor (`netleaf_https` split, tls2/tls3); MQTT on by default; `nl_util`; H2/QUIC frame fixes; Android build support |
 | 2.4.1 | 2026-09-24 | Lang error-code i18n, dynamic/external variables; warning cleanup; full-platform cross builds |

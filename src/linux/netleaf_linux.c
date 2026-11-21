@@ -24,7 +24,10 @@
 #include <limits.h>
 
 #include "../include/netleaf.h"
+#include "../include/nl_util.h"
 #include "../common/nl_proxy_core.h"
+#include "../common/nl_uri.h"
+#include "../common/nl_filesrv.h"
 #include "../common/nl_px_pool.h"
 #include "../common/nl_px_io.h"
 #include "../common/nl_px_h2.h"
@@ -40,6 +43,19 @@
 #define WEB_WORKER_DEFAULT 16
 #define MAX_CONCURRENCY 64
 #define MAX_WORKER_QUEUE 1024
+
+/* ---- 第188轮：Web 引擎实例自动伸缩（auto 模式，engine_threads_cfg<=0）----
+ * 高负载自动增实例、持续空闲自动减实例，区间 [NL_ENGINE_MIN_INSTANCES,
+ * min(逻辑核数, NL_ENGINE_MAX_INSTANCES)]；显式 nl_web_set_engine_threads(n)
+ * 仍为固定实例数，不参与伸缩。 */
+#define NL_ENGINE_MIN_INSTANCES      1      // 下限（engine 0 永不退役）
+#define NL_ENGINE_MAX_INSTANCES      32     // 自动模式实例数硬上限
+#define NL_ENGINE_SCALE_SAMPLE_MS    100    // 负载采样周期（监督线程睡眠粒度）
+#define NL_ENGINE_SCALE_COOLDOWN_MS  3000   // 两次缩容动作最小间隔（防抖）
+#define NL_ENGINE_SCALE_DOWN_TICKS   100    // 100ms 采样点 ×100 = 连续空闲 10s 才缩容
+#define NL_ENGINE_SCALE_UP_PER_CONN  16     // 每实例平均活跃连接 ≥16 → 扩容
+#define NL_ENGINE_SCALE_DOWN_PER_CONN 2     // 每实例平均活跃连接 ≤2 → 计入缩容
+#define NL_ENGINE_DRAIN_MS           10000  // 退役实例排空超时兜底
 
 struct nl_server {
     int fd;
@@ -99,107 +115,10 @@ struct nl_event_loop {
     pthread_t thread_id;
 };
 
-static nl_log_level_t current_log_level = NL_LOG_INFO;
-static nl_log_callback log_callback = NULL;
-static void* log_user_data = NULL;
-static int debug_mode = 0;
-
-static void linux_log(nl_log_level_t level, const char* fmt, ...) {
-    if (level < current_log_level) return;
-    
-    va_list args;
-    va_start(args, fmt);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
-    
-    if (log_callback) {
-        log_callback(level, msg, log_user_data);
-    } else {
-        const char* prefix[] = {"DEBUG", "INFO", "WARN", "ERROR"};
-        time_t now = time(NULL);
-        struct tm tm_buf;
-        localtime_r(&now, &tm_buf);
-        char time_str[32];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
-        fprintf(stderr, "[%s] [%s] %s\n", time_str, prefix[level], msg);
-    }
-}
-
-// Debug mode API implementation
-void nl_debug_enable(int enable) {
-    debug_mode = enable;
-    if (enable) {
-        current_log_level = NL_LOG_DEBUG;
-        linux_log(NL_LOG_INFO, "Debug mode enabled");
-    } else {
-        linux_log(NL_LOG_INFO, "Debug mode disabled");
-    }
-}
-
-int nl_debug_is_enabled(void) {
-    return debug_mode;
-}
-
-void nl_log(nl_log_level_t level, const char* format, ...) {
-    if (level < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    linux_log(level, "%s", msg);
-}
-
-void nl_log_debug(const char* format, ...) {
-    if (NL_LOG_DEBUG < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    linux_log(NL_LOG_DEBUG, "%s", msg);
-}
-
-void nl_log_info(const char* format, ...) {
-    if (NL_LOG_INFO < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    linux_log(NL_LOG_INFO, "%s", msg);
-}
-
-void nl_log_warn(const char* format, ...) {
-    if (NL_LOG_WARN < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    linux_log(NL_LOG_WARN, "%s", msg);
-}
-
-void nl_log_error(const char* format, ...) {
-    if (NL_LOG_ERROR < current_log_level) return;
-    
-    va_list args;
-    va_start(args, format);
-    char msg[1024];
-    vsnprintf(msg, sizeof(msg), format, args);
-    va_end(args);
-    
-    linux_log(NL_LOG_ERROR, "%s", msg);
-}
+/* 日志系统已下沉到 src/common/nl_logsys.c（第193轮）：
+ * 级别状态、格式化输出（毫秒时间戳+线程ID）、callback 分发、
+ * debug 模式、文件落盘/轮转统一由平台无关实现提供，
+ * 本文件的业务日志调用点直接使用 nl_log*()。 */
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -338,7 +257,7 @@ static void* listener_thread(void* arg) {
         int nfds = epoll_wait(server->epoll_fd, server->events, MAX_EVENTS, 100);
         if (nfds == -1) {
             if (errno == EINTR) continue;
-            linux_log(NL_LOG_ERROR, "Linux: epoll_wait() failed: %s", strerror(errno));
+            nl_log(NL_LOG_ERROR, "Linux: epoll_wait() failed: %s", strerror(errno));
             break;
         }
         
@@ -362,7 +281,7 @@ static void* listener_thread(void* arg) {
                         if (len < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                             if (errno == EINTR) continue;
-                            linux_log(NL_LOG_ERROR, "Linux: UDP recvfrom failed: %s", strerror(errno));
+                            nl_log(NL_LOG_ERROR, "Linux: UDP recvfrom failed: %s", strerror(errno));
                             break;
                         }
                         if (len == 0) break;
@@ -388,7 +307,7 @@ static void* listener_thread(void* arg) {
                                 break;
                             }
                             if (errno != EINTR) {
-                                linux_log(NL_LOG_ERROR, "Linux: accept() failed: %s", strerror(errno));
+                                nl_log(NL_LOG_ERROR, "Linux: accept() failed: %s", strerror(errno));
                             }
                             break;
                         }
@@ -410,10 +329,20 @@ static void* listener_thread(void* arg) {
                     }
                 } else {
                     // Legacy single-thread path
-                    struct sockaddr_in client_addr;
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
-                    if (client_fd != -1) {
+                    // listen fd 是 EPOLLET：必须循环 accept 排空 backlog，
+                    // 只 accept 一次的话已排队的连接不会再触发边沿事件，
+                    // 一连接一请求压测下大量连接卡死在 backlog（成功数极低）。
+                    for (;;) {
+                        struct sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
+                        if (client_fd == -1) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                                errno != ECONNABORTED && errno != EINTR) {
+                                nl_log(NL_LOG_ERROR, "Linux: accept() failed: %s", strerror(errno));
+                            }
+                            break;
+                        }
                         set_nonblocking(client_fd);
                         struct epoll_event ev;
                         ev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
@@ -426,7 +355,7 @@ static void* listener_thread(void* arg) {
                 if (server->events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                     int ret = epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                     if (ret == -1 && errno != EBADF) {
-                        linux_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) on hangup fd %d failed: %s", fd, strerror(errno));
+                        nl_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) on hangup fd %d failed: %s", fd, strerror(errno));
                     }
                     close(fd);
                     continue;
@@ -445,7 +374,7 @@ static void* listener_thread(void* arg) {
                         } else if (n == 0) {
                             int ret = epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                             if (ret == -1 && errno != EBADF) {
-                                linux_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) failed for fd %d: %s", fd, strerror(errno));
+                                nl_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) failed for fd %d: %s", fd, strerror(errno));
                             }
                             close(fd);
                             done = 1;
@@ -455,7 +384,7 @@ static void* listener_thread(void* arg) {
                             } else {
                                 int ret = epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                                 if (ret == -1 && errno != EBADF) {
-                                    linux_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) failed for fd %d: %s", fd, strerror(errno));
+                                    nl_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) failed for fd %d: %s", fd, strerror(errno));
                                 }
                                 close(fd);
                                 done = 1;
@@ -487,7 +416,7 @@ static void* listener_thread(void* arg) {
 
                         int ret = epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                         if (ret == -1 && errno != EBADF) {
-                            linux_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) after write failed for fd %d: %s", fd, strerror(errno));
+                            nl_log(NL_LOG_ERROR, "Linux: epoll_ctl(DEL) after write failed for fd %d: %s", fd, strerror(errno));
                         }
                         close(fd);
                     }
@@ -639,7 +568,7 @@ int nl_server_start(nl_server_t* server) {
     if (server->protocol == NL_PROTO_TCP || server->protocol == NL_PROTO_HTTP || 
         server->protocol == NL_PROTO_WEBSOCKET) {
         if (listen(server->fd, SOMAXCONN) == -1) {
-            linux_log(NL_LOG_ERROR, "Linux: listen() failed: %s", strerror(errno));
+            nl_log(NL_LOG_ERROR, "Linux: listen() failed: %s", strerror(errno));
             return NL_ERROR;
         }
         
@@ -660,7 +589,7 @@ int nl_server_start(nl_server_t* server) {
                 server->queue = NULL;
                 server->workers = NULL;
                 server->num_workers = 0;
-                linux_log(NL_LOG_ERROR, "Linux: failed to allocate worker pool");
+                nl_log(NL_LOG_ERROR, "Linux: failed to allocate worker pool");
                 return NL_ERROR;
             }
             pthread_mutex_init(&server->queue_lock, NULL);
@@ -672,7 +601,7 @@ int nl_server_start(nl_server_t* server) {
             for (int i = 0; i < server->num_workers; i++) {
                 if (pthread_create(&server->workers[i], NULL, worker_thread, server) != 0) {
                     cleanup_start_failure(server);
-                    linux_log(NL_LOG_ERROR, "Linux: failed to create worker thread %d", i);
+                    nl_log(NL_LOG_ERROR, "Linux: failed to create worker thread %d", i);
                     return NL_ERROR;
                 }
             }
@@ -684,7 +613,7 @@ int nl_server_start(nl_server_t* server) {
     ev.data.fd = server->fd;
     
     if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server->fd, &ev) == -1) {
-        linux_log(NL_LOG_ERROR, "Linux: epoll_ctl() failed: %s", strerror(errno));
+        nl_log(NL_LOG_ERROR, "Linux: epoll_ctl() failed: %s", strerror(errno));
         if (pool_created) stop_worker_pool(server);
         return NL_ERROR;
     }
@@ -699,7 +628,7 @@ int nl_server_start(nl_server_t* server) {
         return NL_ERROR;
     }
     
-    linux_log(NL_LOG_INFO, "Linux: Server started (epoll), fd=%d, workers=%d",
+    nl_log(NL_LOG_INFO, "Linux: Server started (epoll), fd=%d, workers=%d",
               server->fd, server->pool_used ? server->num_workers : 0);
     return NL_OK;
 }
@@ -717,7 +646,7 @@ void nl_server_stop(nl_server_t* server) {
         pthread_join(server->thread_id, NULL);
         server->thread_id = 0;
     }
-    linux_log(NL_LOG_INFO, "Linux: Server stopped");
+    nl_log(NL_LOG_INFO, "Linux: Server stopped");
 }
 
 int nl_server_set_concurrency(nl_server_t* server, int threads) {
@@ -785,7 +714,7 @@ nl_server_t* nl_server_create(nl_protocol_t protocol, int port) {
         return NULL;
     }
     
-    linux_log(NL_LOG_INFO, "Linux: Server created on port %d (epoll)", port);
+    nl_log(NL_LOG_INFO, "Linux: Server created on port %d (epoll)", port);
     return server;
 }
 
@@ -916,7 +845,7 @@ nl_client_t* nl_client_create(nl_protocol_t protocol) {
     }
     
     set_buffer_sizes(client->fd, 262144, 262144);
-    linux_log(NL_LOG_DEBUG, "Linux: Client created (socket=%d)", client->fd);
+    nl_log(NL_LOG_DEBUG, "Linux: Client created (socket=%d)", client->fd);
     return client;
 }
 
@@ -941,13 +870,13 @@ int nl_client_connect(nl_client_t* client, const char* host, int port) {
     
     if (connect(client->fd, (struct sockaddr*)&client->addr, sizeof(client->addr)) == -1) {
         if (errno != EINPROGRESS) {
-            linux_log(NL_LOG_ERROR, "Linux: connect() failed: %s", strerror(errno));
+            nl_log(NL_LOG_ERROR, "Linux: connect() failed: %s", strerror(errno));
             return NL_ECONNECT;
         }
     }
     
     client->connected = 1;
-    linux_log(NL_LOG_INFO, "Linux: Client connected to %s:%d", host, port);
+    nl_log(NL_LOG_INFO, "Linux: Client connected to %s:%d", host, port);
     return NL_OK;
 }
 
@@ -1129,7 +1058,7 @@ int nl_config_load(nl_config_t* config, const char* path) {
     pthread_mutex_unlock(&config->mutex);
     fclose(fp);
     
-    linux_log(NL_LOG_INFO, "Linux: Config loaded from %s", path);
+    nl_log(NL_LOG_INFO, "Linux: Config loaded from %s", path);
     return NL_OK;
 }
 
@@ -1266,14 +1195,7 @@ size_t nl_buffer_size(nl_buffer_t* buffer) {
     return size;
 }
 
-void nl_log_set_level(nl_log_level_t level) {
-    current_log_level = level;
-}
-
-void nl_log_set_callback(nl_log_callback callback, void* user_data) {
-    log_callback = callback;
-    log_user_data = user_data;
-}
+/* nl_log_set_level / nl_log_set_callback 已下沉到 src/common/nl_logsys.c */
 
 const char* nl_version_string(void) {
     return NETLEAF_VERSION;
@@ -1321,176 +1243,15 @@ struct nl_router {
 
 static volatile int g_file_server_running = 0;
 
-static void get_file_extension(const char* filename, char* ext, size_t ext_len) {
-    const char* dot = strrchr(filename, '.');
-    if (dot) {
-        strncpy(ext, dot + 1, ext_len - 1);
-        ext[ext_len - 1] = '\0';
-        for (size_t i = 0; i < strlen(ext); i++) {
-            ext[i] = tolower(ext[i]);
-        }
-    } else {
-        ext[0] = '\0';
-    }
-}
-
-static const char* get_mime_type(const char* ext) {
-    if (strcmp(ext, "html") == 0 || strcmp(ext, "htm") == 0) return "text/html";
-    if (strcmp(ext, "css") == 0) return "text/css";
-    if (strcmp(ext, "js") == 0) return "application/javascript";
-    if (strcmp(ext, "json") == 0) return "application/json";
-    if (strcmp(ext, "png") == 0) return "image/png";
-    if (strcmp(ext, "jpg") == 0 || strcmp(ext, "jpeg") == 0) return "image/jpeg";
-    if (strcmp(ext, "gif") == 0) return "image/gif";
-    if (strcmp(ext, "svg") == 0) return "image/svg+xml";
-    if (strcmp(ext, "ico") == 0) return "image/x-icon";
-    if (strcmp(ext, "xml") == 0) return "application/xml";
-    if (strcmp(ext, "txt") == 0) return "text/plain";
-    if (strcmp(ext, "pdf") == 0) return "application/pdf";
-    if (strcmp(ext, "zip") == 0) return "application/zip";
-    return "application/octet-stream";
-}
-
-static char* read_file(const char* filepath, size_t* out_size) {
-    FILE* fp = fopen(filepath, "rb");
-    if (!fp) {
-        if (out_size) *out_size = 0;
-        return NULL;
-    }
-    
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    if (size < 0) {
-        fclose(fp);
-        if (out_size) *out_size = 0;
-        return NULL;
-    }
-    
-    char* content = (char*)malloc((size_t)size + 1);
-    if (!content) {
-        fclose(fp);
-        if (out_size) *out_size = 0;
-        return NULL;
-    }
-    
-    size_t read = fread(content, 1, (size_t)size, fp);
-    fclose(fp);
-    content[read] = '\0';
-    
-    if (out_size) *out_size = read;
-    return content;
-}
-
-static char* normalize_path(const char* base_dir, const char* req_path, char* result, size_t result_len) {
-    char full_path[8192];
-    
-    if (req_path[0] == '/') {
-        snprintf(full_path, sizeof(full_path), "%s%s", base_dir, req_path);
-    } else {
-        snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, req_path);
-    }
-    
-    strncpy(result, full_path, result_len);
-    result[result_len - 1] = '\0';
-    return result;
-}
-
-static int is_path_safe(const char* base_dir, const char* filepath) {
-    char normalized_base[8192];
-    char normalized_file[8192];
-    
-    if (realpath(base_dir, normalized_base) == NULL) return 0;
-    if (realpath(filepath, normalized_file) == NULL) return 0;
-    
-    // 目录边界校验：前缀相同还需下一字符为路径结束或 '/'，避免 /base 误匹配 /baseXXX
-    size_t base_len = strlen(normalized_base);
-    if (strncmp(normalized_file, normalized_base, base_len) != 0) return 0;
-    if (base_len > 0 && normalized_base[base_len - 1] == '/') return 1;
-    return normalized_file[base_len] == '\0' || normalized_file[base_len] == '/';
-}
-
-static int send_http_response(int client, const char* content_type, const char* content, size_t content_len) {
-    char header[8192];
-    int header_len = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        content_type, content_len);
-    
-    send(client, header, header_len, 0);
-    if (content && content_len > 0) {
-        send(client, content, content_len, 0);
-    }
-    
-    return 0;
-}
-
-static int send_http_error(int client, int status_code, const char* message) {
-    char response[8192];
-    int len = snprintf(response, sizeof(response),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "<html><body><h1>%d %s</h1></body></html>",
-        status_code, message,
-        strlen(message) + 32,
-        status_code, message);
-    
-    send(client, response, len, 0);
-    return 0;
-}
-
-static int send_418_response(int client) {
-    const char* teapot_html = 
-        "<html>\n"
-        "<head>\n"
-        "<title>418 I'm a teapot</title>\n"
-        "<style>\n"
-        "body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }\n"
-        ".teapot { font-size: 100px; margin-bottom: 20px; }\n"
-        ".container { background: white; border-radius: 16px; padding: 40px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }\n"
-        "h1 { color: #8B4513; }\n"
-        "p { color: #666; }\n"
-        "</style>\n"
-        "</head>\n"
-        "<body>\n"
-        "<div class=\"container\">\n"
-        "<div class=\"teapot\">🫖</div>\n"
-        "<h1>418 I'm a teapot</h1>\n"
-        "<p>This server is a teapot, not a coffee machine!</p>\n"
-        "<p>Happy April Fools' Day! ☕</p>\n"
-        "</div>\n"
-        "</body>\n"
-        "</html>";
-    
-    char response[8192];
-    int len = snprintf(response, sizeof(response),
-        "HTTP/1.1 418 I'm a teapot\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "X-Teapot: Yes, this is a teapot!\r\n"
-        "\r\n"
-        "%s",
-        strlen(teapot_html),
-        teapot_html);
-    
-    send(client, response, len, 0);
-    return 0;
-}
-
-static int is_april_fools_day(void) {
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
-    return (tm_buf.tm_mon == 3 && tm_buf.tm_mday == 1);
-}
+/* 第192轮：以下文件服务辅助已下沉 src/common/nl_filesrv.c（三平台一份实现）。
+ * 保留旧名字的宏别名，全部调用点零改动。 */
+#define get_file_extension nl_filesrv_ext
+#define get_mime_type      nl_filesrv_mime
+#define read_file          nl_filesrv_read
+#define send_http_response nl_filesrv_send_response
+#define send_http_error    nl_filesrv_send_error
+#define send_418_response  nl_filesrv_send_teapot
+#define is_april_fools_day nl_filesrv_is_teapot_day
 
 static void* file_server_thread(void* arg) {
     nl_file_server_t* server = (nl_file_server_t*)arg;
@@ -1528,30 +1289,47 @@ static void* file_server_thread(void* arg) {
             continue;
         }
         
+        /* 第192轮：RFC 3986 端点规范化（剥 query/fragment、percent-decode、
+         * dot-segment 归一）。非法端点 400，越根 403。 */
+        char norm_path[4096];
+        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (uri_rc != NL_URI_OK) {
+            int esc = (uri_rc == NL_URI_ESCAPES);
+            send_http_error(client, esc ? 403 : 400,
+                            esc ? "Forbidden" : "Bad Request");
+            close(client);
+            continue;
+        }
+
         if (server->enable_easter_egg && is_april_fools_day()) {
             const char* tea_path = "/tea";
-            if (strncmp(path, tea_path, strlen(tea_path)) == 0) {
+            if (strncmp(norm_path, tea_path, strlen(tea_path)) == 0) {
                 send_418_response(client);
                 close(client);
                 continue;
             }
         }
-        
+
+        /* 物理文件隔离：请求路径 → 磁盘的拼接统一经 nl_uri_resolve_file */
         char filepath[8192];
-        normalize_path(server->directory, path, filepath, sizeof(filepath));
-        
-        if (!is_path_safe(server->directory, filepath)) {
-            send_http_error(client, 403, "Forbidden");
+        int fr = nl_uri_resolve_file(server->directory, norm_path,
+                                     filepath, sizeof(filepath));
+        if (fr != NL_URI_OK) {
+            int deny403 = (fr == NL_URI_ESCAPES || fr == NL_URI_EROOT);
+            send_http_error(client, deny403 ? 403 : 400,
+                            deny403 ? "Forbidden" : "Bad Request");
             close(client);
             continue;
         }
-        
+
         // Check if it's a directory
         struct stat path_stat;
         if (stat(filepath, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
             char index_path[8192];
             snprintf(index_path, sizeof(index_path), "%s/%s", filepath, server->index_file);
-            if (stat(index_path, &path_stat) == 0) {
+            /* index_file 来自配置，拼接后仍做一次根目录隔离二次校验 */
+            if (stat(index_path, &path_stat) == 0 &&
+                nl_uri_is_under(server->directory, index_path)) {
                 strncpy(filepath, index_path, sizeof(filepath));
             } else {
                 send_http_error(client, 404, "Not Found");
@@ -1807,6 +1585,18 @@ static void* router_server_thread(void* arg) {
             continue;
         }
         
+        /* 第192轮：RFC 3986 端点规范化；路由匹配/静态回退用 norm_path，
+         * handler 仍收原始 path（既有 handler 会自行从 path 截取 query）。 */
+        char norm_path[4096];
+        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (uri_rc != NL_URI_OK) {
+            int esc = (uri_rc == NL_URI_ESCAPES);
+            send_http_error(client, esc ? 403 : 400,
+                            esc ? "Forbidden" : "Bad Request");
+            close(client);
+            continue;
+        }
+
         nl_http_method_t method = NL_METHOD_GET;
         if (strcmp(method_str, "POST") == 0) method = NL_METHOD_POST;
         else if (strcmp(method_str, "PUT") == 0) method = NL_METHOD_PUT;
@@ -1824,7 +1614,7 @@ static void* router_server_thread(void* arg) {
             body_size = (size_t)(received - (body - buffer));
         }
         
-        struct nl_route* route = router_find_route(rs->router, path, method);
+        struct nl_route* route = router_find_route(rs->router, norm_path, method);
         if (route) {
             char* response = NULL;
             size_t response_size = 0;
@@ -1839,15 +1629,18 @@ static void* router_server_thread(void* arg) {
                 send_http_error(client, 500, "Internal Server Error");
             }
         } else if (rs->router->static_dir[0] != '\0') {
+            /* 第192轮：静态目录回退统一走物理文件隔离解析器 */
             char filepath[8192];
-            normalize_path(rs->router->static_dir, path, filepath, sizeof(filepath));
-            
-            if (is_path_safe(rs->router->static_dir, filepath)) {
+            int fr = nl_uri_resolve_file(rs->router->static_dir, norm_path,
+                                         filepath, sizeof(filepath));
+
+            if (fr == NL_URI_OK) {
                 struct stat path_stat;
                 if (stat(filepath, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
                     char index_path[8192];
                     snprintf(index_path, sizeof(index_path), "%s/index.html", filepath);
-                    if (stat(index_path, &path_stat) == 0) {
+                    if (stat(index_path, &path_stat) == 0 &&
+                        nl_uri_is_under(rs->router->static_dir, index_path)) {
                         strncpy(filepath, index_path, sizeof(filepath));
                     }
                 }
@@ -1865,7 +1658,13 @@ static void* router_server_thread(void* arg) {
                     continue;
                 }
             }
-            send_http_error(client, 404, "Not Found");
+            if (fr != NL_URI_OK) {
+                int deny403 = (fr == NL_URI_ESCAPES || fr == NL_URI_EROOT);
+                send_http_error(client, deny403 ? 403 : 400,
+                                deny403 ? "Forbidden" : "Bad Request");
+            } else {
+                send_http_error(client, 404, "Not Found");
+            }
         } else {
             send_http_error(client, 404, "Not Found");
         }
@@ -2031,6 +1830,7 @@ static const nl_px_pool_ops g_pr_pool_ops = {
 typedef struct {
     int      epfd;              // epoll fd（-1=未启用）
     int      sock;              // 本实例监听 socket
+    int      idx;               // 本实例在 server->engines[] 中的槽位号（伸缩/日志用）
     int      cap;               // ring 容量（按核数动态定，上限 4096）
     int      count;             // 当前活动 proxy 连接数
     int      free_top;          // 回收栈顶（O(1) 取 free slot）
@@ -2069,6 +1869,16 @@ typedef struct {
     int*      pr_tls_done;      // [idx] -> 隧道线程已结束，等待引擎回收槽位
     int       wake_pipe[2];     // [0]=读端（注册 epoll），[1]=隧道线程写端
     volatile int pr_tls_threads; // 存活隧道线程数（拆卸时等待归零）
+    // 第188轮：运行时伸缩状态。scale_state 受 server->engine_lock 保护写入，
+    // retire/exited 由引擎线程与伸缩线程跨线程访问，均用原子操作。
+    volatile int scale_state;  // 0=空闲槽 1=运行中 2=退役排空中
+    volatile int retire;       // 1=请求停止 accept 并排空剩余连接后退出
+    volatile int exited;       // 1=引擎线程已返回（等待 join）
+    volatile int overload;     // ring 满触发次数（扩容信号，评估时清零）
+    // 第190轮：ring 满背压。ring 满时把 listen 从 epoll 摘除，让连接留在内核
+    // backlog 排队（而不是 accept 后直接 close 造成无响应 RST）；有槽位归还时
+    // 由 pr_free_slot 重新挂回，避免电平触发 listen 事件忙等。
+    int ring_full;             // 1=listen 已摘除（仅引擎线程读写）
     // 回指针
     nl_web_server_t* server;
 } nl_web_engine_t;
@@ -2101,12 +1911,18 @@ struct nl_web_server {
     // P1: 抽取为 nl_web_engine_t 子结构，server 持有 engines[N]
     // P6: SO_REUSEPORT 多实例（N 线程各自独占一条 ring，内核按四元组哈希分派连接）
     nl_web_engine_t* engines;   // 引擎实例数组（P6：[N]，N=engine_count）
-    int engine_count;           // 引擎实例数（P1=1，P6=N）
+    int engine_count;           // 引擎槽数组容量（伸缩后仍为槽位总数，不回缩）
     int* engine_slots;          // [engine_idx] -> 当前活动连接数（统计用）
     pthread_t* engine_threads;  // P6: [engine_count] 引擎线程句柄（多实例时各线程 join）
     int engine_threads_ready;   // P6: 已就绪线程数（用于优雅关闭前等待）
+    // 第188轮：运行时自动伸缩（仅 auto 模式启用）
+    int engine_max;             // 伸缩上限 = 槽位数组容量（auto: 逻辑核数，1..32）
+    int engine_autoscale;       // 1=按负载在 [1, engine_max] 间自动增减实例
+    pthread_mutex_t engine_lock;// 保护 engines[] 槽位状态与线程句柄的增减
+    pthread_t scaler_thread;    // 伸缩监督线程（engine_autoscale 时存在）
+    int scaler_alive;           // 1=监督线程已启动（stop 时先 join 它）
     // P6/P7 配置
-    int engine_threads_cfg;     // P6: 引擎线程数（0=自动=逻辑核数；1=单实例）
+    int engine_threads_cfg;     // P6: 引擎实例数（0=自动=逻辑核数间伸缩；>0=固定实例数）
     int max_conns_cfg;          // P6: 总连接预算（0=自动=ncpu*64；按 N 均分到每实例 ring cap）
     int idle_timeout_ms;        // P7: 空闲超时（ms），防 slowloris；0=默认 30s
     int force_legacy_pool;      // P5: 回退 legacy worker 池开关（1=旧行为，默认 0=引擎）
@@ -2132,12 +1948,8 @@ static int g_auto_cleanup_enabled = 0;
 static const int NL_ROUTE_HASH_SIZE = 128;
 
 static unsigned nl_route_hash(const char* path) {
-    unsigned h = 2166136261u;
-    for (; *path; path++) {
-        h ^= (unsigned char)*path;
-        h *= 16777619u;
-    }
-    return h % NL_ROUTE_HASH_SIZE;
+    /* 第192轮：FNV-1a 实现已下沉 src/common/nl_util.c（三平台一份实现） */
+    return nl_hash_fnv1a(path) % NL_ROUTE_HASH_SIZE;
 }
 
 static void nl_route_hash_init(nl_web_server_t* server) {
@@ -2268,7 +2080,7 @@ static int nl_proxy_connect_upstream(const nl_web_route_t* route) {
     if (proto == NL_PROXY_HTTPS) {
         nl_px_tls_api api;
         if (!nl_px_tls_contract_get(&api)) {
-            linux_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
+            nl_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
             close(up_sock);
             return -1;
         }
@@ -2404,7 +2216,8 @@ static const nl_px_local_ops g_pr_local_ops_linux = {
 static int pr_alloc_slot(nl_web_engine_t* eng) {
     if (eng->count >= eng->cap || eng->free_top < 0) return -1;
     int idx = eng->free[eng->free_top--];
-    eng->count++;
+    /* 第188轮：count 会被伸缩监督线程跨线程读取（负载信号），写侧改原子 */
+    __atomic_add_fetch(&eng->count, 1, __ATOMIC_RELAXED);
     return idx;
 }
 
@@ -2445,7 +2258,18 @@ static void pr_free_slot(nl_web_engine_t* eng, int idx) {
     if (eng->pr_body_kind) eng->pr_body_kind[idx] = PR_BODY_NONE;
     if (eng->pr_use_chunked) eng->pr_use_chunked[idx] = 0;
     eng->free[++(eng->free_top)] = idx;
-    if (eng->count > 0) eng->count--;
+    if (__atomic_load_n(&eng->count, __ATOMIC_RELAXED) > 0)
+        __atomic_sub_fetch(&eng->count, 1, __ATOMIC_RELAXED);
+    // 第190轮：背压解除 —— ring 满时 listen 已被摘除，有空闲槽位就挂回 epoll。
+    // 必须在 count-- / free_top++ 之后，保证挂回后 accept立刻拿得到槽。
+    if (eng->ring_full && eng->epfd >= 0 && eng->sock >= 0) {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.u32 = 0xFFFFFFFFu;   // 哨兵：listen fd（与注册处一致）
+        if (epoll_ctl(eng->epfd, EPOLL_CTL_ADD, eng->sock, &ev) == 0)
+            eng->ring_full = 0;
+    }
 }
 
 /* ---------------- HTTPS 上游 TLS 隧道（Linux） ----------------
@@ -2479,7 +2303,7 @@ static void* pr_tls_tunnel_thread_linux(void* param) {
         tls_conn = api.conn_wrap(ufd, host, &alpn);
 
     if (!tls_conn) {
-        linux_log(NL_LOG_ERROR,
+        nl_log(NL_LOG_ERROR,
                   "proxy: TLS session unavailable for upstream %s (refusing plaintext fallback)", host);
         send_http_error(cfd, 502, "Bad Gateway");
         close(cfd);
@@ -2645,18 +2469,7 @@ static int pr_h2_start_bridge_linux(nl_web_engine_t* eng, int idx, int cfd,
     return 1;
 }
 
-// 忽略大小写判断 [s, s+n) 是否以 prefix 开头（prefix 为小写字面量）
-static int pr_ci_starts(const char* s, size_t n, const char* prefix) {
-    size_t i = 0;
-    for (; prefix[i]; i++) {
-        if (i >= n) return 0;
-        char c = s[i];
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        if (c != prefix[i]) return 0;
-    }
-    return 1;
-}
-// 解析响应头 / chunked / 请求重组均已下沉至 src/common/nl_proxy_core.c，
+// 忽略大小写前缀判断已下沉 src/common/nl_proxy_core.c（nl_px_ci_starts），
 // 三平台共用同一份实现；此处只保留“槽位数组 ↔ 解析上下文”的映射。
 
 // 旁路解析被转发的上游字节（bytes 方向：上游→客户端），判定响应是否完整可复用。
@@ -2740,8 +2553,8 @@ static int pr_build_local_response(nl_web_engine_t* eng, int idx,
         }
     }
 
+    // 头拷进输出缓冲（调用方传入的 out 就是 pr_outbuf[idx]，只拷一次）
     memcpy(out, plan.head, plan.head_len);
-    memcpy(eng->pr_outbuf[idx], out, plan.head_len);
     eng->pr_out_len[idx]      = (int)plan.head_len;
     eng->pr_out_off[idx]      = 0;
     eng->pr_role[idx]         = PR_ROLE_LOCAL;
@@ -2753,6 +2566,17 @@ static int pr_build_local_response(nl_web_engine_t* eng, int idx,
         eng->pr_body_remain[idx] = is_head ? 0 : plan.file_size;
         eng->pr_body_kind[idx]   = PR_BODY_SENDFILE;
         eng->pr_body_offset[idx] = 0;                      /* sendfile 起始偏移 */
+    } else if (plan.type == NL_PX_LOCAL_CONTENT && plan.body && plan.body_len > 0 &&
+               !is_head &&
+               (size_t)plan.head_len + plan.body_len <= (size_t)out_cap) {
+        /* 第190轮：小 body 直接拼进 outbuf —— 头+body 一次 send 发完，
+         * 省掉一次 epoll 往返 + 一次 send 系统调用（短连接小响应是最高频路径）。
+         * 放不下（head+body > out_cap）才退回原分块流式发送。 */
+        memcpy(out + plan.head_len, plan.body, plan.body_len);
+        eng->pr_out_len[idx]     = (int)((size_t)plan.head_len + plan.body_len);
+        eng->pr_body_src[idx]    = NULL;
+        eng->pr_body_remain[idx] = 0;
+        eng->pr_body_kind[idx]   = PR_BODY_NONE;
     } else {
         // CONTENT：body 借用路由表内容；REDIRECT：无 body。
         eng->pr_body_src[idx]    = (void*)plan.body;
@@ -2805,13 +2629,13 @@ static int pr_body_next_chunk(nl_web_engine_t* eng, int idx) {
         // body 排空
         if (use_chunked) {
             // P4: 发终止 chunk "0\r\n\r\n"
+            // 第190轮：修复 UAF —— 旧代码 realloc(buf,8) 后又 free(buf)：
+            // realloc 原地返回时 pr_outbuf[idx] 悬垂（后续 use-after-free），
+            // 搬移返回时则是 double-free。outbuf 基础容量 8192 足够，直接原地写。
             const char* tail = "0\r\n\r\n";
             char* buf = eng->pr_outbuf[idx];
-            char* nb = (char*)realloc(buf, 8);
-            if (!nb) return -1;
-            eng->pr_outbuf[idx] = nb;
-            if (buf) free(buf);
-            memcpy(eng->pr_outbuf[idx], tail, 5);
+            if (!buf) return -1;
+            memcpy(buf, tail, 5);
             eng->pr_out_len[idx] = 5;
             eng->pr_out_off[idx] = 0;
         }
@@ -2999,6 +2823,66 @@ static int pr_build_upstream_http(nl_web_engine_t* eng, int idx,
 
 // 事件驱动主循环：在 web_server_thread 中运行（不建 worker 池，单线程泵 N 条连接）
 // P6: ring_cap_override > 0 时按指定容量初始化（多实例时 total_conns/N），否则按 ncpu*64
+
+/* 把 listen fd 上已排队的连接全部 accept 进 ring（EPOLLET/排空语义共用体）。
+ * 事件分支与缩容退役前的最终排空都走这里：退役时必须先把 backlog 收完，
+ * 否则关闭 listen fd 会把队列里未 accept 的连接直接 RST 掉。 */
+static void pr_engine_accept_all(nl_web_engine_t* eng, int listen_fd) {
+    for (;;) {
+        /* 第190轮：ring 满背压 —— 不 accept、不 close，把 listen 从 epoll 摘除，
+         * 连接留在内核 backlog 排队（SOMAXCONN），等 pr_free_slot 归还槽位时再挂回。
+         * 旧实现 accept 后直接 close，客户端收到无响应 RST（压测 13.8% 错误全因此）。 */
+        if (__atomic_load_n(&eng->count, __ATOMIC_RELAXED) >= eng->cap || eng->free_top < 0) {
+            if (!eng->ring_full) {
+                eng->ring_full = 1;
+                __atomic_add_fetch(&eng->overload, 1, __ATOMIC_RELAXED);
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, listen_fd, NULL);
+            }
+            return;
+        }
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) break;
+        int cf = fcntl(cfd, F_GETFL, 0);
+        fcntl(cfd, F_SETFL, cf | O_NONBLOCK);
+        int idx = pr_alloc_slot(eng);
+        if (idx < 0) {
+            /* 理论不可达（上方已按 count/free_top 拦截）；兜底：记扩容信号并关闭 */
+            __atomic_add_fetch(&eng->overload, 1, __ATOMIC_RELAXED);
+            close(cfd);
+            continue;
+        }
+        eng->pr_fd_client[idx] = cfd;
+        eng->pr_state[idx] = PR_ST_ACTIVE;
+        // 每连接独立 8KB 首包缓冲 + 8KB 上游请求构造缓冲（pr_up_buf 改为 proxy 路由按需分配，见 P5 内存控制）
+        eng->pr_hbuf[idx]     = (char*)malloc(8193);  // +1：hbuf[*hlen]='\0' 终止符
+        // 第190轮：hbuf_out（上游请求构造/响应 framing 草稿）与 up_key（连接池 key）
+        // 只有 proxy 路由用得上，延迟到分发时分配 —— 本地路由每连接省 8768 字节 + 2 次 malloc/free
+        eng->pr_hdr_len[idx]  = 0;
+        eng->pr_remain[idx]   = 0;
+        // P2: 本地响应输出缓冲（header 8KB，body 按需扩容）
+        eng->pr_outbuf[idx]   = (char*)malloc(8192);
+        eng->pr_out_len[idx]  = 0;
+        eng->pr_out_off[idx]  = 0;
+        eng->pr_role[idx]     = PR_ROLE_LOCAL;
+        eng->pr_phase[idx]    = PR_PHASE_READ_REQ;
+        eng->pr_body_src[idx] = NULL;
+        eng->pr_body_remain[idx] = 0;
+        eng->pr_body_kind[idx] = PR_BODY_NONE;
+        eng->pr_use_chunked[idx] = 0;
+        // P7: 空闲超时（slowloris 防护）
+        eng->pr_last_active_ms[idx] = pr_pool_now_ms();
+        // 重置上游响应 framing 状态
+        nl_px_upstate_reset(&eng->pr_up[idx]);
+        // pr_up_buf / hbuf_out / up_key 改为 proxy 路由按需分配（P5/第190轮）
+        if (!eng->pr_hbuf[idx] || !eng->pr_outbuf[idx]) {
+            close(cfd);
+            pr_free_slot(eng, idx);
+            continue;
+        }
+        pr_register(eng, idx, cfd, 0);
+    }
+}
+
 void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_override) {
     nl_web_server_t* s = eng->server;
 
@@ -3008,7 +2892,7 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     // 初始化 ring 容量（P6: 多实例时按 ring_cap_override 指定，否则 ncpu*64 自动）
     int cap = (ring_cap_override > 0) ? ring_cap_override : nl_web_proxy_ring_capacity();
     eng->cap = cap;
-    eng->count = 0;
+    __atomic_store_n(&eng->count, 0, __ATOMIC_RELAXED);
     eng->pr_fd_client = (int*)calloc((size_t)cap, sizeof(int));
     eng->pr_fd_upstream = (int*)calloc((size_t)cap, sizeof(int));
     eng->pr_route_idx = (int*)calloc((size_t)cap, sizeof(int));
@@ -3085,6 +2969,10 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     int idle_ms = s->idle_timeout_ms;
     if (idle_ms <= 0) idle_ms = 30000;
     int64_t last_scan_ms = pr_pool_now_ms();
+    // 第188轮：缩容退役用。lfd_open=listen fd 仍在 epoll 中；
+    // retire_since=首次观察到 retire 的时刻（排空超时兜底用）。
+    int lfd_open = 1;
+    int64_t retire_since = 0;
 
     // P12 TSan 修复：nl_web_stop 以原子写清零 running，此处必须原子读配对，
     // 否则 volatile 读与原子写构成数据竞争（TSan 报告）。
@@ -3106,7 +2994,8 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
                         int ufd = eng->pr_fd_upstream[si];
                         if (ufd > 0) {
                             int poolable = (eng->pr_up[si].up_parse == PR_UP_DONE &&
-                                            eng->pr_up_key && eng->pr_up_key[si][0] && eng->up_pool);
+                                            eng->pr_up_key && eng->pr_up_key[si] &&
+                                            eng->pr_up_key[si][0] && eng->up_pool);
                             if (poolable)
                                 nl_px_pool_put(eng->up_pool, eng->pr_up_key[si], ufd);
                             else {
@@ -3121,46 +3010,28 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
                 }
             }
         }
+        // 第188轮：缩容退役 —— 停止 accept（摘除 listen fd），排空剩余连接后退出。
+        // 槽位下限为 1，engine 0 永不退役，故这里不必判断是否为 server->sock。
+        if (__atomic_load_n(&eng->retire, __ATOMIC_ACQUIRE)) {
+            if (retire_since == 0) retire_since = pr_pool_now_ms();
+            if (lfd_open) {
+                // 关闭前先把 backlog 里已排队的连接收进来，避免 RST 掉未 accept 的连接
+                pr_engine_accept_all(eng, listen_fd);
+                epoll_ctl(eng->epfd, EPOLL_CTL_DEL, listen_fd, NULL);
+                if (listen_fd != s->sock) close(listen_fd);   // engine 0 的 listen fd 归 stop 关
+                lfd_open = 0;
+                eng->sock = -1;
+            }
+            int left = __atomic_load_n(&eng->count, __ATOMIC_RELAXED);
+            if (left == 0) break;                                       // 已排空，安全退出
+            if (pr_pool_now_ms() - retire_since >= NL_ENGINE_DRAIN_MS) break;  // 排空超时兜底
+        }
         for (int i = 0; i < n; i++) {
             uint32_t ud = events[i].data.u32;
             if (ud == 0xFFFFFFFFu) {
-                // accept 客户端连接
-                int cfd = accept(listen_fd, NULL, NULL);
-                if (cfd < 0) continue;
-                int cf = fcntl(cfd, F_GETFL, 0);
-                fcntl(cfd, F_SETFL, cf | O_NONBLOCK);
-                int idx = pr_alloc_slot(eng);
-                if (idx < 0) { close(cfd); continue; }  // ring 满：回 503 关闭
-                eng->pr_fd_client[idx] = cfd;
-                eng->pr_state[idx] = PR_ST_ACTIVE;
-                // 每连接独立 8KB 首包缓冲 + 8KB 上游请求构造缓冲（pr_up_buf 改为 proxy 路由按需分配，见 P5 内存控制）
-                eng->pr_hbuf[idx]     = (char*)malloc(8193);  // +1：hbuf[*hlen]='\0' 终止符
-                eng->pr_hbuf_out[idx] = (char*)malloc(8192);
-                eng->pr_up_key[idx]   = (char*)malloc(576);
-            eng->pr_hdr_len[idx] = 0;
-            eng->pr_remain[idx]  = 0;
-            // P2: 本地响应输出缓冲（header 8KB，body 按需扩容）
-            eng->pr_outbuf[idx]   = (char*)malloc(8192);
-            eng->pr_out_len[idx] = 0;
-            eng->pr_out_off[idx] = 0;
-            eng->pr_role[idx]     = PR_ROLE_LOCAL;
-            eng->pr_phase[idx]    = PR_PHASE_READ_REQ;
-            eng->pr_body_src[idx] = NULL;
-            eng->pr_body_remain[idx] = 0;
-            eng->pr_body_kind[idx] = PR_BODY_NONE;
-            eng->pr_use_chunked[idx] = 0;
-            // P7: 空闲超时（slowloris 防护）
-            eng->pr_last_active_ms[idx] = pr_pool_now_ms();
-            // 重置上游响应 framing 状态
-            nl_px_upstate_reset(&eng->pr_up[idx]);
-            // pr_up_buf 改为 proxy 路由按需分配（P5），accept 时不检查
-            if (!eng->pr_hbuf[idx] || !eng->pr_hbuf_out[idx] ||
-                !eng->pr_up_key[idx] || !eng->pr_outbuf[idx]) {
-                close(cfd);
-                pr_free_slot(eng, idx);
-                continue;
-            }
-                pr_register(eng, idx, cfd, 0);
+                // accept 客户端连接：排空 backlog（每轮只 accept 一个时，
+                // 突发建连下 accept 消费速度跟不上，QPS 被建连开销锁死）
+                if (lfd_open) pr_engine_accept_all(eng, listen_fd);
                 continue;
             }
             if (ud == 0xFFFFFFFEu) {
@@ -3517,6 +3388,18 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
                     // P5 内存控制：pr_up_buf 只在 proxy 连接按需分配（64KB 是"内存杀手"，本地路由不需要）
                     if (!eng->pr_up_buf[idx])
                         eng->pr_up_buf[idx] = (char*)malloc(PR_PROXY_BUF_SZ);
+                    // 第190轮：hbuf_out / up_key 同样延迟到 proxy 分发时才分配（本地路由不需要）
+                    if (!eng->pr_hbuf_out[idx])
+                        eng->pr_hbuf_out[idx] = (char*)malloc(8192);
+                    if (!eng->pr_up_key[idx])
+                        eng->pr_up_key[idx] = (char*)malloc(576);
+                    if (!eng->pr_up_buf[idx] || !eng->pr_hbuf_out[idx] || !eng->pr_up_key[idx]) {
+                        send_http_error(eng->pr_fd_client[idx], 500, "Internal Server Error");
+                        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, eng->pr_fd_client[idx], NULL);
+                        close(eng->pr_fd_client[idx]);
+                        pr_free_slot(eng, idx);
+                        continue;
+                    }
                     eng->pr_up[idx].req_is_head = (strcmp(method, "HEAD") == 0) ? 1 : 0;
                     char up_host[512];
                     int  up_port = 0;
@@ -3679,6 +3562,14 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     if (eng->wake_pipe[1] >= 0) close(eng->wake_pipe[1]);
     eng->wake_pipe[0] = eng->wake_pipe[1] = -1;
 
+    // 第188轮：listen fd 归属清理。engine 0 的 listen fd == server->sock，由
+    // nl_web_stop 统一关闭；其余实例此前从未关闭（fd 泄漏），现由本线程关闭。
+    if (lfd_open && listen_fd >= 0 && listen_fd != s->sock) {
+        epoll_ctl(eng->epfd, EPOLL_CTL_DEL, listen_fd, NULL);
+        close(listen_fd);
+        lfd_open = 0;
+    }
+    eng->sock = -1;
     // 销毁上游连接池（关闭全部空闲上游连接）
     if (eng->up_pool) { nl_px_pool_destroy(eng->up_pool); free(eng->up_pool); eng->up_pool = NULL; }
     close(eng->epfd);
@@ -3722,7 +3613,8 @@ void nl_web_proxy_engine(nl_web_engine_t* eng, int listen_fd, int ring_cap_overr
     eng->pr_body_offset = NULL;
     eng->pr_use_chunked = NULL;
     eng->pr_last_active_ms = NULL;
-    eng->cap = eng->count = 0;
+    eng->cap = 0;
+    __atomic_store_n(&eng->count, 0, __ATOMIC_RELAXED);
 }
 
 static void nl_handle_client(nl_web_server_t* server, int client) {
@@ -3762,13 +3654,31 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
         }
     }
 
+    /* 第192轮：RFC 3986 端点规范化（剥 query/fragment、percent-decode、
+     * dot-segment 归一）。路由查找与本地响应用 norm_path；代理转发
+     * （反代请求行 / TCP 透传）保留原始 path（含 query，字节原样）。 */
+    char norm_path[4096];
+    if (strcmp(path, "*") == 0) {
+        norm_path[0] = '*';        /* OPTIONS *（RFC 7230 §7.1）：无路由，维持 404 */
+        norm_path[1] = '\0';
+    } else {
+        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (uri_rc != NL_URI_OK) {
+            int esc = (uri_rc == NL_URI_ESCAPES);
+            send_http_error(client, esc ? 403 : 400,
+                            esc ? "Forbidden" : "Bad Request");
+            close(client);
+            return;
+        }
+    }
+
     pthread_mutex_lock(&server->mutex);
     // 使用 hash 表 O(1) 查找路由；若 hash 未初始化则回退到线性链表
-    nl_web_route_t* route = nl_route_hash_lookup_simple(server, path);
+    nl_web_route_t* route = nl_route_hash_lookup_simple(server, norm_path);
     if (!route) {
         // 回退：hash 未命中时遍历主链表（兼容早期未初始化 hash 的 server）
         for (nl_web_route_t* r = server->routes; r; r = r->next) {
-            if (strcmp(r->path, path) == 0) { route = r; break; }
+            if (strcmp(r->path, norm_path) == 0) { route = r; break; }
         }
     }
     if (route) {
@@ -3915,9 +3825,9 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                     size_t nl = 0;
                     while (nl < llen && buffer[ls + nl] != ':') nl++;
                     if (nl == 0 || nl >= llen) continue;
-                    if ((nl == 4 && pr_ci_starts(buffer + ls, nl, "host")) ||
-                        (nl == 16 && pr_ci_starts(buffer + ls, nl, "x-forwarded-for")) ||
-                        (nl == 10 && pr_ci_starts(buffer + ls, nl, "connection"))) continue;
+                    if ((nl == 4 && nl_px_ci_starts(buffer + ls, nl, "host")) ||
+                        (nl == 16 && nl_px_ci_starts(buffer + ls, nl, "x-forwarded-for")) ||
+                        (nl == 10 && nl_px_ci_starts(buffer + ls, nl, "connection"))) continue;
                     if ((size_t)total + llen + 2 >= sizeof(upstream_req_full)) break;
                     memcpy(upstream_req_full + total, buffer + ls, llen);
                     total += (int)llen;
@@ -3949,7 +3859,7 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                     (void)nl_px_split_hostport(route->upstream, up_host, sizeof(up_host),
                                                &up_port, 443);
                     if (!nl_px_tls_contract_get(&tls_api) || !tls_api.conn_wrap) {
-                        linux_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
+                        nl_log(NL_LOG_ERROR, "proxy: %s", nl_px_tls_contract_missing());
                         free(proxy_buf);
                         close(up_sock);
                         send_http_error(client, 502, "Bad Gateway");
@@ -3958,7 +3868,7 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                     }
                     void* tls_conn = tls_api.conn_wrap(up_sock, up_host, NULL);
                     if (!tls_conn) {
-                        linux_log(NL_LOG_ERROR,
+                        nl_log(NL_LOG_ERROR,
                                   "proxy: TLS session unavailable for upstream %s (refusing plaintext fallback)",
                                   up_host);
                         free(proxy_buf);
@@ -4007,12 +3917,30 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
     close(client);
 }
 
+/* 第189轮 stop 死锁修复：legacy worker 的 accept 无限阻塞时不检查 running，
+ * 而 nl_web_stop 必须先 join 线程才能关 listen fd —— 空闲时 stop 永远卡死
+ * （16 worker 全阻塞 inet_csk_accept，主线程 futex_wait）。
+ * 改为先 poll(200ms) 等可读再 accept：空闲时最多 200ms 唤醒一次检查 running，
+ * 有连接时行为与原阻塞 accept 等价。 */
+static int web_worker_accept(nl_web_server_t* server) {
+    struct pollfd pfd;
+    pfd.fd = server->sock;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, 200);
+    if (rc <= 0) return -1;              /* 超时/出错：回循环头检查 running */
+    int c = accept(server->sock, NULL, NULL);
+    if (c >= 0) set_blocking(c);         /* 非阻塞 listen 上 accept 的新 fd 显式恢复阻塞 */
+    return c;
+}
+
 static void* nl_worker_thread(void* arg) {
     nl_web_server_t* server = (nl_web_server_t*)arg;
     // P12 TSan 修复：与 nl_web_stop 的原子写配对（同引擎循环）。
     while (__atomic_load_n(&server->running, __ATOMIC_RELAXED)) {
-        int client = accept(server->sock, NULL, NULL);
+        int client = web_worker_accept(server);
         if (client < 0) {
+            if (!__atomic_load_n(&server->running, __ATOMIC_RELAXED)) break;
             usleep(10000);
             continue;
         }
@@ -4050,8 +3978,9 @@ static void* web_server_thread(void* arg) {
     // 回退：worker 未启动（启动失败或 worker_count=0），accept 线程自己承担主 accept 循环
     // P12 TSan 修复：与 nl_web_stop 的原子写配对。
     while (__atomic_load_n(&server->running, __ATOMIC_RELAXED)) {
-        int client = accept(server->sock, NULL, NULL);
+        int client = web_worker_accept(server);
         if (client < 0) {
+            if (!__atomic_load_n(&server->running, __ATOMIC_RELAXED)) break;
             usleep(10000);
             continue;
         }
@@ -4086,6 +4015,12 @@ nl_web_server_t* nl_web_create(int port) {
     server->engine_count = 0;
     server->engine_slots = NULL;
     server->engine_threads = NULL;
+    // 第188轮：伸缩相关字段初始化（engine_lock 只在 create 里 init 一次，
+    // 因为 start/stop 可以反复调用）
+    server->engine_max = 0;
+    server->engine_autoscale = 0;
+    server->scaler_alive = 0;
+    pthread_mutex_init(&server->engine_lock, NULL);
     server->engine_threads_ready = 0;
     server->engine_threads_cfg = 0;   // 0 = 自动（逻辑核数）
     server->max_conns_cfg = 0;        // 0 = 自动（ncpu*64）
@@ -4134,6 +4069,7 @@ void nl_web_destroy(nl_web_server_t* server) {
     pthread_mutex_unlock(&server->mutex);
     
     pthread_mutex_destroy(&server->mutex);
+    pthread_mutex_destroy(&server->engine_lock);   // 第188轮
     free(server->route_hash);
     free(server->workers);
     // P6: 释放引擎子结构（多实例时遍历所有引擎的 pr_* 数组已由各线程自行释放）
@@ -4157,6 +4093,9 @@ static void* nl_web_proxy_engine_thread_multi(void* arg) {
     nl_web_engine_t* eng = &s->engines[a->index];
     eng->sock = a->listen_fd;
     nl_web_proxy_engine(eng, a->listen_fd, a->ring_cap);
+    /* 第188轮：无论正常退出还是初始化失败，都要置 exited，
+     * 否则缩容线程对退役槽位的 join 会永远等不到。 */
+    __atomic_store_n(&eng->exited, 1, __ATOMIC_RELEASE);
     free(a);   // P6: 线程自释放 arg（start 不持有，避免泄漏）
     return NULL;
 }
@@ -4207,13 +4146,176 @@ static int nl_web_open_listen(nl_web_server_t* server, struct sockaddr_storage* 
         }
         if (*af != AF_INET6) return -1;
         if (mode == NL_PX_LISTEN_V6) return -1;   // 显式要求 V6 时不静默回退
+        // 第188轮：回退 IPv4 必须同时改地址族与地址长度——只改 addr 而 *af 仍是
+        // AF_INET6 时，下一轮 socket()/bind() 照样失败，回退分支等于死代码
+        // （macOS 版本此处是对的，Linux 漏了这两行）。
         struct sockaddr_in* a4 = (struct sockaddr_in*)addr;
         memset(addr, 0, sizeof(*addr));
         a4->sin_family = AF_INET;
         a4->sin_addr.s_addr = INADDR_ANY;
         a4->sin_port = htons((unsigned short)server->port);
+        *addr_len = (socklen_t)sizeof(*a4);
+        *af = AF_INET;
     }
     return -1;
+}
+
+/* ---------------- 第188轮：引擎实例自动伸缩（auto 模式） ----------------
+ * 监督线程每 100ms 采样一次各实例的活跃连接数与 ring 满拒绝计数：
+ *   扩容：ring 满发生过，或 每实例平均活跃连接 ≥ NL_ENGINE_SCALE_UP_PER_CONN，
+ *         且未达上限、距上次动作 ≥ 500ms；
+ *   缩容：ring 满未发生 且 每实例平均活跃连接 ≤ NL_ENGINE_SCALE_DOWN_PER_CONN
+ *         连续 10s，且距上次动作 ≥ 3s，缩到下限 1 为止（engine 0 永不退役）。
+ * 所有槽位状态变更都在 engine_lock 内完成；nl_web_stop 先 join 本线程，
+ * 再统一 join 引擎线程句柄，避免句柄并发变更。 */
+
+static int nl_web_engine_slots_used(nl_web_server_t* s) {
+    int n = 0;
+    for (int i = 0; i < s->engine_count; i++)
+        if (s->engines[i].scale_state != 0) n++;
+    return n;
+}
+
+/* 为新实例创建 listen socket（复用 nl_web_open_listen 的族回退逻辑） */
+static int nl_web_engine_listen(nl_web_server_t* s) {
+    int opt = 1;
+    struct sockaddr_storage addr;
+    socklen_t alen = 0;
+    int af = nl_web_listen_addr(s, &addr, &alen);
+    if (s->af == AF_INET && af != AF_INET) {
+        // 启动时已回退到 IPv4：新实例必须按 IPv4 建地址
+        struct sockaddr_in* a4 = (struct sockaddr_in*)&addr;
+        memset(&addr, 0, sizeof(addr));
+        a4->sin_family = AF_INET;
+        a4->sin_addr.s_addr = INADDR_ANY;
+        a4->sin_port = htons((unsigned short)s->port);
+        alen = (socklen_t)sizeof(*a4);
+        af = AF_INET;
+    }
+    return nl_web_open_listen(s, &addr, &alen, &af, &opt);
+}
+
+/* 扩容：在空闲槽位上开一个新引擎实例。调用方必须持有 engine_lock。 */
+static int nl_web_engine_scale_up(nl_web_server_t* s) {
+    if (!s->engines || !s->engine_threads || s->engine_count <= 0) return -1;
+    int slot = -1;
+    for (int i = 0; i < s->engine_count; i++) {
+        if (s->engines[i].scale_state == 0) { slot = i; break; }
+    }
+    if (slot < 0) return -1;   // 无空闲槽位 = 已到上限
+
+    int sk = nl_web_engine_listen(s);
+    if (sk < 0) return -1;
+
+    int live = nl_web_engine_slots_used(s) + 1;
+    int total = s->max_conns_cfg > 0 ? s->max_conns_cfg : nl_web_proxy_ring_capacity();
+    int per_cap = total / (live > 0 ? live : 1);
+    if (per_cap < 64) per_cap = 64;
+    if (per_cap > 4096) per_cap = 4096;
+
+    nl_web_engine_t* e = &s->engines[slot];
+    memset(e, 0, sizeof(*e));
+    e->server = s;
+    e->epfd = -1;
+    e->sock = sk;
+    e->idx = slot;
+    e->scale_state = 1;
+
+    struct pr_engine_thread_arg* a =
+        (struct pr_engine_thread_arg*)malloc(sizeof(struct pr_engine_thread_arg));
+    if (!a) { close(sk); e->sock = -1; e->scale_state = 0; return -1; }
+    a->server = s;
+    a->listen_fd = sk;
+    a->ring_cap = per_cap;
+    a->index = slot;
+    if (pthread_create(&s->engine_threads[slot], NULL,
+                       nl_web_proxy_engine_thread_multi, a) != 0) {
+        free(a); close(sk); e->sock = -1; e->scale_state = 0;
+        return -1;
+    }
+    s->engine_threads_ready++;
+    nl_log(NL_LOG_INFO, "Web: 引擎扩容 -> %d 实例（槽位 %d）",
+              nl_web_engine_slots_used(s), slot);
+    return 0;
+}
+
+/* 缩容：请求最高槽位的运行中实例退役。调用方必须持有 engine_lock。 */
+static int nl_web_engine_scale_down(nl_web_server_t* s) {
+    int slot = -1;
+    for (int i = s->engine_count - 1; i >= 1; i--) {   // engine 0 永不退役
+        if (s->engines[i].scale_state == 1) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+    s->engines[slot].scale_state = 2;   // 退役排空中（仍占槽位，回收后释放）
+    __atomic_store_n(&s->engines[slot].retire, 1, __ATOMIC_RELEASE);
+    nl_log(NL_LOG_INFO, "Web: 引擎缩容请求 -> %d 实例（槽位 %d 排空中）",
+              nl_web_engine_slots_used(s), slot);
+    return 0;
+}
+
+/* 回收已退出的退役线程，释放槽位。调用方必须持有 engine_lock。 */
+static void nl_web_engine_reap(nl_web_server_t* s) {
+    for (int i = 0; i < s->engine_count; i++) {
+        nl_web_engine_t* e = &s->engines[i];
+        if (e->scale_state == 2 &&
+            __atomic_load_n(&e->exited, __ATOMIC_ACQUIRE) &&
+            s->engine_threads[i] != 0) {
+            pthread_join(s->engine_threads[i], NULL);
+            s->engine_threads[i] = 0;
+            e->scale_state = 0;
+        }
+    }
+}
+
+static void* nl_web_engine_scaler(void* arg) {
+    nl_web_server_t* s = (nl_web_server_t*)arg;
+    int64_t last_scale_ms = pr_pool_now_ms();
+    int idle_ticks = 0;
+    while (__atomic_load_n(&s->running, __ATOMIC_RELAXED)) {
+        usleep(NL_ENGINE_SCALE_SAMPLE_MS * 1000);   // stop 最多等一个采样周期即可 join 本线程
+        if (!__atomic_load_n(&s->running, __ATOMIC_RELAXED)) break;
+
+        int64_t now = pr_pool_now_ms();
+        pthread_mutex_lock(&s->engine_lock);
+        nl_web_engine_reap(s);
+        int live = nl_web_engine_slots_used(s);
+        if (live <= 0 || s->engine_max <= 0 || !s->engines) {
+            pthread_mutex_unlock(&s->engine_lock);
+            continue;
+        }
+        int total = 0, over = 0;
+        for (int i = 0; i < s->engine_count; i++) {
+            nl_web_engine_t* e = &s->engines[i];
+            if (e->scale_state != 1) continue;
+            total += __atomic_load_n(&e->count, __ATOMIC_RELAXED);
+            over += __atomic_exchange_n(&e->overload, 0, __ATOMIC_RELAXED);
+        }
+        int acted = 0;
+        if (over > 0 || total >= live * NL_ENGINE_SCALE_UP_PER_CONN) {
+            // 高负载：先清空闲计数，再扩容（ring 满是最强信号，允许 500ms 一次）
+            idle_ticks = 0;
+            if (live < s->engine_max && now - last_scale_ms >= 500) {
+                if (nl_web_engine_scale_up(s) == 0) {
+                    last_scale_ms = now; acted = 1;
+                }
+            }
+        } else if (total <= live * NL_ENGINE_SCALE_DOWN_PER_CONN) {
+            // 持续空闲：累计缩容计数
+            idle_ticks++;
+            if (idle_ticks >= NL_ENGINE_SCALE_DOWN_TICKS &&
+                live > NL_ENGINE_MIN_INSTANCES &&
+                now - last_scale_ms >= NL_ENGINE_SCALE_COOLDOWN_MS) {
+                if (nl_web_engine_scale_down(s) == 0) {
+                    last_scale_ms = now; idle_ticks = 0; acted = 1;
+                }
+            }
+        } else {
+            idle_ticks = 0;
+        }
+        (void)acted;
+        pthread_mutex_unlock(&s->engine_lock);
+    }
+    return NULL;
 }
 
 int nl_web_start(nl_web_server_t* server) {
@@ -4225,28 +4327,42 @@ int nl_web_start(nl_web_server_t* server) {
     server->af = af;
 
     // P5/P6: 默认走数据驱动引擎（epoll），除非显式 nl_web_force_legacy_pool(1)
-    // P6: engine_threads_cfg > 1 时走 SO_REUSEPORT 多实例
-    int n_engines = 0;
+    // 第188轮：engine_threads_cfg > 0 = 固定实例数；<= 0 = auto 模式 ——
+    // 初始 1 个实例，由伸缩监督线程按负载在 [1, min(逻辑核数,32)] 间自动增减。
+    int n_engines = 0;   // 初始实例数
+    int slots = 0;       // 槽位数组容量 = 伸缩上限（固定模式下 == n_engines）
+    int autoscale = 0;
     if (server->force_legacy_pool) {
         n_engines = 0;  // legacy worker 池
     } else {
         n_engines = server->engine_threads_cfg;
-        if (n_engines <= 0) n_engines = 1;  // 默认单实例
-        if (n_engines > 1) {
-            // 多实例：N 个 listen socket（SO_REUSEPORT），共享 4 元组，内核均衡
-            int total_conns = server->max_conns_cfg;
-            if (total_conns <= 0) {
-                // 自动：ncpu*64 总量，按 N 均分
-                int auto_cap = nl_web_proxy_ring_capacity();
-                total_conns = auto_cap;
-            }
-            int per_cap = total_conns / n_engines;
-            if (per_cap < 64) per_cap = 64;
-            (void)per_cap;  // 实际 per-cap 在 nl_web_start 内计算
+        if (n_engines <= 0) {
+            autoscale = 1;
+            n_engines = 1;                       // 起步只开 1 个实例，按需再扩
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu < 1) ncpu = 1;
+            int mx = (int)ncpu;
+            if (mx > NL_ENGINE_MAX_INSTANCES) mx = NL_ENGINE_MAX_INSTANCES;
+            if (mx < NL_ENGINE_MIN_INSTANCES) mx = NL_ENGINE_MIN_INSTANCES;
+            slots = mx;                          // 槽位容量 = 伸缩上限
+        } else {
+            slots = n_engines;
         }
+        if (slots < n_engines) slots = n_engines;
+        if (slots > 256) slots = 256;            // listen_fds[] 栈数组容量
     }
+    server->engine_autoscale = autoscale;
+    server->engine_max = slots;
 
     if (n_engines >= 1) {
+        // 重启清理：nl_web_stop 不释放 engines/engine_slots（destroy 才释放），
+        // 若上一轮跑过引擎，这里必须先释放，否则覆盖指针造成泄漏。
+        if (server->engines)        { free(server->engines);        server->engines = NULL; }
+        if (server->engine_slots)   { free(server->engine_slots);   server->engine_slots = NULL; }
+        if (server->engine_threads) { free(server->engine_threads); server->engine_threads = NULL; }
+        server->engine_count = 0;
+        server->engine_threads_ready = 0;   // 第188轮：重启时清零（scaler 启动条件依赖它）
+
         // P6: 多实例 SO_REUSEPORT 分支
         int listen_fds[256];
         int sock_cnt = 0;
@@ -4261,32 +4377,50 @@ int nl_web_start(nl_web_server_t* server) {
         server->af = af;
         // 主 sock 记第一个（兜底 nl_web_stop 清理）
         server->sock = listen_fds[0];
-        // 其余 sock 由 engines[i].sock 持有（线程内清理）
-        server->engines = (nl_web_engine_t*)malloc(sizeof(nl_web_engine_t) * (size_t)n_engines);
+        // 槽位按伸缩上限 slots 分配；未启用的槽位 sock/epfd 置 -1，
+        // 供伸缩线程按需复用（engine 0 的 sock 即 server->sock，由 stop 关）。
+        server->engines = (nl_web_engine_t*)calloc((size_t)slots, sizeof(nl_web_engine_t));
         if (!server->engines) {
             for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
             server->sock = -1;
             return -1;
         }
-        for (int i = 0; i < n_engines; i++) {
-            memset(&server->engines[i], 0, sizeof(nl_web_engine_t));
-            server->engines[i].server = server;
-            server->engines[i].epfd = -1;
-            server->engines[i].sock = listen_fds[i];
+        for (int i = 0; i < slots; i++) {
+            nl_web_engine_t* e = &server->engines[i];
+            e->server = server;
+            e->epfd = -1;
+            e->sock = -1;
+            e->idx = i;
+            e->scale_state = 0;
         }
-        server->engine_count = n_engines;
-        server->engine_slots = (int*)calloc((size_t)n_engines, sizeof(int));
+        for (int i = 0; i < n_engines; i++) {
+            // 启动前先记归属（线程创建失败时由 start 关闭）；
+            // scale_state=1 必须等线程真的创建成功再置，否则伸缩线程会
+            // 把“有 sock 无线程”的槽位当成运行中实例。
+            server->engines[i].sock = listen_fds[i];
+            server->engines[i].scale_state = 0;
+        }
+        server->engine_count = slots;
+        server->engine_slots = (int*)calloc((size_t)slots, sizeof(int));
         // P7: 空闲超时
-        // P6: 总连接预算按 N 均分
+        // P6: 总连接预算按实例数均分（auto 模式按伸缩上限 slots 均分，
+        //     这样扩容后的实例不会突破 max_conns 预算）
         int total_conns = server->max_conns_cfg;
         if (total_conns <= 0) total_conns = nl_web_proxy_ring_capacity();
-        int per_cap = total_conns / n_engines;
+        int denom = autoscale ? slots : n_engines;
+        if (denom < 1) denom = 1;
+        int per_cap = total_conns / denom;
         if (per_cap < 64) per_cap = 64;
         if (per_cap > 4096) per_cap = 4096;
 
-        server->engine_threads = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)n_engines);
+        // calloc：未启用槽位的线程句柄必须为 0（stop 只 join 非 0 句柄）
+        server->engine_threads = (pthread_t*)calloc((size_t)slots, sizeof(pthread_t));
         if (!server->engine_threads) {
             free(server->engines);
+            free(server->engine_slots);
+            server->engines = NULL;
+            server->engine_slots = NULL;
+            server->engine_count = 0;
             for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
             server->sock = -1;
             return -1;
@@ -4298,6 +4432,11 @@ int nl_web_start(nl_web_server_t* server) {
                  for (int j = 0; j < i; j++) pthread_join(server->engine_threads[j], NULL);
                  free(server->engine_threads);
                  free(server->engines);
+                 free(server->engine_slots);
+                 server->engine_threads = NULL;
+                 server->engines = NULL;
+                 server->engine_slots = NULL;
+                 server->engine_count = 0;
                  for (int j = 0; j < sock_cnt; j++) close(listen_fds[j]);
                  server->sock = -1;
                  server->running = 0;
@@ -4309,14 +4448,30 @@ int nl_web_start(nl_web_server_t* server) {
              a->index = i;
              int rc = pthread_create(&server->engine_threads[i], NULL,
                                      (void*(*)(void*))nl_web_proxy_engine_thread_multi, a);
-             if (rc != 0) { free(a); break; }
+             if (rc != 0) {
+                 free(a);
+                 // 本槽位及其后未启动实例的 listen fd 一并关闭，槽位回滚为可用
+                 for (int k = i; k < sock_cnt; k++) {
+                     close(listen_fds[k]);
+                     if (k < slots) {
+                         server->engines[k].sock = -1;
+                         server->engines[k].scale_state = 0;
+                     }
+                 }
+                 if (i == 0) server->sock = -1;
+                 nl_log(NL_LOG_ERROR, "Web: 引擎线程创建失败(%d)，已启动 %d 个实例", rc, i);
+                 break;
+             }
+             server->engines[i].scale_state = 1;
              server->engine_threads_ready++;
          }
-         // 主线程不 join 单实例（server->thread 未用）；多实例时由 nl_web_stop 遍历 join
-        if (n_engines == 1) {
-            // 单实例：记录到 server->thread（nl_web_stop 通过 server->thread join）
-            server->thread = server->engine_threads[0];
-            server->engine_threads[0] = 0;  // 避免 nl_web_stop 重复 join
+        // 第188轮：auto 模式启动伸缩监督线程（固定实例数不伸缩）。
+        // 不再把单实例句柄搬到 server->thread —— 实例数运行时会变，
+        // 线程句柄统一由 engine_threads[] 持有、nl_web_stop 统一 join。
+        if (autoscale && server->engine_threads_ready > 0) {
+            if (pthread_create(&server->scaler_thread, NULL,
+                               nl_web_engine_scaler, server) == 0)
+                server->scaler_alive = 1;
         }
         return 0;
     }
@@ -4324,6 +4479,10 @@ int nl_web_start(nl_web_server_t* server) {
     // legacy worker 池分支（P5 回退开关 force_legacy_pool=1）
     server->sock = nl_web_open_listen(server, &addr, &addr_len, &af, opt);
     if (server->sock < 0) return -1;
+    /* 第189轮：listen 改非阻塞 —— 多 worker 同时 poll 到 POLLIN 后竞争 accept，
+     * 输家在阻塞 socket 上永久挂起（stop 依旧死锁）。非阻塞下输家拿 EAGAIN
+     * 回循环退避即可。accept 后的新连接 fd 不受此影响（内核会重置为阻塞）。 */
+    set_nonblocking(server->sock);
     server->af = af;
     server->running = 1;
     // 全动态化：worker 池容量按需分配。未显式设置时用 WEB_WORKER_DEFAULT。
@@ -4351,7 +4510,7 @@ int nl_web_set_worker_count(nl_web_server_t* server, int target) {
     return 0;
 }
 
-// P6: 设置引擎线程数（0 = 自动 = 逻辑核数；1 = 单实例）
+// P6: 设置引擎实例数（0 = 自动伸缩：按负载在 [1, min(逻辑核数,32)] 间增减；>0 = 固定实例数）
 // 在 nl_web_start 前调用生效；已 start 的服务器下次重启后生效。
 int nl_web_set_engine_threads(nl_web_server_t* server, int n) {
     if (!server) return -1;
@@ -4400,16 +4559,22 @@ void nl_web_stop(nl_web_server_t* server) {
 
     __atomic_store_n(&server->running, 0, __ATOMIC_RELAXED);
 
+    // 第188轮：先 join 伸缩监督线程（它会再做最后一轮 reap），再 join 引擎线程
+    if (server->scaler_alive) {
+        pthread_join(server->scaler_thread, NULL);
+        server->scaler_alive = 0;
+    }
+
     if (server->thread) {
         pthread_join(server->thread, NULL);
         server->thread = 0;
     }
 
-    // P6: join 多实例引擎线程（单实例时 engines[0] 线程已走 server->thread join）。
+    // P6: join 全部引擎线程（含退役排空中实例；已被 reap join 过的句柄为 0，跳过）。
     // P12 TSan 修复：必须先 join 引擎线程，再兜底清理 epfd/up_pool——
     // 原先先 close(epfd)/pool_destroy 再 join，引擎线程仍在 epoll_ctl/pool_reap，
     // 属 use-after-free 竞争（TSan 报 7 处均由此顺序错误 + running 非原子引起）。
-    if (server->engine_threads && server->engine_count > 1) {
+    if (server->engine_threads && server->engine_count > 0) {
         for (int i = 0; i < server->engine_count; i++) {
             if (server->engine_threads[i]) {
                 pthread_join(server->engine_threads[i], NULL);
@@ -4424,6 +4589,9 @@ void nl_web_stop(nl_web_server_t* server) {
     if (server->engines && server->engine_count > 0) {
         for (int i = 0; i < server->engine_count; i++) {
             nl_web_engine_t* e = &server->engines[i];
+            // 第188轮：兜底关闭本实例独占的 listen socket（engine 0 的归 server->sock 统一关）
+            if (e->sock >= 0 && e->sock != server->sock) { close(e->sock); }
+            e->sock = -1;
             if (e->epfd > 0) { close(e->epfd); e->epfd = -1; }
             if (e->up_pool) { nl_px_pool_destroy(e->up_pool); free(e->up_pool); e->up_pool = NULL; }
         }

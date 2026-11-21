@@ -290,6 +290,20 @@ NL_API char* nl_base64_decode(const char* input, size_t* out_len) {
 }
 
 /* ============================================================
+ * 内部：FNV-1a 哈希（三平台路由表共用）
+ * ============================================================ */
+
+NL_API unsigned nl_hash_fnv1a(const char* s) {
+    unsigned h = 2166136261u;                       /* FNV offset basis */
+    if (!s) return h;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        h ^= (unsigned)(*p);
+        h *= 16777619u;                             /* FNV prime */
+    }
+    return h;
+}
+
+/* ============================================================
  * 内部：一次性守卫
  * ============================================================ */
 #define NL_ONCE_SLOTS 8

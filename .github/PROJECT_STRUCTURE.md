@@ -34,7 +34,7 @@ flowchart TD
     subgraph SRCDIR["src/"]
         S1["netleaf_module.c"]
         S2["autocomplete/  autoroute/  errorpage/  ipc/  lang/  linkagg/  vue/"]
-        S3["tls2/  tls3/  mqtt/  quic/  (quic 扩展含 QUIC/H3，开发暂缓)"]
+        S3["tls2/  tls3/  mqtt/  quic/  (quic 扩展含 QUIC/H3，已停止支持，不再更新)"]
         S4["windows/  linux/  macos/  (各含 optimize/)"]
         S5["http/  (H1/H2 纯逻辑)  common/  (公共工具层)"]
         S6["android/  (Bionic 平台后端，minSdk 21)"]

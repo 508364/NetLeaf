@@ -10,13 +10,30 @@ static DWORD WINAPI nl_worker_thread(LPVOID arg) {
     nl_worker_pool_ctx_t* ctx = (nl_worker_pool_ctx_t*)arg;
     if (!ctx) return 0;
 
+    /* 第189轮 stop 死锁修复：同 Linux —— 阻塞 accept 不检查 running，
+     * 调用方必须先 join 再 closesocket → 空闲时 stop 永远卡死。
+     * 先 WSAPoll(200ms) 等可读再 accept，空闲时最多 200ms 唤醒一次。
+     * listen 已被调用方设为非阻塞：竞争输家拿 WSAEWOULDBLOCK 回循环退避。 */
     while (*ctx->running) {
-        SOCKET client = accept(ctx->sock, NULL, NULL);
-        if (client == INVALID_SOCKET) {
-            // accept 失败（fd 耗尽/被中断）时退避，避免 tight loop 空转
+        WSAPOLLFD pfd;
+        pfd.fd = ctx->sock;
+        pfd.events = POLLRDNORM;
+        pfd.revents = 0;
+        int rc = WSAPoll(&pfd, 1, 200);
+        if (rc <= 0) {
+            if (!*ctx->running) break;
             Sleep(10);
             continue;
         }
+        SOCKET client = accept(ctx->sock, NULL, NULL);
+        if (client == INVALID_SOCKET) {
+            // accept 失败（wouldblock/fd 耗尽/被中断）时退避，避免 tight loop 空转
+            Sleep(10);
+            continue;
+        }
+        /* Windows：accept 的新 socket 继承 listening socket 的阻塞模式，恢复阻塞 */
+        u_long nb = 0;
+        ioctlsocket(client, FIONBIO, &nb);
         ctx->handle_client(ctx->owner, client);
     }
     return 0;

@@ -246,6 +246,9 @@ set(NETLEAF_COMMON_SOURCES
     src/common/nl_px_io.c
     src/common/nl_px_h2.c
     src/common/nl_px_local.c
+    src/common/nl_uri.c
+    src/common/nl_filesrv.c
+    src/common/nl_logsys.c
 )
 
 set(NETLEAF_CORE_SOURCES

@@ -14,6 +14,7 @@
 
 #include "nl_px_local.h"
 #include "nl_proxy_core.h"
+#include "nl_uri.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -515,9 +516,16 @@ int nl_px_local_dispatch(void* ctx, const nl_px_local_ops* ops,
     *out_body = NULL;
     *out_blen = 0;
 
+    /* 第192轮：RFC 3986 端点校验——无法规范化（坏 % 编码 / 越根 / 反斜杠）
+     * 直接 400；lookup 用规范化路径，PROXY 上游转发仍用原始 path（含 query）。 */
+    char norm_path[4096];
+    if (nl_uri_normalize(path, norm_path, sizeof(norm_path)) != NL_URI_OK)
+        return pl_simple_response(400, out_status, out_hdrs, out_hlen,
+                                  out_body, out_blen);
+
     nl_px_local_route route;
     memset(&route, 0, sizeof(route));
-    if (!ops->lookup(ctx, path, &route))
+    if (!ops->lookup(ctx, norm_path, &route))
         return pl_simple_response(404, out_status, out_hdrs, out_hlen, out_body, out_blen);
 
     if (route.type == NL_PX_LOCAL_REDIRECT) {
@@ -599,6 +607,8 @@ static const char PL_PLAN_404[] =
     "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static const char PL_PLAN_500[] =
     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static const char PL_PLAN_400[] =
+    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 static void pl_plan_status(nl_px_local_plan* out, int status, const char* head) {
     size_t n = strlen(head);
@@ -620,9 +630,16 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
     memset(out, 0, sizeof(*out));
     out->status = 200;
 
+    /* 第192轮：无法规范化的端点直接产出 400 计划（RFC 3986） */
+    char norm_path[4096];
+    if (nl_uri_normalize(path, norm_path, sizeof(norm_path)) != NL_URI_OK) {
+        pl_plan_status(out, 400, PL_PLAN_400);
+        return 1;
+    }
+
     nl_px_local_route route;
     memset(&route, 0, sizeof(route));
-    if (!ops->lookup(ctx, path, &route)) return 0;          /* 未命中：平台按 404 处理 */
+    if (!ops->lookup(ctx, norm_path, &route)) return 0;     /* 未命中：平台按 404 处理 */
     if (route.type == NL_PX_LOCAL_PROXY) return 0;          /* 反代走平台既有池/异步路径 */
 
     if (route.type == NL_PX_LOCAL_REDIRECT) {

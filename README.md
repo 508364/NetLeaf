@@ -16,7 +16,9 @@
 
 - **跨平台** - Windows (x86\_64/i686/arm64), Linux, macOS, Android（核心库，arm64-v8a/armeabi-v7a/x86\_64）
 
-- **多协议** - TCP, UDP, HTTP/1.1, HTTP/2, WebSocket, MQTT v3.1.1/v5.0（HTTP/3 QUIC 为独立可选 `quic` 扩展）
+- **多协议** - TCP, UDP, HTTP/1.1, HTTP/2, WebSocket, MQTT v3.1.1/v5.0（HTTP/3 QUIC 为独立可选 `quic` 扩展，**已停止支持，不再更新**）
+
+- **统一日志系统（v3.0.1）** - 三平台共享单实现：毫秒级时间戳 + 线程 ID + 级别定宽对齐（`[INFO ] [T12345] [2026-11-20 17:30:45.123] 消息`），控制台按级别着色（DEBUG 青 / INFO 绿 / WARN 黄 / ERROR 红，遵循 `NO_COLOR`），可选文件落盘 + 按大小轮转（`nl_log_set_file`）
 
 - **全异步 Web 引擎（v3.0.0）** - 数据驱动事件引擎，流式 body 64KB 分块 + chunked 编码，SO_REUSEPORT 多实例，30s 空闲超时扫描（slowloris 防护）
 
@@ -48,7 +50,7 @@ flowchart TD
         A2[libnetleaf_https.dll]
         A3[libnetleaf_tls2.dll]
         A4[libnetleaf_tls3.dll]
-        A5[libnetleaf_quic.dll 可选]
+        A5[libnetleaf_quic.dll 可选（已停止支持）]
         A6[libnetleaf_mqtt.dll]
         A7[libnetleaf_mqtt_server.dll]
         A8[libnetleaf_lang.dll]
@@ -74,7 +76,7 @@ flowchart TD
         direction TB
         C0[common/nl_util.c 公共工具]
         C1[http/ 公共 HTTP 逻辑 + 短名转接层 nlh_*]
-        C2[quic/ QUIC/H3 扩展（BUILD_QUIC）]
+        C2[quic/ QUIC/H3 扩展（已停止支持，不再更新）]
         C3["tls/(tls2) tls3/ MQTT/"]
         C4["lang/ vue/ ipc/ linkagg/ autocomplete/ autoroute/ errorpage/"]
         C5[windows/ linux/ macos/ 平台实现 + optimize/]
@@ -110,7 +112,7 @@ flowchart TD
 | `BUILD_MQTT` / `BUILD_MQTT_SERVER` | ON | MQTT 客户端 / 服务端 |
 | `BUILD_TLS3` | ON | 构建 `netleaf_tls3`（mbedTLS 3.x，TLS 1.2/1.3） |
 | `BUILD_TLS` | OFF | 构建 `netleaf_tls2`（mbedTLS 2.28.10），与 `BUILD_TLS3` 互斥 |
-| `BUILD_QUIC` | OFF | QUIC/H3 独立扩展（主库不含 QUIC） |
+| `BUILD_QUIC` | OFF | QUIC/H3 独立扩展（主库不含 QUIC）——**已停止支持，不再更新** |
 | `BUILD_LANG` | ON | 多语言错误消息 |
 | `BUILD_TESTS` / `BUILD_EXAMPLES` | OFF | 测试 / 示例 |
 | `NETLEAF_ENABLE_LTO` | OFF | LTO（仅加 `-flto`/`/GL /LTCG`，不提升优化等级） |
@@ -278,13 +280,18 @@ nl_extension_shutdown_all();
 ctest --test-dir build --output-on-failure
 ```
 
-注册测试：`ModulesTest` / `FullTest` / `VariableSubstitutionTest` / `AllModulesTest` / `MqttFramesTest` / `HttpFramesTest` / `MqttServerLoopbackTest` / `WebEngineTest` / `QuicTlsTest`（BUILD_QUIC 时）。压测工具 `test/bench_web.c` 覆盖 CONTENT/FILE/PROXY/慢客户端场景。
+注册测试：`ModulesTest` / `FullTest` / `VariableSubstitutionTest` / `AllModulesTest` / `MqttFramesTest` / `HttpFramesTest` / `MqttServerLoopbackTest` / `WebEngineTest` / `LogSystemTest` / `QuicTlsTest`（BUILD_QUIC 时，QUIC 已停止支持）。压测工具 `test/bench_web.c` 覆盖 CONTENT/FILE/PROXY/慢客户端场景。
 
 ## 文档
 
 完整文档见 [wiki/](wiki/Home.md)：快速入门、安装指南、功能特性、API 参考、示例代码、问题排查，以及 TLS、MQTT、Vue、IPC、Lang、LinkAgg、扩展开发等专题页。变更明细见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 更新日志
+
+### v3.0.1（2026-11-21）
+
+- **统一日志系统**：三平台重复日志实现（各 ~120 行）下沉为单份平台无关核心 `src/common/nl_logsys.c`（净删约 360 行）；时间戳精确到毫秒、输出携带线程 ID、级别定宽对齐；新增文件落盘 + 按大小轮转（`nl_log_set_file` / `nl_log_close_file`）与级别查询（`nl_log_get_level`）；控制台输出按级别着色（遵循 `NO_COLOR`）；`http_tls` 裸 `fprintf` 收敛为 `nl_log_error`；新增回归测试 `LogSystemTest`（Windows/Linux 双平台 11/11 通过）
+- **QUIC/H3 停止支持**：`quic` 扩展因协议栈缺陷无法修复，自 2026-11-21 起停止支持、不再更新（源码保留、`BUILD_QUIC` 默认 OFF）
 
 ### v3.0.1（2026-11-08）
 
@@ -312,7 +319,7 @@ ctest --test-dir build --output-on-failure
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
-| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE；HTTP/2/HTTPS 大响应截断与流泄漏 OOM 修复、安卓后端独立化（2026-11-13）；跨协议反代 5 项缺陷修复、HPACK 容量更新解码、Linux/macOS worker 池改为 `nl_server_start_workers()` 显式启用（2026-11-15） |
+| 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE；HTTP/2/HTTPS 大响应截断与流泄漏 OOM 修复、安卓后端独立化（2026-11-13）；跨协议反代 5 项缺陷修复、HPACK 容量更新解码、Linux/macOS worker 池改为 `nl_server_start_workers()` 显式启用（2026-11-15）；统一日志系统（毫秒时间戳/线程ID/颜色/文件轮转）、QUIC/H3 停止支持（2026-11-21） |
 | 3.0.0 | 2026-10-31 | Web 引擎全异步重构（sendfile 零拷贝、多实例、测试体系）；HTTP/2 补完；HTTPS/2；Windows 全 IOCP 化 + UDP 16 槽接收环；QUIC 拆出独立扩展 |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS 重构（`netleaf_https` 独立、tls2/tls3 拆分）；MQTT 默认开启；`nl_util` 公共工具层；H2/QUIC 帧补全；Android 构建支持 |
 | 2.4.1 | 2026-09-24 | Lang 错误码接入多语言、动态/外部变量；清理编译告警；全平台交叉编译 |

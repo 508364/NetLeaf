@@ -268,6 +268,10 @@ int main() {
 
 ## 更新日志
 
+**v3.0.1（2026-11-21）:**
+- 统一日志系统：三平台重复日志实现下沉为单份平台无关核心 `src/common/nl_logsys.c`（净删约 360 行）；毫秒级时间戳 + 线程 ID + 级别定宽对齐，控制台按级别着色（遵循 `NO_COLOR`）；新增文件落盘 + 按大小轮转（`nl_log_set_file` / `nl_log_close_file`）与级别查询（`nl_log_get_level`）；`http_tls` 裸 `fprintf` 收敛为 `nl_log_error`；新增回归测试 `LogSystemTest`（Windows/Linux 双平台 11/11 通过）
+- QUIC/H3 停止支持：`quic` 扩展因协议栈缺陷无法修复，自 2026-11-21 起停止支持、不再更新（源码保留、`BUILD_QUIC` 默认 OFF）
+
 **v3.0.1（2026-11-13）:**
 - HTTP/2 / HTTPS 稳定性修复：HTTPS/1.1 >16KB 内存体响应截断挂死、H2 大响应单帧卡死、`nlh_resp_file` 在 H2 下 body=0、H2 长连接累计请求流泄漏 OOM
 - TLS 写性能：`h2_send_headers` 攒批发帧（HEADERS+DATA 同缓冲），减少小写、提升 QPS
@@ -336,12 +340,28 @@ nl_web_stop_by_port(8080);
 
 **Debug模式（开发阶段）：**
 ```c
-nl_debug_enable();  // 启用详细日志输出
+nl_debug_enable();  // 启用详细日志输出（级别降到 DEBUG）
 ```
+
+**日志API（三平台统一实现，第194轮起）：**
+```c
+nl_log_set_level(NL_LOG_INFO);          // 设置日志级别（DEBUG/INFO/WARN/ERROR）
+nl_log_get_level();                     // 查询当前级别
+nl_log_set_callback(cb, ud);            // 自定义回调（设置后不写 stderr）
+nl_log_set_file("app.log", 10<<20, 3);  // 文件落盘：10MB 轮转、保留 3 份历史
+nl_log_close_file();                    // 关闭文件 sink
+```
+
+控制台输出按级别着色（DEBUG 青 / INFO 绿 / WARN 黄 / ERROR 红，遵循 `NO_COLOR`）：
+```text
+[INFO ] [T12345] [2026-11-20 17:30:45.123] 消息内容
+ ^级别(定宽5)  ^线程ID        ^毫秒级时间戳
+```
+文件 sink 落盘格式相同但永不着色，写满后按 `path → path.1 → … → path.keep` 轮转。
 
 **Release模式（生产环境）：**
 ```c
-// 默认关闭调试日志，仅输出错误信息
+// 默认关闭调试日志，仅输出 WARN 及以上
 ```
 
 #### 4. 系统信息组件（懒加载）
@@ -604,7 +624,7 @@ gcc myapp.c -I include -L build/lib -lnetleaf -lpthread -o myapp
 ## 功能特性
 
 ✅ **TCP/UDP** - 完整的网络协议支持  
-✅ **HTTP/1.1, HTTP/2** - 全HTTP协议栈（HTTP/3/QUIC 已拆为独立 `quic` 扩展）  
+✅ **HTTP/1.1, HTTP/2** - 全HTTP协议栈（HTTP/3/QUIC 已拆为独立 `quic` 扩展，**已停止支持，不再更新**）  
 ✅ **内联HTML/Vue** - 直接在代码中嵌入响应式界面  
 ✅ **现代CSS** - 美观的渐变和动画效果  
 ✅ **跨平台** - Windows (IOCP) + Linux (epoll) + macOS (kqueue) 🔶  

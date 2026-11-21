@@ -769,6 +769,37 @@ NL_API void nl_log_set_level(nl_log_level_t level);
 NL_API void nl_log_set_callback(nl_log_callback callback, void* userdata);
 
 /**
+ * @brief Get current log level
+ */
+NL_API nl_log_level_t nl_log_get_level(void);
+
+/**
+ * @brief 开启/关闭日志文件 sink（平台无关统一日志系统）
+ *
+ * 设置后每条通过级别过滤的日志会同步追加写入指定文件
+ * （无论是否设置了 callback），格式与 stderr 一致（不含颜色）：
+ *   [级别] [T线程ID] [YYYY-MM-DD HH:MM:SS.mmm] 消息
+ *
+ * stderr 输出在控制台下会按级别着色（DEBUG 青 / INFO 绿 / WARN 黄 /
+ * ERROR 红）；文件 sink 永不着色，保证落盘内容可被 grep/解析。
+ *
+ * @param path      文件路径；NULL 或空串关闭文件 sink
+ * @param max_bytes 单文件大小上限（字节），达到后轮转；0 表示不轮转
+ * @param keep      轮转保留的历史文件个数（path.1 .. path.N），
+ *                  超出的最旧文件被删除；<0 按 0 处理
+ * @return NL_OK 成功（含关闭）；NL_ERROR 打开文件失败
+ *
+ * 轮转链示例（keep=2）：写满 -> path 变 path.1，原 path.1 变 path.2，
+ * 原 path.2 被删除，重新打开 path 继续写。
+ */
+NL_API int nl_log_set_file(const char* path, size_t max_bytes, int keep);
+
+/**
+ * @brief 关闭日志文件 sink（等价于 nl_log_set_file(NULL, 0, 0)）
+ */
+NL_API void nl_log_close_file(void);
+
+/**
  * @brief Log a message
  */
 NL_API void nl_log(nl_log_level_t level, const char* format, ...);
@@ -895,10 +926,13 @@ NL_API int nl_web_set_worker_count(nl_web_server_t* server, int target);
 
 /**
  * @brief P6: Set the number of epoll engine instances (SO_REUSEPORT).
- * @details 0 = auto (single instance); > 1 enables multi-instance with
- *          SO_REUSEPORT listen-socket sharing for kernel-level load balancing.
+ * @details 0 = auto (第188轮): the instance count scales dynamically with load
+ *          between 1 and min(logical CPUs, 32) — extra instances are started
+ *          under high load and retired after ~10s of sustained idleness.
+ *          > 0 = fixed instance count (no scaling).
  *          Values > 128 are capped. Apply before nl_web_start.
- *          Linux only; other platforms fall back to single instance.
+ *          Linux and macOS support multi-instance; Windows falls back to its
+ *          IOCP worker threads (this call is a no-op there).
  */
 NL_API int nl_web_set_engine_threads(nl_web_server_t* server, int n);
 
