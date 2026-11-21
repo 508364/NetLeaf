@@ -12,6 +12,9 @@
  *   h. slowloris：半行请求 20 连接 + idle_timeout=2000ms，2.6s 后正常请求仍成功
  *     （服务器未被拖死，空闲槽位已回收）
  *   i. 客户端提前断开：发完完整请求立刻 close，随后正常请求仍成功
+ *   j. WS 升级隧道反代：101 切换 + 双向裸字节回显 + 头透传
+ *   k. PROXY 目录转发（第195轮）：nginx location 语义——透传 / 最长前缀 /
+ *      精确优先 / proxy_pass URI 拼接 / query 保留 / 前缀边界
  *
  * 构建：随 test/CMakeLists.txt 注册（WebEngineTest）。
  * 跨平台：POSIX socket + Windows winsock（netleaf.h 内部已含 winsock2.h）。
@@ -22,6 +25,8 @@
 #endif
 
 #include "netleaf.h"
+/* 第195轮：目录转发的公共层纯逻辑（前缀匹配 / 路径改写）直测 */
+#include "../src/common/nl_proxy_core.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -675,6 +680,198 @@ static void case_ws_proxy(void) {
     engine_stop(s);
 }
 
+/* ------------------------------------------------------------------ */
+/* 用例 k：PROXY 目录转发（第195轮，nginx location 语义）              */
+/* 上游 = 回显请求行的极简 TCP 线程：body 即上游收到的请求行，          */
+/* 由此直接断言透传 / 前缀剥离 / URI 拼接 / query 保留 / 优先级。        */
+/* ------------------------------------------------------------------ */
+#define DIR_UPSTREAM_PORT 19003
+
+typedef struct {
+    int port;
+    volatile int stop;
+    int ready;
+} dir_up_ctx_t;
+
+#ifdef _WIN32
+static unsigned __stdcall dir_upstream_proc(void* p) {
+#else
+static void* dir_upstream_proc(void* p) {
+#endif
+    dir_up_ctx_t* ctx = (dir_up_ctx_t*)p;
+    nl_sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == NL_SOCK_INVALID) return 0;
+    {
+        int yes = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)ctx->port);
+    a.sin_addr.s_addr = htonl(0x7F000001);
+    if (bind(ls, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 8) != 0) {
+        nl_sock_close(ls);
+        return 0;
+    }
+    ctx->ready = 1;
+    while (!ctx->stop) {
+        nl_sock_t c = accept(ls, NULL, NULL);
+        if (c == NL_SOCK_INVALID) break;
+        if (ctx->stop) { nl_sock_close(c); break; }
+        char req[4096];
+        int n = nl_sock_recv(c, req, (int)sizeof(req) - 1, 0);
+        if (n > 0) {
+            req[n] = '\0';
+            char* eol = strstr(req, "\r\n");
+            if (eol) *eol = '\0';            /* 只回显请求行（方法+路径+版本） */
+            int bl = (int)strlen(req);
+            char resp[4608];
+            int hn = snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                "Content-Length: %d\r\nConnection: close\r\n\r\n", bl);
+            if (hn > 0 && hn + bl < (int)sizeof(resp)) {
+                memcpy(resp + hn, req, (size_t)bl);
+                nl_sock_send(c, resp, hn + bl, 0);
+            }
+        }
+        nl_sock_close(c);   /* Connection: close：每请求一条上游连接 */
+    }
+    nl_sock_close(ls);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+/* 发一个 GET 并断言上游回显的请求行（即上游实际收到的请求行）。 */
+static void dir_req_expect(int port, const char* path, const char* want_line) {
+    char req[512], buf[8192], name[160];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", path);
+    int n = http_exchange(port, req, buf, sizeof(buf));
+    const char* body = (n > 0) ? http_body(buf) : NULL;
+    int ok = (body != NULL && strcmp(body, want_line) == 0);
+    snprintf(name, sizeof(name), "上游收到请求行 [%s] == [%s]", path, want_line);
+    if (!ok)
+        printf("    实得: %s\n", body ? body : "(无响应体)");
+    expect(name, ok);
+}
+
+static void case_proxy_dir(void) {
+    printf("\n[用例] k. PROXY 目录转发（nginx location 语义）\n");
+
+    /* ---- 纯逻辑快检（公共层，无需起服） ---- */
+    char rb[256];
+    expect("前缀匹配: /api/ 命中 /api/echo",
+           nl_px_path_match_prefix("/api/", "/api/echo") == 1);
+    expect("前缀匹配: /api/ 不命中 /apifoo",
+           nl_px_path_match_prefix("/api/", "/apifoo") == 0);
+    expect("前缀匹配: 双方剥 query",
+           nl_px_path_match_prefix("/api/", "/api/echo?x=1") == 1);
+    expect("改写: 剥前缀+拼URI+保query",
+           nl_px_dir_rewrite("/api/", 1, "/v1/", "/api/foo?a=1", rb, sizeof(rb)) > 0 &&
+           strcmp(rb, "/v1/foo?a=1") == 0);
+    expect("改写: up_uri 空=原样透传",
+           nl_px_dir_rewrite("/api/", 1, "", "/api/foo?a=1", rb, sizeof(rb)) > 0 &&
+           strcmp(rb, "/api/foo?a=1") == 0);
+    expect("改写: 字面前缀不匹配→安全回退",
+           nl_px_dir_rewrite("/api/", 1, "/v1/", "/apifoo", rb, sizeof(rb)) > 0 &&
+           strcmp(rb, "/apifoo") == 0);
+
+    /* ---- 端到端：回显上游 ---- */
+    dir_up_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.port = DIR_UPSTREAM_PORT;
+#ifdef _WIN32
+    HANDLE th = (HANDLE)_beginthreadex(NULL, 0, dir_upstream_proc, &ctx, 0, NULL);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, dir_upstream_proc, &ctx) != 0) {
+        expect("启动目录回显上游线程", 0);
+        return;
+    }
+#endif
+    for (int i = 0; i < 100 && !ctx.ready; i++) nl_sleep_ms(10);
+    if (!ctx.ready) {
+        expect("回显上游就绪", 0);
+        ctx.stop = 1;
+#ifdef _WIN32
+        if (th) { WaitForSingleObject(th, 5000); CloseHandle(th); }
+#else
+        pthread_join(th, NULL);
+#endif
+        return;
+    }
+
+    char target[80], target_v2[96], target_ex[96];
+    snprintf(target, sizeof(target), "http://127.0.0.1:%d", DIR_UPSTREAM_PORT);
+    snprintf(target_v2, sizeof(target_v2), "%s/v2/", target);
+    snprintf(target_ex, sizeof(target_ex), "%s/exact/", target);
+
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) {
+        expect("start proxy server", 0);
+        ctx.stop = 1;
+        nl_sock_t w = socket(AF_INET, SOCK_STREAM, 0);   /* 唤醒 accept 后 join */
+        if (w != NL_SOCK_INVALID) nl_sock_close(w);
+#ifdef _WIN32
+        if (th) { WaitForSingleObject(th, 5000); CloseHandle(th); }
+#else
+        pthread_join(th, NULL);
+#endif
+        return;
+    }
+    nl_web_add_proxy_dir(s, "/api/", target);            /* 不带 URI：原样透传 */
+    nl_web_add_proxy_dir(s, "/api/v2/", target_v2);      /* 带 URI：剥前缀拼接 */
+    nl_sleep_ms(50);
+
+    /* 1) 透传：不带 URI 的目录路由原样转发完整路径（含 query） */
+    dir_req_expect(port, "/api/echo", "GET /api/echo HTTP/1.1");
+
+    /* 2) 最长前缀 + URI 拼接 + query 保留：/api/v2/x?a=1 → 上游 /v2/x?a=1 */
+    dir_req_expect(port, "/api/v2/x?a=1", "GET /v2/x?a=1 HTTP/1.1");
+
+    /* 3) 精确 > 最长前缀：精确路由剥整段拼 URI，/api/v2/x → 上游 /exact/ */
+    nl_web_add_proxy(s, "/api/v2/x", target_ex);
+    nl_sleep_ms(50);
+    dir_req_expect(port, "/api/v2/x", "GET /exact/ HTTP/1.1");
+
+    /* 4) 前缀边界：/api/ 不吞 /apifoo（nginx location 前缀字面语义） */
+    {
+        char buf[4096];
+        int n = http_exchange(port,
+            "GET /apifoo HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            buf, sizeof(buf));
+        expect("前缀边界: /api/ 不匹配 /apifoo（404）",
+               n > 0 && http_status(buf) == 404);
+    }
+
+    engine_stop(s);
+
+    /* 停上游：置位 + 本地 connect 唤醒阻塞中的 accept */
+    ctx.stop = 1;
+    {
+        nl_sock_t w = socket(AF_INET, SOCK_STREAM, 0);
+        if (w != NL_SOCK_INVALID) {
+            struct sockaddr_in a;
+            memset(&a, 0, sizeof(a));
+            a.sin_family = AF_INET;
+            a.sin_port = htons((unsigned short)DIR_UPSTREAM_PORT);
+            a.sin_addr.s_addr = htonl(0x7F000001);
+            connect(w, (struct sockaddr*)&a, sizeof(a));
+            nl_sock_close(w);
+        }
+    }
+#ifdef _WIN32
+    if (th) { WaitForSingleObject(th, 5000); CloseHandle(th); }
+#else
+    pthread_join(th, NULL);
+#endif
+}
+
 int main(void) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -686,6 +883,7 @@ int main(void) {
     case_redirect();
     case_proxy();
     case_ws_proxy();
+    case_proxy_dir();
     case_head();
     case_404();
     case_uri();

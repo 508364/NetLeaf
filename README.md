@@ -212,6 +212,21 @@ int main(void) {
 }
 ```
 
+**目录（前缀）转发 `nl_web_add_proxy_dir`**（nginx `location` 语义）——把整个目录
+下的请求转发到上游，命中规则为**精确匹配 > 最长前缀**：
+
+```c
+nl_web_add_proxy_dir(server, "/api/",     "http://127.0.0.1:9000");      // 全路径透传
+nl_web_add_proxy_dir(server, "/api/v2/",  "http://127.0.0.1:9000/v2/");  // 剥前缀 + 拼 URI
+```
+
+- **upstream 不带 URI**：命中后完整原始路径（含 query）原样透传
+  （等价 nginx `proxy_pass http://backend;`）；
+- **upstream 带 URI**：剥离命中前缀后拼接 URI，query 原样保留
+  （`/api/foo?a=1` → 上游 `/v1/foo?a=1`，等价 nginx `proxy_pass http://backend/v1/;`）；
+- 前缀边界由尾斜杠控制：`/api/` 不匹配 `/apifoo`；可与 `nl_web_add_proxy`
+  精确路由混合共存，精确匹配永远优先。
+
 ### MQTT 客户端
 
 ```c

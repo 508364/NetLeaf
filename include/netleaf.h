@@ -1026,12 +1026,37 @@ NL_API int nl_web_add_html_file(nl_web_server_t* server, const char* path, const
  *       三平台实现：Linux epoll / macOS kqueue / Windows IOCP（完成端口）。
  *       Windows 采用 IOCP 内核完成端口，**不受 FD_SETSIZE 限制**。
  * @details New short-interface API; upstream may carry an optional scheme
- *          (e.g. "http://host:8080", "https://api.example.com", "tcp://host:6379").
- *          The matched path is transparently forwarded to the upstream.
+ *          (e.g. "http://host:8080", "https://api.example.com", "tcp://host:6379")
+ *          and an optional URI (e.g. "http://backend/v1/"). The matched path is
+ *          transparently forwarded to the upstream; when upstream carries a URI,
+ *          the matched path is replaced by it (nginx proxy_pass semantics).
  *          Mixed routes supported since v2.4.2：同一 server 内 proxy + static +
  *          content + redirect + file 路由可共存，引擎内部统一处理。
+ * @see nl_web_add_proxy_dir
  */
 NL_API int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream);
+
+/**
+ * @brief Add a directory (prefix) reverse proxy route — nginx `location` semantics — **Beta**
+ * @note 反向代理引擎目前处于 Beta 阶段，API 与行为可能在后续版本调整。
+ *       三平台实现：Linux epoll / macOS kqueue / Windows IOCP。
+ * @param server Web server handle
+ * @param prefix URL directory prefix，必须以 '/' 开头（e.g. "/api/"）。
+ *               前缀边界由尾斜杠控制："/api/" 不匹配 "/apifoo"。
+ * @param upstream 上游地址，可选 scheme + 可选 URI
+ *                 （e.g. "http://host:8080", "https://api.example.com/v1/",
+ *                  "tcp://host:6379"）。
+ * @details 目录转发（第195轮）：prefix 下所有请求转发至上游，命中规则为
+ *          **精确匹配 > 最长前缀**（nginx location 规则）。
+ *          路径改写遵循 nginx proxy_pass 语义：upstream 不带 URI → 完整
+ *          原始路径（含 query）原样透传；带 URI（如 ".../v1/"）→ 剥离
+ *          命中前缀后拼接 URI，query 原样保留（/api/foo?a=1 → 上游 /v1/foo?a=1）。
+ *          与 nl_web_add_proxy 路由可混合共存。
+ * @return NL_OK on success, NL_EINVAL（prefix 不以 '/' 开头或 upstream 非法）/
+ *         NL_ENOMEM on error
+ * @see nl_web_add_proxy
+ */
+NL_API int nl_web_add_proxy_dir(nl_web_server_t* server, const char* prefix, const char* upstream);
 
 /**
  * @brief Enable or disable automatic encoding handling

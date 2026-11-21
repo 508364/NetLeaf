@@ -152,6 +152,23 @@ int main(void) {
 }
 ```
 
+**Directory (prefix) forwarding `nl_web_add_proxy_dir`** (nginx `location` semantics) —
+forward an entire directory to an upstream; match priority is **exact > longest prefix**:
+
+```c
+nl_web_add_proxy_dir(server, "/api/",    "http://127.0.0.1:9000");     // full-path passthrough
+nl_web_add_proxy_dir(server, "/api/v2/", "http://127.0.0.1:9000/v2/"); // strip prefix + join URI
+```
+
+- **Upstream without URI**: the full original path (including query) is forwarded
+  unchanged (equivalent to nginx `proxy_pass http://backend;`);
+- **Upstream with URI**: the matched prefix is stripped and the URI appended, query
+  preserved (`/api/foo?a=1` → upstream `/v1/foo?a=1`, equivalent to nginx
+  `proxy_pass http://backend/v1/;`);
+- The prefix boundary is controlled by the trailing slash (`/api/` does not match
+  `/apifoo`); directory routes mix freely with exact `nl_web_add_proxy` routes —
+  exact matches always win.
+
 ### MQTT Client
 
 ```c

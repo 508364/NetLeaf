@@ -2041,6 +2041,8 @@ typedef struct nl_web_route {
     char redirect_url[512];       // Redirect URL for 302
     char upstream[512];           // 反代上游地址 host:port（不带 scheme）
     nl_proxy_protocol_t protocol; // 反代上游协议
+    unsigned char is_prefix;      // 第195轮：1=目录（前缀）路由（nginx location 语义）
+    char up_uri[256];             // 第195轮：上游 URI 部分（如 "/v1/"，空=路径原样透传）
     struct nl_web_route* next;
 } nl_web_route_t;
 
@@ -2366,16 +2368,29 @@ static void pr_parse_upstream_bytes(nl_web_server_t* s, int idx, const char* dat
 
 static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
     // 路径匹配（剥离 query）在公共层实现，三端语义一致
+    // 第195轮：单遍扫描实现"精确 > 最长前缀"（nginx location 规则）——
+    // 精确命中立即返回；前缀命中只记录最长者，扫完再回填。
     int idx = 0;
+    int best_idx = -1;
+    size_t best_len = 0;
+    int has_best = 0;
     EnterCriticalSection(&s->mutex);
     for (nl_web_route_t* r = s->routes; r; r = r->next, idx++) {
         if (nl_px_path_match(r->path, path)) {
             LeaveCriticalSection(&s->mutex);
             return idx;
         }
+        if (r->is_prefix && nl_px_path_match_prefix(r->path, path)) {
+            size_t plen = strlen(r->path);
+            if (!has_best || plen > best_len) {   // 最长前缀；同长取链表先出现者
+                best_len = plen;
+                best_idx = idx;
+                has_best = 1;
+            }
+        }
     }
     LeaveCriticalSection(&s->mutex);
-    return -1;
+    return has_best ? best_idx : -1;
 }
 
 // 构造上游请求，输出到 out，返回字节数（-1=失败）
@@ -2395,6 +2410,11 @@ static int pr_build_upstream_http(nl_web_server_t* s, int idx,
     int is_tcp = (r->protocol == NL_PROXY_TCP);
     char upstream[512];
     snprintf(upstream, sizeof(upstream), "%s", r->upstream);
+    /* 第195轮：目录转发改写所需字段一并复制（解锁后不再解引用共享路由） */
+    int is_prefix = r->is_prefix;
+    char match_path[256], up_uri[256];
+    snprintf(match_path, sizeof(match_path), "%s", r->path);
+    snprintf(up_uri, sizeof(up_uri), "%s", r->up_uri);
     LeaveCriticalSection(&s->mutex);
 
     if (is_tcp) return nl_px_passthrough(out, out_cap, raw_hdrs, raw_hdrs_len);
@@ -2408,8 +2428,17 @@ static int pr_build_upstream_http(nl_web_server_t* s, int idx,
     memset(&pa, 0, sizeof(pa));
     if (getpeername(s->pr_fd_client[idx], (struct sockaddr*)&pa, &pa_len) == 0)
         (void)nl_px_sockaddr_ip((const struct sockaddr*)&pa, peer_ip, sizeof(peer_ip));
+    /* 第195轮：目录转发路径改写（nginx proxy_pass URI 拼接语义）；
+     * up_uri 为空时 nl_px_dir_rewrite 原样拷贝，热路径开销仅为一次 strlen。 */
+    char rpath[4096];
+    const char* fwd_path = path;
+    if (up_uri[0]) {
+        if (nl_px_dir_rewrite(match_path, is_prefix, up_uri, path,
+                              rpath, sizeof(rpath)) > 0)
+            fwd_path = rpath;
+    }
     // 请求行改写 / Host / XFF / 客户端头透传 / 空行终止符：公共层实现
-    return nl_px_build_request(out, out_cap, method, path, proto, upstream,
+    return nl_px_build_request(out, out_cap, method, fwd_path, proto, upstream,
                                raw_hdrs, raw_hdrs_len, peer_ip[0] ? peer_ip : NULL);
 }
 
@@ -2452,6 +2481,8 @@ static int pr_local_lookup(void* ctx, const char* path, nl_px_local_route* out) 
                       : (r->protocol == NL_PROXY_TCP) ? NL_PX_LOCAL_PROTO_TCP
                       : NL_PX_LOCAL_PROTO_HTTP;
         out->upstream = r->upstream;
+        out->dir_prefix = r->is_prefix ? r->path : NULL;   // 第195轮：目录转发
+        out->up_uri = r->up_uri;                           // 空=路径原样透传
         break;
     default:
         ok = 0;
@@ -4054,9 +4085,18 @@ static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
     // 使用 hash 表 O(1) 查找路由；若 hash 未初始化则回退到线性链表
     nl_web_route_t* route = nl_route_hash_lookup_simple(server, norm_path);
     if (!route) {
+        // 第195轮：先精确 strcmp（hash 同款语义），未中再按最长前缀挑目录路由
+        // ——"精确 > 最长前缀"与引擎路径 pr_lookup_route_idx 一致。
+        nl_web_route_t* best = NULL;
+        size_t best_len = 0;
         for (nl_web_route_t* r = server->routes; r; r = r->next) {
             if (strcmp(r->path, norm_path) == 0) { route = r; break; }
+            if (r->is_prefix && nl_px_path_match_prefix(r->path, norm_path)) {
+                size_t plen = strlen(r->path);
+                if (!best || plen > best_len) { best = r; best_len = plen; }
+            }
         }
+        if (!route) route = best;
     }
     if (route) {
         if (route->type == NL_ROUTE_TYPE_REDIRECT) {
@@ -4167,8 +4207,18 @@ static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
                     if (getpeername(client, (struct sockaddr*)&pa, &pa_len) == 0)
                         (void)nl_px_sockaddr_ip((const struct sockaddr*)&pa, peer_ip, sizeof(peer_ip));
                 }
+                /* 第195轮：目录转发改写（nginx proxy_pass URI 拼接）；
+                 * up_uri 为空保持原样透传，与引擎路径同一份公共逻辑。 */
+                char rpath[4096];
+                const char* fwd_path = path;
+                if (route->up_uri[0]) {
+                    if (nl_px_dir_rewrite(route->path, route->is_prefix,
+                                          route->up_uri, path,
+                                          rpath, sizeof(rpath)) > 0)
+                        fwd_path = rpath;
+                }
                 int total = snprintf(upstream_req_full, sizeof(upstream_req_full),
-                    "%s %s %s\r\nHost: %s\r\n", method, path, protocol, route->upstream);
+                    "%s %s %s\r\nHost: %s\r\n", method, fwd_path, protocol, route->upstream);
                 if (total < 0 || (size_t)total >= sizeof(upstream_req_full)) total = 0;
                 if (peer_ip[0]) {
                     int x = snprintf(upstream_req_full + total, sizeof(upstream_req_full) - total,
@@ -4890,10 +4940,14 @@ static void add_web_route_smart(nl_web_server_t* server, const char* path, const
 }
 
 // 解析 upstream 字符串为 host + port + protocol（支持 scheme 前缀或默认端口）
-// 返回 0 成功，-1 失败。host/port 由调用方提供足够缓冲。
+// 第195轮：新增 uri_out —— authority 之后的第一个 '/' 起为上游 URI 部分
+// （如 http://backend/v1/ 的 "/v1/"），供目录转发的 proxy_pass URI 拼接使用。
+// 返回 0 成功，-1 失败。host/port/uri 由调用方提供足够缓冲。
 static int nl_parse_upstream(const char* upstream, char* host, size_t host_size,
-                             int* port_out, nl_proxy_protocol_t* proto_out) {
+                             int* port_out, nl_proxy_protocol_t* proto_out,
+                             char* uri_out, size_t uri_cap) {
     if (!upstream || upstream[0] == '\0') return -1;
+    if (uri_out && uri_cap > 0) uri_out[0] = '\0';
 
     const char* p = upstream;
     nl_proxy_protocol_t proto = NL_PROXY_HTTP;
@@ -4909,11 +4963,20 @@ static int nl_parse_upstream(const char* upstream, char* host, size_t host_size,
         p += 6;
     }
 
+    // 分离 authority 与 URI（第一个 '/' 起为 URI；IPv6 [::1]:8080 不含 '/' 不受影响）
+    char authority[512];
+    const char* slash = strchr(p, '/');
+    size_t alen = slash ? (size_t)(slash - p) : strlen(p);
+    if (alen >= sizeof(authority)) alen = sizeof(authority) - 1;
+    memcpy(authority, p, alen);
+    authority[alen] = '\0';
+    if (slash && uri_out && uri_cap > 0) snprintf(uri_out, uri_cap, "%s", slash);
+
     // 分离 host 与 port（支持 [::1]:8080 形式）
     int port = (proto == NL_PROXY_HTTPS) ? 443 : 80;
-    if (!nl_px_split_hostport(p, host, host_size, &port,
+    if (!nl_px_split_hostport(authority, host, host_size, &port,
                               (proto == NL_PROXY_HTTPS) ? 443 : 80)) {
-        snprintf(host, host_size, "%s", p);
+        snprintf(host, host_size, "%s", authority);
         port = (proto == NL_PROXY_HTTPS) ? 443 : 80;
     }
 
@@ -4923,13 +4986,17 @@ static int nl_parse_upstream(const char* upstream, char* host, size_t host_size,
 }
 
 // 数据驱动反向代理：将 path 路径的请求转发至上游（http/https/tcp）
-int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream) {
+// 共享的路由创建实现（第195轮抽出，供精确/目录两个 API 复用）
+static int nl_web_add_proxy_common(nl_web_server_t* server, const char* path,
+                                   const char* upstream, int is_prefix) {
     if (!server || !path || !upstream) return NL_EINVAL;
 
     char host[512];
     int port = 0;
     nl_proxy_protocol_t proto = NL_PROXY_HTTP;
-    if (nl_parse_upstream(upstream, host, sizeof(host), &port, &proto) != 0) {
+    char up_uri[256];
+    if (nl_parse_upstream(upstream, host, sizeof(host), &port, &proto,
+                          up_uri, sizeof(up_uri)) != 0) {
         return NL_EINVAL;
     }
 
@@ -4942,6 +5009,8 @@ int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upst
         snprintf(route->upstream, sizeof(route->upstream), "%s:%d", host, port);
         route->protocol = proto;
         route->type = NL_ROUTE_TYPE_PROXY;
+        route->is_prefix = (unsigned char)(is_prefix ? 1 : 0);
+        snprintf(route->up_uri, sizeof(route->up_uri), "%s", up_uri);
         route->content = NULL;
         route->content_size = 0;
         route->file_path[0] = '\0';
@@ -4950,11 +5019,24 @@ int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upst
         server->routes = route;
         nl_route_hash_insert_simple(server, route);
         LeaveCriticalSection(&server->mutex);
-        nl_log(NL_LOG_INFO, "Added proxy route: %s -> %s (%d)", path, route->upstream, port);
+        nl_log(NL_LOG_INFO, "Added proxy route: %s -> %s%s%s (%d)", path, route->upstream,
+               up_uri[0] ? " " : "", up_uri[0] ? up_uri : "", port);
         return NL_OK;
     }
     LeaveCriticalSection(&server->mutex);
     return NL_ENOMEM;
+}
+
+int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream) {
+    return nl_web_add_proxy_common(server, path, upstream, 0);
+}
+
+// 第195轮：目录（前缀）转发 —— nginx `location <prefix> { proxy_pass ... }` 语义。
+// 命中规则：精确匹配优先，其余按最长前缀选择；upstream 可带 URI
+// （http://backend/v1/）命中后剥离前缀拼接，不带则完整路径原样透传。
+int nl_web_add_proxy_dir(nl_web_server_t* server, const char* prefix, const char* upstream) {
+    if (!prefix || prefix[0] != '/') return NL_EINVAL;   // 目录前缀必须是绝对路径
+    return nl_web_add_proxy_common(server, prefix, upstream, 1);
 }
 
 // Runtime route management APIs (v2.2.2)

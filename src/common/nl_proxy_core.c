@@ -375,6 +375,92 @@ int nl_px_path_match(const char* route_path, const char* req_path) {
     return strcmp(r, q) == 0;
 }
 
+/* 第195轮：目录（前缀）路由匹配——与 nl_px_path_match 同源的规范化流程，
+ * 仅把"整段相等"放宽为"规范化后 req 以 route_prefix 为前缀"。
+ * 对齐 nginx location 前缀匹配语义：纯字节前缀，边界由调用方用尾斜杠控制
+ * （/api/ 不匹配 /apifoo，/api 匹配两者）。 */
+int nl_px_path_match_prefix(const char* route_prefix, const char* req_path) {
+    if (!route_prefix || !req_path || route_prefix[0] == '\0') return 0;
+
+    /* 与 nl_px_path_match 相同的快路径判定：无特殊字符时免规范化拷贝 */
+    int need = 0;
+    for (const char* p = route_prefix; *p; p++)
+        if (*p == '%' || *p == '.' || *p == '?' || *p == '#' || *p == '\\') {
+            need = 1; break;
+        }
+    if (!need)
+        for (const char* p = req_path; *p; p++)
+            if (*p == '%' || *p == '.' || *p == '?' || *p == '#' || *p == '\\') {
+                need = 1; break;
+            }
+
+    char rbuf[4096], qbuf[4096];
+    const char* r = route_prefix, *q = req_path;
+    if (need) {
+        if (nl_uri_normalize(route_prefix, rbuf, sizeof(rbuf)) != NL_URI_OK) return 0;
+        if (nl_uri_normalize(req_path, qbuf, sizeof(qbuf)) != NL_URI_OK) return 0;
+        r = rbuf;
+        q = qbuf;
+    }
+
+    size_t rlen = strlen(r);
+    return strncmp(q, r, rlen) == 0;
+}
+
+/* 第195轮：目录转发的上游请求路径改写（nginx proxy_pass URI 拼接语义）。
+ *   match_path / is_prefix  命中路由的 path 与是否目录（前缀）路由
+ *   up_uri                  上游 URI 部分（如 "/v1/"）；空 → 路径原样透传
+ *   req_path                客户端原始请求路径（含 query，字节原样）
+ * 规则：up_uri 为空直接透传（等价 nginx `proxy_pass http://backend;`）；
+ * 否则剥掉命中前缀（精确路由剥整段）拼接 up_uri，再原样挂回 ?query。
+ * 原始 path 不以 match_path 字面开头（规范化差异等边缘情况）时安全回退
+ * 原样透传。返回写入字节数（不含 NUL），<0 表示容量不足/参数非法。 */
+int nl_px_dir_rewrite(const char* match_path, int is_prefix,
+                      const char* up_uri, const char* req_path,
+                      char* out, size_t cap) {
+    if (!out || cap == 0 || !req_path) return -1;
+    if (!up_uri || up_uri[0] == '\0') {
+        size_t n = strlen(req_path);
+        if (n + 1 > cap) return -1;
+        memcpy(out, req_path, n + 1);
+        return (int)n;
+    }
+    if (!match_path) return -1;
+
+    /* 拆 query（fragment 已被上游规范化流程剥掉，此处只认 '?'） */
+    const char* q = strchr(req_path, '?');
+    size_t plen = q ? (size_t)(q - req_path) : strlen(req_path);
+
+    /* 剥前缀：精确路由剥整段；前缀路由要求字面开头，否则回退透传 */
+    size_t mlen = strlen(match_path);
+    const char* rest;
+    size_t rest_len;
+    if (is_prefix) {
+        if (plen < mlen || memcmp(req_path, match_path, mlen) != 0) {
+            size_t qlen0 = q ? strlen(q) : 0;
+            if (plen + qlen0 + 1 > cap) return -1;
+            memcpy(out, req_path, plen);
+            if (q) memcpy(out + plen, q, qlen0 + 1);
+            else out[plen] = '\0';
+            return (int)(plen + qlen0);
+        }
+        rest = req_path + mlen;
+        rest_len = plen - mlen;
+    } else {
+        rest = "";
+        rest_len = 0;
+    }
+
+    size_t ulen = strlen(up_uri);
+    size_t qlen = q ? strlen(q) : 0;
+    if (ulen + rest_len + qlen + 1 > cap) return -1;
+    memcpy(out, up_uri, ulen);
+    memcpy(out + ulen, rest, rest_len);
+    if (q) memcpy(out + ulen + rest_len, q, qlen + 1);
+    else out[ulen + rest_len] = '\0';
+    return (int)(ulen + rest_len + qlen);
+}
+
 /* ---------------- 每上游连接的 framing 状态 ---------------- */
 
 void nl_px_upstate_reset(nl_px_upstate* st) {

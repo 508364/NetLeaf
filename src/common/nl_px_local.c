@@ -591,7 +591,20 @@ int nl_px_local_dispatch(void* ctx, const nl_px_local_ops* ops,
     if (route.type == NL_PX_LOCAL_PROXY) {
         if (route.protocol != NL_PX_LOCAL_PROTO_HTTP || !route.upstream)
             return NL_PX_LOCAL_FALLBACK;
-        return pl_proxy_http(ops, ctx, &route, method, path,
+        /* 第195轮：目录转发改写（nginx proxy_pass URI 拼接语义）。
+         * up_uri 为空不改写（原样透传，热路径零拷贝）；前缀路由剥 dir_prefix，
+         * 精确路由剥整段（nl_px_dir_rewrite 对 is_prefix=0 不使用 match_path
+         * 内容，此处传 path 占位即可）。 */
+        char rpath[4096];
+        const char* fwd_path = path;
+        if (route.up_uri && route.up_uri[0]) {
+            const char* mp = route.dir_prefix ? route.dir_prefix : path;
+            int pre = route.dir_prefix ? 1 : 0;
+            if (nl_px_dir_rewrite(mp, pre, route.up_uri, path,
+                                  rpath, sizeof(rpath)) > 0)
+                fwd_path = rpath;
+        }
+        return pl_proxy_http(ops, ctx, &route, method, fwd_path,
                              req_hdrs, req_hdr_len, req_body, req_body_len,
                              peer_ip, is_head, idle_ms,
                              out_status, out_hdrs, out_hlen, out_body, out_blen);

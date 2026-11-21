@@ -55,6 +55,10 @@ typedef struct nl_px_local_route {
     const char* file_path;     /* FILE：磁盘路径 */
     const char* redirect_url;  /* REDIRECT：Location */
     const char* upstream;      /* PROXY：host:port（IPv6 可写 [::1]:8080） */
+    /* 第195轮：目录转发（nginx proxy_pass URI 拼接）。dir_prefix 非空=前缀路由；
+     * up_uri 非空时按 nl_px_dir_rewrite 改写转发路径，空则原样透传。 */
+    const char* dir_prefix;    /* PROXY：目录路由前缀（精确路由为 NULL） */
+    const char* up_uri;        /* PROXY：上游 URI 部分（如 "/v1/"，空=不改写） */
 } nl_px_local_route;
 
 typedef struct nl_px_local_ops {

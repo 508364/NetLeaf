@@ -18,6 +18,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Windows 共享库导出（与 nl_uri.h 同机制）：核心库以 NL_EXPORTS 编译，
+ * 直接消费本头的测试/扩展按 dllimport 引用。第195轮新增的公共 API
+ * （目录转发）需要被 test_web_engine 直接链接，故统一补上导出标记。 */
+#ifndef NL_API
+    #ifdef _WIN32
+        #ifdef NL_EXPORTS
+            #define NL_API __declspec(dllexport)
+        #else
+            #define NL_API __declspec(dllimport)
+        #endif
+    #else
+        #define NL_API
+    #endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -83,6 +98,27 @@ int nl_px_feed_response(nl_px_ctx* c, const char* data, size_t len);
 
 /* 路由路径匹配：双方都剥离 query string（'?' 之后）后整段比较。 */
 int nl_px_path_match(const char* route_path, const char* req_path);
+
+/*
+ * 第195轮：目录（前缀）路由匹配——与 nl_px_path_match 同样的规范化流程，
+ * 比较放宽为"规范化后的 req_path 以 route_prefix 为前缀"（nginx location
+ * 前缀语义）。空前缀返回 0。与 nl_px_path_match 配合实现"精确 > 最长前缀"。
+ */
+NL_API int nl_px_path_match_prefix(const char* route_prefix, const char* req_path);
+
+/*
+ * 第195轮：目录转发的上游请求路径改写（nginx proxy_pass URI 拼接语义）。
+ *   match_path / is_prefix  命中路由的 path 与是否目录（前缀）路由
+ *   up_uri                  上游 URI（如 "/v1/"）；NULL/空 → 路径原样透传
+ *   req_path                客户端原始请求路径（含 query，字节原样）
+ * up_uri 为空：直接透传（nginx `proxy_pass http://backend;`）；否则剥掉命中
+ * 前缀（精确路由剥整段）拼接 up_uri 并原样挂回 ?query；原始 path 不以
+ * match_path 字面开头时安全回退原样透传。返回写入字节数（不含 NUL），
+ * <0 表示容量不足/参数非法。out 建议 >= 4096。
+ */
+NL_API int nl_px_dir_rewrite(const char* match_path, int is_prefix,
+                             const char* up_uri, const char* req_path,
+                             char* out, size_t cap);
 
 /* 忽略大小写前缀比较（prefix 必须是全小写字面量）。 */
 int nl_px_ci_starts(const char* s, size_t n, const char* prefix);

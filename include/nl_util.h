@@ -138,6 +138,13 @@ NL_API char* nl_base64_encode(const char* input, size_t len);
  */
 NL_API char* nl_base64_decode(const char* input, size_t* out_len);
 
+/**
+ * @brief FNV-1a 32 位字符串哈希（三平台路由表原 nl_route_hash 的公共实现）。
+ *
+ * 调用方自行对桶数取模：hash % bucket_count。s 为 NULL 时按空串处理。
+ */
+NL_API unsigned nl_hash_fnv1a(const char* s);
+
 /* ============================================================
  * 线程安全的一次性初始化守卫
  * ============================================================ */
