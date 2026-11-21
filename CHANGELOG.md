@@ -52,7 +52,7 @@
 - 异步模式下握手/收发不再内部 select 等待，直接返回 `WANT_READ` / `WANT_WRITE`，由调用方事件循环驱动；同步行为保持不变
 - 修复 `handshake()` 因 `setup_done` 未置位而始终返回 INVALID_STATE 的问题
 
-### HTTP/2 / HTTPS 稳定性修复与安卓独立化（2026-11-13，第169轮）
+### HTTP/2 / HTTPS 稳定性修复与安卓独立化
 
 **修复:**
 - HTTPS/1.1 内存体响应 >16KB 被截断并挂死：三平台 `nlh_tls_write_cb` 改为循环处理部分写（mbedTLS 单次写约 16KB 上限）
@@ -72,7 +72,7 @@
 **验证:**
 - Windows `ctest` 9/9 通过、`test_http_frames` 52/52 断言；Android 三 ABI 构建通过
 
-### 跨协议反代修复与 worker 池显式启用（2026-11-15，第181-182轮）
+### 跨协议反代修复与 worker 池显式启用
 
 **跨协议反代 5 项缺陷修复:**
 - 扩展自动加载 `.so` 后缀判断差一（`len-4` 比较 3 字符 `".so"`）→ 新增 `nl_has_suffix()`，Linux/macOS 扩展现在可正常自动加载
