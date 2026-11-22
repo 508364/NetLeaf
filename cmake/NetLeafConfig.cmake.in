@@ -1,0 +1,57 @@
+# ============================================================
+# NetLeafConfig.cmake —— NetLeaf 预构建包 CMake package config
+# 由 CMakeLists.txt configure_file 生成（${CMAKE_BINARY_DIR}/pkgmeta/）
+#
+# 预构建包目录结构（v3.1.0 起）：
+#   <包根>/lib/cmake/NetLeaf/NetLeafConfig.cmake  ← 本文件
+#   <包根>/lib/bin/   共享库
+#   <包根>/include/   公共头文件（平铺）
+# 用法：
+#   list(APPEND CMAKE_PREFIX_PATH "<解压后的包目录>")
+#   find_package(NetLeaf REQUIRED)
+#   target_link_libraries(app PRIVATE NetLeaf::netleaf)
+# 找到核心库后定义 NetLeaf::netleaf；扩展库存在时额外定义
+# NetLeaf::netleaf_<ext>（如 NetLeaf::netleaf_lang、NetLeaf::netleaf_https）。
+# ============================================================
+cmake_minimum_required(VERSION 3.14)
+
+get_filename_component(_NETLEAF_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+set(NetLeaf_INCLUDE_DIRS "${_NETLEAF_PREFIX}/include")
+set(NetLeaf_LIBRARY_DIRS "${_NETLEAF_PREFIX}/lib/bin")
+
+# ---- 核心库（必需，缺失则整个包视为无效）----
+find_library(NetLeaf_LIBRARY NAMES netleaf
+    HINTS "${NetLeaf_LIBRARY_DIRS}" NO_DEFAULT_PATH)
+if(NOT NetLeaf_LIBRARY)
+    set(NetLeaf_FOUND FALSE)
+    set(NetLeaf_NOT_FOUND_MESSAGE
+        "在 '${NetLeaf_LIBRARY_DIRS}' 未找到 netleaf 库，该目录不是有效的 NetLeaf 预构建包")
+    return()
+endif()
+
+if(NOT TARGET NetLeaf::netleaf)
+    add_library(NetLeaf::netleaf UNKNOWN IMPORTED)
+    set_target_properties(NetLeaf::netleaf PROPERTIES
+        IMPORTED_LOCATION "${NetLeaf_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${NetLeaf_INCLUDE_DIRS}"
+        INTERFACE_LINK_DIRECTORIES "${NetLeaf_LIBRARY_DIRS}")
+endif()
+
+# ---- 扩展库（可选：包内存在才定义对应 target）----
+foreach(_netleaf_ext netleaf_https netleaf_tls3 netleaf_tls2 netleaf_lang
+                      netleaf_ipc netleaf_vue netleaf_linkagg
+                      netleaf_autocomplete netleaf_autoroute
+                      netleaf_errorpage netleaf_mqtt netleaf_mqtt_server)
+    find_library(NetLeaf_${_netleaf_ext}_LIBRARY NAMES ${_netleaf_ext}
+        HINTS "${NetLeaf_LIBRARY_DIRS}" NO_DEFAULT_PATH)
+    if(NetLeaf_${_netleaf_ext}_LIBRARY AND NOT TARGET NetLeaf::${_netleaf_ext})
+        add_library(NetLeaf::${_netleaf_ext} UNKNOWN IMPORTED)
+        set_target_properties(NetLeaf::${_netleaf_ext} PROPERTIES
+            IMPORTED_LOCATION "${NetLeaf_${_netleaf_ext}_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${NetLeaf_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES NetLeaf::netleaf)
+    endif()
+endforeach()
+unset(_netleaf_ext)
+
+set(NetLeaf_FOUND TRUE)

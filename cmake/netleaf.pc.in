@@ -1,0 +1,22 @@
+# ============================================================
+# netleaf.pc —— NetLeaf 预构建包 pkg-config 模板
+# 由 CMakeLists.txt configure_file 生成（${CMAKE_BINARY_DIR}/pkgmeta/netleaf.pc）
+#
+# 预构建包目录结构（v3.1.0 起）：
+#   <包根>/netleaf.pc          ← 本文件（放在包根）
+#   <包根>/lib/bin/            ← 共享库
+#   <包根>/include/            ← 公共头文件（平铺）
+# 因此 prefix 用 ${pcfiledir} 相对定位，解压到任意路径均可直接使用：
+#   PKG_CONFIG_PATH=<包根> pkg-config --cflags --libs netleaf
+# ============================================================
+prefix=${pcfiledir}
+libdir=${prefix}/lib/bin
+includedir=${prefix}/include
+
+Name: netleaf
+Description: @PROJECT_DESCRIPTION@
+URL: @PROJECT_HOMEPAGE_URL@
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lnetleaf
+Libs.private: @NETLEAF_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}
