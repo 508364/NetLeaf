@@ -1,6 +1,6 @@
 # NetLeaf NL 扩展系统开发教程
 
-> 版本：对应 NetLeaf `3.0.1` / NL 扩展系统 `NL_MODULE_VERSION = 3.0.1`
+> 版本：对应 NetLeaf `3.1.0` / NL 扩展系统 `NL_MODULE_VERSION = 3.1.0`
 > 头文件：[include/netleaf_module.h](../include/netleaf_module.h)、[include/netleaf_lang.h](../include/netleaf_lang.h)
 > 配套示例：[examples/extension_showcase/](../examples/extension_showcase/)
 > 示例 API 使用指南：[docs/extension_showcase_api_guide.md](extension_showcase_api_guide.md)
@@ -11,7 +11,7 @@
 不承载任何业务/负载逻辑。示例中的演示程序会对每一项 API 做 `PASS/FAIL` 断言，
 运行结束打印 `PASS=192 FAIL=0`，可作为回归验证。
 
-> 说明：该示例已从 NetLeaf 主构建中解耦，不再作为根工程的目标随 `-DBUILD_EXAMPLES=ON` 一起构建，
+> 说明：该示例已从 NetLeaf 主构建中解耦，不再作为根工程的目标随 `BUILD_EXAMPLES`（默认关闭）一起构建，
 > 需按 [3.1 构建示例](#31-构建示例) 的方式独立构建，便于后续迁入独立仓库。
 
 ---
@@ -59,7 +59,7 @@ NL 扩展系统是 NetLeaf 的运行时扩展框架，核心理念是：
 
 ### 3.1 构建示例
 
-该示例已从主构建解耦，**不再**随根工程的 `-DBUILD_EXAMPLES=ON` 一起构建。先构建主库与
+该示例已从主构建解耦，**不再**随根工程的 `BUILD_EXAMPLES`（默认关闭）一起构建。先构建主库与
 lang 扩展库（得到 `libnetleaf` 与 `libnetleaf_lang`）：
 
 ```bash

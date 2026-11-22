@@ -17,7 +17,7 @@
 # ============================================================
 set -uo pipefail
 
-VERSION="3.0.1"
+VERSION="3.1.0"
 MIN_SDK="21"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_ROOT="${SCRIPT_DIR}/build-android"

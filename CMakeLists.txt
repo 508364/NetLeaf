@@ -1,11 +1,11 @@
 # NetLeaf - CMake Build Configuration (Pure C)
-# NL扩展系统 v3.0.1
+# NL扩展系统 v3.1.0
 # 架构: 核心库 + 独立扩展，运行时自动加载
 # 说明: 各扩展模块的目标定义已拆分到 src/<模块>/CMakeLists.txt，
 #       本文件仅负责核心库、模块装配（add_subdirectory）以及示例与测试。
 
 cmake_minimum_required(VERSION 3.14)
-project(netleaf VERSION 3.0.1 DESCRIPTION "NetLeaf - A Modern High-Performance Network Library" HOMEPAGE_URL "https://github.com/508364/netleaf" LANGUAGES C)
+project(netleaf VERSION 3.1.0 DESCRIPTION "NetLeaf - A Modern High-Performance Network Library" HOMEPAGE_URL "https://github.com/508364/netleaf" LANGUAGES C)
 
 # Allow overriding the C compiler via CC environment variable or cmake -DCMAKE_C_COMPILER=...
 # This supports LLVM-MinGW (clang.exe), MSVC (cl.exe), and any other toolchain.
@@ -426,6 +426,33 @@ install(FILES
     include/nl_util.h
     DESTINATION include
 )
+
+# ============================================================
+# 预构建包元数据：pkg-config 与 CMake package config（v3.1.0）
+# 生成到 ${CMAKE_BINARY_DIR}/pkgmeta/，由打包脚本随包分发：
+#   netleaf.pc                  -> <包根>/netleaf.pc
+#   NetLeafConfig.cmake         -> <包根>/lib/cmake/NetLeaf/
+#   NetLeafConfigVersion.cmake  -> <包根>/lib/cmake/NetLeaf/
+# 扁平包内用户用法：
+#   PKG_CONFIG_PATH=<包根> pkg-config --cflags --libs netleaf
+#   CMAKE_PREFIX_PATH=<包根> find_package(NetLeaf REQUIRED)
+# ============================================================
+set(NETLEAF_PKG_META_DIR "${CMAKE_BINARY_DIR}/pkgmeta")
+if(WIN32)
+    set(NETLEAF_PC_LIBS_PRIVATE "-lws2_32")
+elseif(APPLE)
+    set(NETLEAF_PC_LIBS_PRIVATE "-lpthread")
+else()
+    set(NETLEAF_PC_LIBS_PRIVATE "-lpthread -ldl")
+endif()
+configure_file("${CMAKE_SOURCE_DIR}/cmake/netleaf.pc.in"
+               "${NETLEAF_PKG_META_DIR}/netleaf.pc" @ONLY)
+configure_file("${CMAKE_SOURCE_DIR}/cmake/NetLeafConfig.cmake.in"
+               "${NETLEAF_PKG_META_DIR}/NetLeafConfig.cmake" @ONLY)
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file("${NETLEAF_PKG_META_DIR}/NetLeafConfigVersion.cmake"
+                                 VERSION ${PROJECT_VERSION}
+                                 COMPATIBILITY SameMajorVersion)
 
 # ============================================================
 # Examples

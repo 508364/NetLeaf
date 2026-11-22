@@ -19,7 +19,7 @@
 # ============================================================
 set -uo pipefail
 
-VERSION="3.0.1"
+VERSION="3.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -106,7 +106,7 @@ build_macos() {
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=ON \
-        -DBUILD_EXAMPLES=ON \
+        -DBUILD_EXAMPLES=OFF \
         -DBUILD_TESTS=OFF \
         -DBUILD_TLS=OFF \
         -DBUILD_TLS3=ON \
@@ -121,23 +121,93 @@ build_macos() {
         return 1
     fi
 
-    # 打包
-    local pkg="${bdir}/pkg_tmp"
-    rm -rf "$pkg"; mkdir -p "$pkg"
+    # 打包（目录结构 v3.1.0：根文档/pc + lib/bin + lib/cmake + include 平铺，
+    # 包内含顶层目录 NetLeaf-<版本>-macos-<arch>/；.a 静态库不入包）
+    local pkg_root="${bdir}/pkg_tmp"
+    local pkg_name="NetLeaf-${VERSION}-macos-${arch}"
+    local pkg="${pkg_root}/${pkg_name}"
+    local out="${RELEASES_DIR}/${pkg_name}.tar.gz"
+    rm -rf "$pkg_root"; mkdir -p "$pkg/lib/bin" "$pkg/include"
     shopt -s nullglob
-    local f
-    for f in "$bdir"/lib/*.dylib "$bdir"/lib/*.a; do
-        cp -f "$f" "$pkg/" 2>/dev/null || true
+    local f base name
+    # 第200轮：符号链接不入包——只取真实文件，跳过 .dylib / .dylib.N 链接，
+    # 主文件去掉版本号重命名（libnetleaf.3.1.0.dylib → libnetleaf.dylib）。
+    for f in "$bdir"/lib/*.dylib "$bdir"/lib/*.dylib.*; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        base="$(basename "$f")"
+        stem="${base%.dylib}"
+        if [[ "$stem" == *.* ]]; then
+            name="${stem%%.*}.dylib"    # 去掉 .<版本号> 后缀
+        else
+            name="$base"
+        fi
+        cp -f "$f" "$pkg/lib/bin/${name}" || true
     done
-    for f in "$SCRIPT_DIR"/include/*.h; do
-        cp -f "$f" "$pkg/" 2>/dev/null || true
+    # 第200轮方案1（macOS 对称修正）：install_name 同步。
+    # 与 Linux 的 NEEDED/SONAME 等价——包内库的 install_name 原为
+    # @rpath/libnetleaf.3.dylib（或构建机绝对路径），重命名后引用会断，
+    # 把 id 与依赖引用统一改为 @rpath/<新名>。
+    # 工具解析：macOS 主机为裸名 install_name_tool/otool；osxcross 交叉环境为
+    # <triplet>-install_name_tool/<triplet>-otool（优先 target/bin 绝对路径）。
+    # 映射目标不在包内的（系统库 /usr/lib/libSystem.B.dylib 等）自动跳过。
+    local install_tool="" otool_tool=""
+    if command -v install_name_tool >/dev/null 2>&1 && command -v otool >/dev/null 2>&1; then
+        install_tool="install_name_tool"
+        otool_tool="otool"
+    elif [[ -x "${OSXCROSS_TARGET_DIR}/bin/${triplet}-install_name_tool" && -x "${OSXCROSS_TARGET_DIR}/bin/${triplet}-otool" ]]; then
+        install_tool="${OSXCROSS_TARGET_DIR}/bin/${triplet}-install_name_tool"
+        otool_tool="${OSXCROSS_TARGET_DIR}/bin/${triplet}-otool"
+    elif command -v "${triplet}-install_name_tool" >/dev/null 2>&1 && command -v "${triplet}-otool" >/dev/null 2>&1; then
+        install_tool="${triplet}-install_name_tool"
+        otool_tool="${triplet}-otool"
+    fi
+    if [[ -n "$install_tool" ]]; then
+        local dep dst stem2
+        for f in "$pkg"/lib/bin/*.dylib; do
+            [[ -f "$f" ]] || continue
+            "$install_tool" -id "@rpath/$(basename "$f")" "$f" 2>/dev/null || true
+        done
+        for f in "$pkg"/lib/bin/*.dylib; do
+            [[ -f "$f" ]] || continue
+            for dep in $("$otool_tool" -L "$f" | tail -n +2 | awk '{print $1}'); do
+                [[ "$dep" == *.dylib ]] || continue
+                stem2="$(basename "$dep")"
+                stem2="${stem2%.dylib}"
+                # 无版本号时 dst 即原名本身；只要映射目标在包内（含构建机
+                # 绝对路径引用的包内库），统一改写为 @rpath/<新名>，
+                # 系统库（libSystem.B.dylib 等）映射目标不在包内自动跳过
+                dst="${stem2%%.*}.dylib"
+                if [[ -f "$pkg/lib/bin/${dst}" && "$dep" != "@rpath/${dst}" ]]; then
+                    "$install_tool" -change "$dep" "@rpath/${dst}" "$f" 2>/dev/null || true
+                fi
+            done
+        done
+    else
+        echo "[WARN] install_name_tool/otool 不可用：包内 dylib install_name 仍带版本号"
+    fi
+    # 公共头文件平铺到 include/（原 include/optimize/ 下的头文件也平铺进来）
+    for f in "$SCRIPT_DIR"/include/*.h "$SCRIPT_DIR"/include/optimize/*.h; do
+        cp -f "$f" "$pkg/include/" 2>/dev/null || true
     done
-    # 子目录头文件（include/optimize）需保留相对路径
-    cp -rf "$SCRIPT_DIR"/include/optimize "$pkg/" 2>/dev/null || true
+    # 说明文档与许可证
+    for f in README.md README_EN.md LICENSE; do
+        cp -f "$SCRIPT_DIR/$f" "$pkg/" 2>/dev/null || true
+    done
+    # pkg-config（放包根，prefix=${pcfiledir} 相对定位）
+    if [[ -f "$bdir/pkgmeta/netleaf.pc" ]]; then
+        cp -f "$bdir/pkgmeta/netleaf.pc" "$pkg/"
+    fi
+    # CMake package config（放 lib/cmake/NetLeaf/，find_package 可直接定位包根）
+    if [[ -f "$bdir/pkgmeta/NetLeafConfig.cmake" ]]; then
+        mkdir -p "$pkg/lib/cmake/NetLeaf"
+        cp -f "$bdir/pkgmeta/NetLeafConfig.cmake" \
+              "$bdir/pkgmeta/NetLeafConfigVersion.cmake" \
+              "$pkg/lib/cmake/NetLeaf/"
+    fi
     shopt -u nullglob
-    tar -czf "${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz" -C "$pkg" . 2>/dev/null || true
-    rm -rf "$pkg"
-    echo -e "${GREEN}[OK] macOS ${arch} -> ${RELEASES_DIR}/NetLeaf-${VERSION}-macos-${arch}.tar.gz${NC}"
+    tar -czf "$out" -C "$pkg_root" "$pkg_name" 2>/dev/null || true
+    rm -rf "$pkg_root"
+    echo -e "${GREEN}[OK] macOS ${arch} -> ${out}${NC}"
 }
 
 FAILED=()

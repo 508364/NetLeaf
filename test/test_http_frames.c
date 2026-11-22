@@ -452,6 +452,161 @@ static void test_send_frames(void) {
     h2_connection_cleanup(&conn);
 }
 
+/* ============================================================
+ * v3.1.0 HTTP/1 边界回归（纯内存，不触网）
+ *  - 100 Continue：带 Expect 的请求先回 100 再收 body；
+ *  - 413：请求体超上限时判定为不完整（上层据此回 413）；
+ *  - 431：头值超 1023B / 头条目 >64 时 parse 返回 -2 而非静默截断；
+ *  - nlh_resp_file：文件不存在 → 404（不再 200 挂死）；
+ *  - nlh_resp_body_offset：原始响应切割辅助。
+ * ============================================================ */
+
+struct fake_src { const char* data; size_t len; size_t off; size_t chunk; };
+
+/* 假 recv：每次最多吐 chunk 字节（模拟"先头后 body"的到达顺序），
+ * 数据吐完返回 -1（对端关闭）。 */
+static long fake_recv(void* ctx, char* buf, size_t len) {
+    struct fake_src* s = (struct fake_src*)ctx;
+    if (s->off >= s->len) return -1;
+    size_t n = s->len - s->off;
+    if (n > len) n = len;
+    if (s->chunk && n > s->chunk) n = s->chunk;
+    memcpy(buf, s->data + s->off, n);
+    s->off += n;
+    return (long)n;
+}
+
+/* 假 write：把服务端写出的字节捕获到 buf（验证 100 Continue）。 */
+struct wcap { char buf[256]; size_t len; };
+static int fake_write(void* ctx, const char* data, size_t len) {
+    struct wcap* w = (struct wcap*)ctx;
+    if (len > sizeof(w->buf) - 1 - w->len) len = sizeof(w->buf) - 1 - w->len;
+    memcpy(w->buf + w->len, data, len);
+    w->len += len;
+    w->buf[w->len] = '\0';
+    return 0;
+}
+
+static void test_http1_boundaries(void) {
+    printf("\n[用例] HTTP/1 v3.1.0 边界（100-continue / 413 / 431 / 404）\n");
+
+    /* --- 1. 带 Expect: 100-continue：先回 100 再收 body --- */
+    {
+        const char* req =
+            "POST /u HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n"
+            "Content-Length: 4\r\n\r\nABCD";
+        struct fake_src src = { req, strlen(req), 0, 0 };
+        /* 第一次只吐头部（模拟 curl 等 100 才发 body） */
+        src.chunk = (size_t)(strstr(req, "\r\n\r\n") + 4 - req);
+        struct wcap w; memset(&w, 0, sizeof(w));
+        size_t len = 0;
+        char* b = nl_http_read_request_full(fake_recv, &src, fake_write, &w,
+                                            1024, 1u << 20, &len);
+        expect("Expect 请求读完整", (b && len == strlen(req)) ? 1 : 0, 1);
+        expect("回了 100 Continue",
+               (w.len == 25 && memcmp(w.buf, "HTTP/1.1 100 Continue\r\n\r\n", 25) == 0) ? 1 : 0, 1);
+        expect("body 完整可交付", b ? nl_http_request_body_complete(b, len) : -1, 1);
+        free(b);
+    }
+
+    /* --- 2. 不带 Expect：不发任何中间响应 --- */
+    {
+        const char* req = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        struct fake_src src = { req, strlen(req), 0, 0 };
+        struct wcap w; memset(&w, 0, sizeof(w));
+        size_t len = 0;
+        char* b = nl_http_read_request_full(fake_recv, &src, fake_write, &w,
+                                            1024, 1u << 20, &len);
+        expect("无 Expect 读完整", (b && len == strlen(req)) ? 1 : 0, 1);
+        expect("无 Expect 不回 100", w.len == 0 ? 1 : 0, 1);
+        free(b);
+    }
+
+    /* --- 3. 请求体超上限：返回头部完整但 body 不全（上层回 413） --- */
+    {
+        char req[512];
+        int hl = snprintf(req, sizeof(req),
+                          "POST / HTTP/1.1\r\nContent-Length: 104857600\r\n\r\n");
+        memset(req + hl, 'x', 100);            /* 仅到了 100 字节 body */
+        struct fake_src src = { req, (size_t)hl + 100, 0, 0 };
+        struct wcap w; memset(&w, 0, sizeof(w));
+        size_t len = 0;
+        char* b = nl_http_read_request_full(fake_recv, &src, fake_write, &w,
+                                            1024, 4096, &len);   /* 上限 4KB */
+        expect("超限请求仍返回数据", (b && len > 0) ? 1 : 0, 1);
+        expect("超限判为不完整(→413)", b ? (nl_http_request_body_complete(b, len) == 0) : -1, 1);
+        expect("超限不回 100 Continue", w.len == 0 ? 1 : 0, 1);
+        free(b);
+    }
+
+    /* --- 4. 头值 4200B（>4096 规范上限）：parse 返回 -2，不再截断 --- */
+    {
+        char req[4600];
+        int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nX-Long: ");
+        memset(req + n, 'A', 4200);
+        snprintf(req + n + 4200, sizeof(req) - n - 4200, "\r\n\r\n");
+        nl_http_request_t r;
+        expect("4200B 头值返回 -2", nl_http_parse_request(&r, req, strlen(req)), -2);
+    }
+
+    /* --- 5. 4096B 头值：仍可正常解析（规范上限的最大值） --- */
+    {
+        char req[4600];
+        int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nX-Long: ");
+        memset(req + n, 'A', 4096);
+        snprintf(req + n + 4096, sizeof(req) - n - 4096, "\r\n\r\n");
+        nl_http_request_t r;
+        int rc = nl_http_parse_request(&r, req, strlen(req));
+        expect("4096B 头值解析成功", rc, 0);
+        expect("4096B 头值不截断", (int)strlen(r.headers[0].value), 4096);
+    }
+
+    /* --- 6. 头条目 >64：返回 -2 --- */
+    {
+        char req[4096];
+        int off = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\n");
+        for (int i = 0; i < 65; i++)
+            off += snprintf(req + off, sizeof(req) - off, "X-H%d: v\r\n", i);
+        snprintf(req + off, sizeof(req) - off, "\r\n");
+        nl_http_request_t r;
+        expect("65 个头返回 -2", nl_http_parse_request(&r, req, strlen(req)), -2);
+    }
+
+    /* --- 7. nlh_resp_file：文件不存在 → 404 + 空正文，不挂死 --- */
+    {
+        nl_http_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.status = 200;
+        nl_http_response_set_file(&resp, "Z:/no/such/dir/nl_missing_file.html", 1234);
+        expect("缺文件回 404", resp.status, 404);
+        expect("缺文件无 file_path", resp.file_path == NULL ? 1 : 0, 1);
+        expect("缺文件有空正文", (resp.body != NULL && resp.body_size == 0) ? 1 : 0, 1);
+        free(resp.body);
+
+        /* 存在的文件：正常挂 file_path，状态保持 200 */
+        memset(&resp, 0, sizeof(resp));
+        resp.status = 200;
+        const char* tmp = "nl_test_resp_file.tmp";
+        FILE* f = fopen(tmp, "wb");
+        if (f) { fputs("hello", f); fclose(f); }
+        nl_http_response_set_file(&resp, tmp, 5);
+        expect("存在文件挂 file_path", resp.file_path != NULL ? 1 : 0, 1);
+        expect("存在文件状态不变", resp.status, 200);
+        free(resp.file_path);
+        free(resp.body);
+        remove(tmp);
+    }
+
+    /* --- 8. nlh_resp_body_offset：原始响应切割 --- */
+    {
+        const char* raw = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nABCD";
+        size_t off = nlh_resp_body_offset(raw, strlen(raw));
+        expect("body 偏移指向 BODY", off == strlen(raw) - 4 ? 1 : 0, 1);
+        expect("无头结束符返回 0", (int)nlh_resp_body_offset("HTTP/1.1 200", 12), 0);
+        expect("偏移处内容为 ABCD", memcmp(raw + off, "ABCD", 4) == 0 ? 1 : 0, 1);
+    }
+}
+
 int main(void) {
     printf("=== HTTP/2 帧回环回归测试 ===\n");
 
@@ -462,6 +617,7 @@ int main(void) {
     test_connection_init();
     test_frame_state_machine();
     test_send_frames();
+    test_http1_boundaries();
 
     printf("\n=== 结果：%d/%d 通过，%d 失败 ===\n",
            g_total - g_fail, g_total, g_fail);

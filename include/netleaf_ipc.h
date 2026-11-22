@@ -22,10 +22,10 @@ extern "C" {
     #define NL_IPC_API
 #endif
 
-#define NL_IPC_VERSION "3.0.1"
+#define NL_IPC_VERSION "3.1.0"
 #define NL_IPC_VERSION_MAJOR 3
-#define NL_IPC_VERSION_MINOR 0
-#define NL_IPC_VERSION_PATCH 1
+#define NL_IPC_VERSION_MINOR 1
+#define NL_IPC_VERSION_PATCH 0
 
 // =========================================
 // Module Information

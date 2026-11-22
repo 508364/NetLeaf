@@ -15,6 +15,7 @@
 #include "nl_px_local.h"
 #include "nl_proxy_core.h"
 #include "nl_uri.h"
+#include "nl_filesrv.h"        /* 第203轮：DIR 端点按扩展名猜 MIME */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@
 #if defined(_WIN32)
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <sys/stat.h>
     typedef SOCKET pl_fd;
     #define PL_BAD_FD INVALID_SOCKET
     #define pl_closefd closesocket
@@ -36,6 +38,7 @@
     #include <unistd.h>
     #include <errno.h>
     #include <poll.h>
+    #include <sys/stat.h>
     typedef int pl_fd;
     #define PL_BAD_FD (-1)
     #define pl_closefd close
@@ -44,6 +47,19 @@
 #endif
 
 #define PL_DEFAULT_IDLE 60000
+
+/* 第203轮：DIR 端点 stat —— Windows 用 _stat，POSIX 用 stat */
+#if defined(_WIN32)
+    #define pl_stat_t   struct _stat
+    #define pl_stat     _stat
+    #define PL_S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+    #define PL_S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#else
+    #define pl_stat_t   struct stat
+    #define pl_stat     stat
+    #define PL_S_ISREG(m) S_ISREG(m)
+    #define PL_S_ISDIR(m) S_ISDIR(m)
+#endif
 #define PL_MAX_BODY     (64u << 20)
 #define PL_HDR_NAME_MAX 256
 #define PL_HDR_VAL_MAX  4096
@@ -497,6 +513,190 @@ static int pl_proxy_http(const nl_px_local_ops* ops, void* ctx,
 }
 
 /* ============================================================
+ * 第203轮：DIR 端点（端点即根目录 / 端点即文件）
+ * ============================================================ */
+#define PL_DIR_ENOENT (-100)   /* 端点根下目标不存在（调用方映射 404） */
+
+/* Content-Type：路由显式值优先，否则按扩展名猜（nl_filesrv）。 */
+static const char* pl_guess_ct(const char* fpath, const char* ct_hint) {
+    if (ct_hint && ct_hint[0]) return ct_hint;
+    char ext[32];
+    nl_filesrv_ext(fpath, ext, sizeof(ext));
+    const char* m = nl_filesrv_mime(ext);
+    return (m && m[0]) ? m : "application/octet-stream";
+}
+
+/* 把 clamp 规范化结果中的 '%' 重编码为 %25 —— 下一步
+ * nl_uri_resolve_file 会再次 percent-decode，重编码保证解码往返一致：
+ *   /web/a%2520b → clamp 解码 → /a%20b → 重编码 → /a%2520b
+ *   → resolve 解码 → /a%20b（文件名字面 "a%20b"，防双重解码）。
+ * 返回 0 成功，-1 容量不足。 */
+static int pl_reencode_pct(const char* in, char* out, size_t cap) {
+    size_t w = 0;
+    for (const char* p = in; *p; p++) {
+        if (*p == '%') {
+            if (w + 4 > cap) return -1;
+            out[w++] = '%'; out[w++] = '2'; out[w++] = '5';
+        } else {
+            if (w + 2 > cap) return -1;
+            out[w++] = *p;
+        }
+    }
+    out[w] = '\0';
+    return 0;
+}
+
+/* 打开本地文件构造 200 响应（FILE 路由与 DIR 端点共用）。 */
+static int pl_file_response(const char* fpath, const char* ct_hint, int is_head,
+                            int* out_status, char** out_hdrs, size_t* out_hlen,
+                            char** out_body, size_t* out_blen) {
+    if (!fpath)
+        return pl_simple_response(404, out_status, out_hdrs, out_hlen,
+                                  out_body, out_blen);
+    FILE* f = fopen(fpath, "rb");
+    if (!f)
+        return pl_simple_response(404, out_status, out_hdrs, out_hlen,
+                                  out_body, out_blen);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return pl_simple_response(500, out_status, out_hdrs, out_hlen,
+                                  out_body, out_blen);
+    }
+    long sz = ftell(f);
+    if (sz < 0 || (unsigned long)sz > NL_PX_LOCAL_FILE_MAX) {
+        fclose(f);
+        return pl_simple_response(500, out_status, out_hdrs, out_hlen,
+                                  out_body, out_blen);
+    }
+    rewind(f);
+    char* body = NULL;
+    size_t got = 0;
+    if (!is_head && sz > 0) {
+        body = (char*)malloc((size_t)sz);
+        if (!body) {
+            fclose(f);
+            return NL_PX_LOCAL_ERROR;
+        }
+        got = fread(body, 1, (size_t)sz, f);
+    }
+    fclose(f);
+    const char* ct = pl_guess_ct(fpath, ct_hint);
+    size_t hl = strlen(ct) + 32;
+    char* hdrs = (char*)malloc(hl);
+    if (!hdrs) {
+        free(body);
+        return NL_PX_LOCAL_ERROR;
+    }
+    int n = snprintf(hdrs, hl, "Content-Type: %s\r\n", ct);
+    if (n <= 0) {
+        free(hdrs);
+        free(body);
+        return NL_PX_LOCAL_ERROR;
+    }
+    return pl_set_response(200, hdrs, (size_t)n, body, got, is_head,
+                           out_status, out_hdrs, out_hlen, out_body, out_blen);
+}
+
+/*
+ * DIR 端点解析：path（含 query）→ 端点根下的完整磁盘路径 out。
+ * 语义：
+ *   - 端点指向文件：端点即根，任意余段都服务该文件；
+ *   - 端点指向目录：字面剥端点前缀 → clamp 规范化（端点内 ../ 不逃逸，
+ *     越根 .. 忽略）→ % 重编码 → nl_uri_resolve_file 安全拼接 → stat：
+ *       文件 → 直接服务；
+ *       目录且余段以 '/' 结尾 → 找 index.html（is_under 二次校验）；
+ *       其余 → PL_DIR_ENOENT。
+ * 返回 NL_URI_OK / PL_DIR_ENOENT / NL_URI_*（EINVAL→400、
+ * ESCAPES/EROOT→403、ENOSPC→500）。
+ */
+static int pl_dir_resolve(const nl_px_local_route* route, const char* path,
+                          char* out, size_t cap) {
+    if (!route || !route->file_path || !route->dir_prefix || !path || cap < 2)
+        return NL_URI_EINVAL;
+
+    pl_stat_t st;
+    if (pl_stat(route->file_path, &st) != 0) return PL_DIR_ENOENT;
+    if (PL_S_ISREG(st.st_mode)) {
+        /* 端点指向文件：文件即根，忽略余段 */
+        size_t n = strlen(route->file_path);
+        if (n + 1 > cap) return NL_URI_ENOSPC;
+        memcpy(out, route->file_path, n + 1);
+        return NL_URI_OK;
+    }
+    if (!PL_S_ISDIR(st.st_mode)) return PL_DIR_ENOENT;
+
+    /* 1) 字面剥端点前缀（注册前缀以 '/' 开头、无尾 '/'，见 nl_web_add_dir） */
+    const char* pre = route->dir_prefix;
+    size_t plen = strlen(pre);
+    char work[NL_URI_MAX];       /* 规范化/端点内规范化共用缓冲 */
+    char remalt[2];              /* 端点根的余段写法 "/" */
+    const char* rem = NULL;
+    int rem_in_work = 0;         /* rem 是否指向 work（work 可能被原地改写） */
+    if (strncmp(path, pre, plen) == 0) {
+        char c = path[plen];
+        if (c == '\0' || c == '/') {
+            rem = path + plen;
+        } else if (c == '?' || c == '#') {
+            remalt[0] = '/'; remalt[1] = '\0';
+            rem = remalt;
+        }
+    }
+    if (!rem) {
+        /* 编码/折叠变体（/a/../web/x、%77eb 等）：全局规范化后再剥 */
+        if (nl_uri_normalize(path, work, sizeof(work)) != NL_URI_OK)
+            return NL_URI_EINVAL;
+        if (strncmp(work, pre, plen) != 0 ||
+            !(work[plen] == '\0' || work[plen] == '/'))
+            return PL_DIR_ENOENT;   /* 防御：lookup 命中应保证在端点下 */
+        rem = work + plen;
+        rem_in_work = 1;
+    }
+    if (rem[0] == '\0') {
+        remalt[0] = '/'; remalt[1] = '\0';
+        rem = remalt;
+        rem_in_work = 0;
+    }
+
+    /* 2) 端点内 clamp 规范化：越根 ".." 忽略（端点即根，../ 不逃逸） */
+    char nrem[NL_URI_MAX];
+    int rc = rem_in_work ? nl_uri_normalize_clamp(rem, rem, sizeof(work))   /* 原地 */
+                         : nl_uri_normalize_clamp(rem, nrem, sizeof(nrem));
+    if (rc != NL_URI_OK) return rc;
+    const char* use = rem_in_work ? rem : nrem;
+
+    /* 3) % 重编码 → resolve_file 安全拼接（canonical root + realpath 二次校验） */
+    char renc[NL_URI_MAX * 2];
+    if (pl_reencode_pct(use, renc, sizeof(renc)) != 0) return NL_URI_ENOSPC;
+    char full[NL_URI_MAX];
+    rc = nl_uri_resolve_file(route->file_path, renc, full, sizeof(full));
+    if (rc != NL_URI_OK) return rc;
+
+    /* 4) stat：文件 → 服务；目录 → 仅余段以 '/' 结尾时找 index.html */
+    if (pl_stat(full, &st) != 0) return PL_DIR_ENOENT;
+    if (PL_S_ISREG(st.st_mode)) {
+        size_t n = strlen(full);
+        if (n + 1 > cap) return NL_URI_ENOSPC;
+        memcpy(out, full, n + 1);
+        return NL_URI_OK;
+    }
+    if (!PL_S_ISDIR(st.st_mode)) return PL_DIR_ENOENT;
+    size_t nlen = strlen(use);
+    if (nlen == 0 || use[nlen - 1] != '/') return PL_DIR_ENOENT;
+
+    size_t fl = strlen(full);
+    if (fl + 12 > sizeof(full)) return NL_URI_ENOSPC;
+    if (full[fl - 1] != '/' && full[fl - 1] != '\\')
+        full[fl++] = '/';
+    memcpy(full + fl, "index.html", 11);
+    if (!nl_uri_is_under(route->file_path, full)) return NL_URI_EROOT;
+    if (pl_stat(full, &st) != 0 || !PL_S_ISREG(st.st_mode))
+        return PL_DIR_ENOENT;
+    if (strlen(full) + 1 > cap) return NL_URI_ENOSPC;
+    strcpy(out, full);
+    return NL_URI_OK;
+}
+
+/* ============================================================
  * 分发入口
  * ============================================================ */
 int nl_px_local_dispatch(void* ctx, const nl_px_local_ops* ops,
@@ -517,16 +717,30 @@ int nl_px_local_dispatch(void* ctx, const nl_px_local_ops* ops,
     *out_blen = 0;
 
     /* 第192轮：RFC 3986 端点校验——无法规范化（坏 % 编码 / 越根 / 反斜杠）
-     * 直接 400；lookup 用规范化路径，PROXY 上游转发仍用原始 path（含 query）。 */
+     * 直接 400；PROXY 上游转发仍用原始 path（含 query）。
+     * 第203轮：改为先查路由再校验 —— 目录端点（DIR）把端点当根，越根
+     * ".." 由端点内 clamp 解释（/web/../../x → 端点内 /x），不能被全局
+     * ESCAPES 拦成 400；其它路由维持 normalize 失败 → 400。
+     * 第203轮（补）：lookup 统一传原始 path —— 规范化会吃掉端点前缀
+     * （"/web/../p" → "/p"），DIR 字面前缀将无法命中；三阶段 lookup
+     * 内部已覆盖字面精确/DIR 字面前缀/规范化匹配三种情形。 */
     char norm_path[4096];
-    if (nl_uri_normalize(path, norm_path, sizeof(norm_path)) != NL_URI_OK)
-        return pl_simple_response(400, out_status, out_hdrs, out_hlen,
-                                  out_body, out_blen);
+    int norm_ok = (nl_uri_normalize(path, norm_path, sizeof(norm_path)) == NL_URI_OK);
+    (void)norm_path;
 
     nl_px_local_route route;
     memset(&route, 0, sizeof(route));
-    if (!ops->lookup(ctx, norm_path, &route))
+    if (!ops->lookup(ctx, path, &route)) {
+        if (!norm_ok)
+            return pl_simple_response(400, out_status, out_hdrs, out_hlen,
+                                      out_body, out_blen);
         return pl_simple_response(404, out_status, out_hdrs, out_hlen, out_body, out_blen);
+    }
+    if (!norm_ok && route.type != NL_PX_LOCAL_DIR) {
+        /* 非法端点只有目录端点可 clamp 放行 */
+        return pl_simple_response(400, out_status, out_hdrs, out_hlen,
+                                  out_body, out_blen);
+    }
 
     if (route.type == NL_PX_LOCAL_REDIRECT) {
         int code = route.redirect_code > 0 ? route.redirect_code : 302;
@@ -559,33 +773,30 @@ int nl_px_local_dispatch(void* ctx, const nl_px_local_ops* ops,
                                out_status, out_hdrs, out_hlen, out_body, out_blen);
     }
 
-    if (route.type == NL_PX_LOCAL_FILE) {
-        if (!route.file_path) return pl_simple_response(404, out_status, out_hdrs, out_hlen, out_body, out_blen);
-        FILE* f = fopen(route.file_path, "rb");
-        if (!f) return pl_simple_response(404, out_status, out_hdrs, out_hlen, out_body, out_blen);
-        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return pl_simple_response(500, out_status, out_hdrs, out_hlen, out_body, out_blen); }
-        long sz = ftell(f);
-        if (sz < 0 || (unsigned long)sz > NL_PX_LOCAL_FILE_MAX) {
-            fclose(f);
-            return pl_simple_response(500, out_status, out_hdrs, out_hlen, out_body, out_blen);
-        }
-        rewind(f);
-        char* body = NULL;
-        size_t got = 0;
-        if (!is_head && sz > 0) {
-            body = (char*)malloc((size_t)sz);
-            if (!body) { fclose(f); return NL_PX_LOCAL_ERROR; }
-            got = fread(body, 1, (size_t)sz, f);
-        }
-        fclose(f);
-        const char* ct = route.content_type && route.content_type[0]
-                             ? route.content_type : "application/octet-stream";
-        char* hdrs = (char*)malloc(strlen(ct) + 32);
-        if (!hdrs) { free(body); return NL_PX_LOCAL_ERROR; }
-        int n = snprintf(hdrs, strlen(ct) + 32, "Content-Type: %s\r\n", ct);
-        if (n <= 0) { free(hdrs); free(body); return NL_PX_LOCAL_ERROR; }
-        return pl_set_response(200, hdrs, (size_t)n, body, got, is_head,
-                               out_status, out_hdrs, out_hlen, out_body, out_blen);
+    if (route.type == NL_PX_LOCAL_FILE)
+        return pl_file_response(route.file_path, route.content_type, is_head,
+                                out_status, out_hdrs, out_hlen,
+                                out_body, out_blen);
+
+    /* 第203轮：DIR 端点 —— 端点即根（目录或文件），解析后按文件响应 */
+    if (route.type == NL_PX_LOCAL_DIR) {
+        char dpath[NL_URI_MAX];
+        int rc = pl_dir_resolve(&route, path, dpath, sizeof(dpath));
+        if (rc == PL_DIR_ENOENT)
+            return pl_simple_response(404, out_status, out_hdrs, out_hlen,
+                                      out_body, out_blen);
+        if (rc == NL_URI_ESCAPES || rc == NL_URI_EROOT)
+            return pl_simple_response(403, out_status, out_hdrs, out_hlen,
+                                      out_body, out_blen);
+        if (rc == NL_URI_ENOSPC)
+            return pl_simple_response(500, out_status, out_hdrs, out_hlen,
+                                      out_body, out_blen);
+        if (rc != NL_URI_OK)
+            return pl_simple_response(400, out_status, out_hdrs, out_hlen,
+                                      out_body, out_blen);
+        return pl_file_response(dpath, NULL, is_head,
+                                out_status, out_hdrs, out_hlen,
+                                out_body, out_blen);
     }
 
     if (route.type == NL_PX_LOCAL_PROXY) {
@@ -622,6 +833,8 @@ static const char PL_PLAN_500[] =
     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static const char PL_PLAN_400[] =
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static const char PL_PLAN_403[] =
+    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 static void pl_plan_status(nl_px_local_plan* out, int status, const char* head) {
     size_t n = strlen(head);
@@ -633,7 +846,7 @@ static void pl_plan_status(nl_px_local_plan* out, int status, const char* head) 
     out->type = NL_PX_LOCAL_CONTENT;
     out->body = NULL;
     out->body_len = 0;
-    out->file_path = NULL;
+    out->file_path[0] = '\0';    /* 第203轮：内嵌数组（不再是指针） */
     out->file_size = 0;
 }
 
@@ -643,16 +856,28 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
     memset(out, 0, sizeof(*out));
     out->status = 200;
 
-    /* 第192轮：无法规范化的端点直接产出 400 计划（RFC 3986） */
+    /* 第192轮：无法规范化的端点直接产出 400 计划（RFC 3986）。
+     * 第203轮：先查路由再校验 —— 目录端点越根 ".." 由端点内 clamp 解释
+     * （/web/../../x → 端点内 /x），不能被全局 ESCAPES 拦成 400；
+     * 其它路由维持 normalize 失败 → 400。
+     * 第203轮（补）：lookup 统一传原始 path —— 规范化会吃掉端点前缀
+     * （"/web/../p" → "/p"），DIR 字面前缀将无法命中；三阶段 lookup
+     * 内部已覆盖字面精确/DIR 字面前缀/规范化匹配三种情形。 */
     char norm_path[4096];
-    if (nl_uri_normalize(path, norm_path, sizeof(norm_path)) != NL_URI_OK) {
-        pl_plan_status(out, 400, PL_PLAN_400);
-        return 1;
-    }
+    int norm_ok = (nl_uri_normalize(path, norm_path, sizeof(norm_path)) == NL_URI_OK);
+    (void)norm_path;
 
     nl_px_local_route route;
     memset(&route, 0, sizeof(route));
-    if (!ops->lookup(ctx, norm_path, &route)) return 0;     /* 未命中：平台按 404 处理 */
+    if (!ops->lookup(ctx, path, &route)) {
+        if (!norm_ok) { pl_plan_status(out, 400, PL_PLAN_400); return 1; }
+        return 0;     /* 未命中：平台按 404 处理 */
+    }
+    if (!norm_ok && route.type != NL_PX_LOCAL_DIR) {
+        /* 非法端点只有目录端点可 clamp 放行 */
+        pl_plan_status(out, 400, PL_PLAN_400);
+        return 1;
+    }
     if (route.type == NL_PX_LOCAL_PROXY) return 0;          /* 反代走平台既有池/异步路径 */
 
     if (route.type == NL_PX_LOCAL_REDIRECT) {
@@ -682,9 +907,25 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
         return 1;
     }
 
-    if (route.type == NL_PX_LOCAL_FILE) {
-        if (!route.file_path) { pl_plan_status(out, 404, PL_PLAN_404); return 1; }
-        FILE* f = fopen(route.file_path, "rb");
+    if (route.type == NL_PX_LOCAL_FILE || route.type == NL_PX_LOCAL_DIR) {
+        char dpath[NL_URI_MAX];
+        const char* fpath = route.file_path;
+        if (route.type == NL_PX_LOCAL_DIR) {
+            /* 第203轮：DIR 端点解析（端点即根，../ clamp） */
+            int rc = pl_dir_resolve(&route, path, dpath, sizeof(dpath));
+            if (rc == PL_DIR_ENOENT) { pl_plan_status(out, 404, PL_PLAN_404); return 1; }
+            if (rc == NL_URI_ESCAPES || rc == NL_URI_EROOT) { pl_plan_status(out, 403, PL_PLAN_403); return 1; }
+            if (rc == NL_URI_ENOSPC) { pl_plan_status(out, 500, PL_PLAN_500); return 1; }
+            if (rc != NL_URI_OK) { pl_plan_status(out, 400, PL_PLAN_400); return 1; }
+            fpath = dpath;
+        }
+        if (!fpath) { pl_plan_status(out, 404, PL_PLAN_404); return 1; }
+        /* 第203轮：file_path 为内嵌数组（plan 会 memcpy 进延迟上下文） */
+        if (strlen(fpath) >= sizeof(out->file_path)) {
+            pl_plan_status(out, 500, PL_PLAN_500);
+            return 1;
+        }
+        FILE* f = fopen(fpath, "rb");
         if (!f) { pl_plan_status(out, 404, PL_PLAN_404); return 1; }
         long long sz = -1;
         if (fseek(f, 0, SEEK_END) == 0) {
@@ -697,14 +938,20 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
             pl_plan_status(out, 500, PL_PLAN_500);
             return 1;
         }
-        const char* ct = (route.content_type && route.content_type[0])
-                             ? route.content_type : "application/octet-stream";
+        const char* ct;
+        if (route.content_type && route.content_type[0]) {
+            ct = route.content_type;
+        } else if (route.type == NL_PX_LOCAL_DIR) {
+            ct = pl_guess_ct(fpath, NULL);      /* DIR：按扩展名猜 MIME */
+        } else {
+            ct = "application/octet-stream";
+        }
         int n = nl_px_build_body_head(out->head, sizeof(out->head), ct, sz, 0);
         if (n < 0) { pl_plan_status(out, 500, PL_PLAN_500); return 1; }
         out->status = 200;
         out->type = NL_PX_LOCAL_FILE;
         out->head_len = (size_t)n;
-        out->file_path = route.file_path;      /* 借用路由表内字符串 */
+        strcpy(out->file_path, fpath);          /* 拷贝（数组），memcpy 进 defer 安全 */
         out->file_size = sz;
         return 1;
     }

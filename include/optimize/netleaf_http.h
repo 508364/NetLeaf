@@ -285,15 +285,31 @@ NL_API void nlh_resp_status(nl_http_response_t* resp, int status);
 NL_API void nlh_resp_header(nl_http_response_t* resp, const char* name, const char* value);
 NL_API void nlh_resp_body(nl_http_response_t* resp, const char* body, size_t len);
 /** 以文件内容作为响应体（等价于 TransmitFile/sendfile 语义，但适用于 TLS）。
- *  size 为文件字节数，用于生成 Content-Length；正文由传输层分块发送。 */
+ *  size 为文件字节数，用于生成 Content-Length；正文由传输层分块发送。
+ *  v3.1.0：文件不存在/不可读时自动改回 404 + 空正文（不再发 200 后挂死）。 */
 NL_API void nlh_resp_file(nl_http_response_t* resp, const char* path, size_t size);
 
 #ifdef NL_HTTPS_ENABLE
-NL_API int nlh_server_enable_tls(nl_http_server_t* server,
+/** @deprecated 自 v3.1.0 起本短名同长名一样是固定返回 NL_HTTP_TLS_UNAVAILABLE
+ * 的桩（历史实现向核心库结构体越界写 TLS 字段），调用时会在日志输出错误提示。
+ * 服务端 TLS / HTTPS 2 请改用 nlh_tls_server_*。保留仅为维持符号兼容。 */
+NL_API NL_HTTP_DEPRECATED int nlh_server_enable_tls(nl_http_server_t* server,
                                  const nl_http_tls_server_cfg_t* cfg);
+/**
+ * 创建 HTTP/1.1 客户端连接。
+ * - cfg != NULL：执行 TLS 握手（HTTPS）；TLS 后端不可用时返回 NULL。
+ * - cfg == NULL：明文 HTTP 连接（v3.1.0 起支持），不依赖 TLS 后端。
+ * @return 句柄；NULL = 失败
+ */
 NL_API nl_http_client_t* nlh_client_connect(const char* host, int port,
                                             const nl_http_tls_client_cfg_t* cfg);
 NL_API void nlh_client_close(nl_http_client_t* client);
+/**
+ * 发送 HTTP/1.1 请求并读取响应到 out_buf。
+ * 注意：out_buf 中是原始响应（状态行 + 响应头 + \\r\\n\\r\\n + body），
+ * 需自行按 \\r\\n\\r\\n 切割；可用 nlh_resp_body_offset 求 body 起点。
+ * @return 200..599 = HTTP 状态码；负数 = 错误（NL_HTTP_TLS_UNAVAILABLE 等）
+ */
 NL_API int nlh_client_request(nl_http_client_t* client,
                                const char* method,
                                const char* path,
@@ -301,6 +317,13 @@ NL_API int nlh_client_request(nl_http_client_t* client,
                                char* out_buf, size_t out_buf_size,
                                size_t* out_body_len);
 #endif /* NL_HTTPS_ENABLE */
+
+/**
+ * 求原始响应（nlh_client_request 的 out_buf 内容）中 body 的起始偏移：
+ * 即首个 \\r\\n\\r\\n 之后的位置；未找到头结束符时返回 0。
+ * 用法：body = raw + nlh_resp_body_offset(raw, raw_len)。
+ */
+NL_API size_t nlh_resp_body_offset(const char* raw, size_t len);
 
 #ifdef __cplusplus
 }

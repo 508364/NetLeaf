@@ -268,6 +268,12 @@ int main() {
 
 ## 更新日志
 
+**v3.1.0（2026-11-22）:**
+- nlh_* HTTP 协议层修复：补 `100 Continue` 握手（4MB 上传 1.007s → 23ms）；头字段超限回 `431` 不再静默截断；请求体超 64MiB 总上限回 `413` 不再提前回 200；修复头扫描漏掉最后一个头行（`Content-Length` 恒丢失）
+- `nlh_resp_file` 文件不存在改回 `404 + 空正文`（旧为 200+头 后 0 字节挂死 655s）
+- 明文 HTTP 客户端：`nlh_client_connect(host, port, NULL)`；新增 `nlh_resp_body_offset()` 切割原始响应；`nlh_server_enable_tls` 标记 deprecated 并输出运行时错误提示
+- 版本 3.1.0；双平台 ctest 11/11 通过（新增 HttpFramesTest 边界用例组）
+
 **v3.0.1（2026-11-21）:**
 - 统一日志系统：三平台重复日志实现下沉为单份平台无关核心 `src/common/nl_logsys.c`（净删约 360 行）；毫秒级时间戳 + 线程 ID + 级别定宽对齐，控制台按级别着色（遵循 `NO_COLOR`）；新增文件落盘 + 按大小轮转（`nl_log_set_file` / `nl_log_close_file`）与级别查询（`nl_log_get_level`）；`http_tls` 裸 `fprintf` 收敛为 `nl_log_error`；新增回归测试 `LogSystemTest`（Windows/Linux 双平台 11/11 通过）
 - QUIC/H3 停止支持：`quic` 扩展因协议栈缺陷无法修复，自 2026-11-21 起停止支持、不再更新（源码保留、`BUILD_QUIC` 默认 OFF）

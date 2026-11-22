@@ -178,41 +178,63 @@ static void* http1_client_thread(void* arg) {
         /* 读满整个请求（头部 + Content-Length body），与 TLS 会话保持一致：
          * 只读到头部终止符会让带体请求（注册/登录/上传）拿不到 body。 */
         char* buffer = nl_http_read_request_full(nlh_plain_recv_cb, &client_fd,
+                                                 nlh_plain_write_cb, &client_fd,
                                                  BUFFER_SIZE, NL_HTTP_MAX_REQUEST,
                                                  &total);
         if (!buffer || total == 0) { free(buffer); break; }
 
-        nl_http_request_t req;
-        nl_http_response_t resp;
-        memset(&req, 0, sizeof(req));
-        memset(&resp, 0, sizeof(resp));
-        resp.status = 200;
+        /* 请求体超出单请求上限（64MiB）：头部已到但 body 读不完整，
+         * 回 413 关连接，而非把截断数据当完整请求回 200（v3.1.0 修复） */
+        if (!nl_http_request_body_complete(buffer, total)) {
+            static const char r413[] = "HTTP/1.1 413 Request Entity Too Large\r\n"
+                                       "Connection: close\r\nContent-Length: 0\r\n\r\n";
+            ssize_t w413 = write(client_fd, r413, sizeof(r413) - 1);
+            (void)w413;
+            free(buffer);
+            break;
+        }
+
+        /* req/resp 头值已动态分配（结构体约 9KB）；保留堆分配（v3.1.0） */
+        nl_http_request_t* req = (nl_http_request_t*)malloc(sizeof(*req));
+        nl_http_response_t* resp = (nl_http_response_t*)malloc(sizeof(*resp));
+        if (!req || !resp) { free(req); free(resp); free(buffer); break; }
+        memset(req, 0, sizeof(*req));
+        memset(resp, 0, sizeof(*resp));
+        resp->status = 200;
         int parsed = 0;
 
-        if (nl_http_parse_request(&req, buffer, total) == 0) {
+        int parse_rc = nl_http_parse_request(req, buffer, total);
+        if (parse_rc == 0) {
             parsed = 1;
             /* 解析出的 Connection 头决定本连接是否复用 */
-            const char* conn = nl_http_request_get_header(&req, "Connection");
+            const char* conn = nl_http_request_get_header(req, "Connection");
             if (conn && strcasecmp(conn, "close") == 0) {
                 keep_alive = 0;
             }
-            if (req.version == NL_HTTP_VERSION_1_0) {
-                const char* ka = nl_http_request_get_header(&req, "Keep-Alive");
+            if (req->version == NL_HTTP_VERSION_1_0) {
+                const char* ka = nl_http_request_get_header(req, "Keep-Alive");
                 if (!ka) keep_alive = 0;
             }
 
             if (server && server->handler) {
-                server->handler(&req, &resp, server->user_data);
+                server->handler(req, resp, server->user_data);
             } else {
-                nl_http_response_set_body(&resp, "<html><body><h1>Hello, NetLeaf HTTP/1.1!</h1></body></html>", 53);
+                nl_http_response_set_body(resp, "<html><body><h1>Hello, NetLeaf HTTP/1.1!</h1></body></html>", 53);
             }
+        } else if (parse_rc == -2) {
+            /* 头字段超限（值 >4096B / 条目 >64）：回 431 并关连接，
+             * 不再静默截断头值（v3.1.0 修复） */
+            keep_alive = 0;
+            resp->status = 431;
+            nl_http_response_set_header(resp, "Connection", "close");
+            nl_http_response_set_body(resp, "", 0);
         }
 
         char* response_data = NULL;
         size_t response_len = 0;
         /* 回写 Connection 头，让客户端知道连接是否复用 */
-        if (keep_alive && parsed) nl_http_response_set_header(&resp, "Connection", "keep-alive");
-        nl_http_generate_response_http1(&resp, &response_data, &response_len);
+        if (keep_alive && parsed) nl_http_response_set_header(resp, "Connection", "keep-alive");
+        nl_http_generate_response_http1(resp, &response_data, &response_len);
 
         if (response_data) {
             if (response_len > 0) {
@@ -223,14 +245,18 @@ static void* http1_client_thread(void* arg) {
         }
 
         /* 文件响应：头部已带 Content-Length，正文在此分块发出 */
-        if (resp.file_path) {
-            nl_http_stream_file_chunks(resp.file_path, resp.file_size,
+        if (resp->file_path) {
+            nl_http_stream_file_chunks(resp->file_path, resp->file_size,
                                        nlh_plain_write_cb, &client_fd);
-            free(resp.file_path);
-            resp.file_path = NULL;
+            free(resp->file_path);
+            resp->file_path = NULL;
         }
-        if (resp.body) free(resp.body);
-        if (req.body) free(req.body);
+        if (resp->body) free(resp->body);
+        nl_http_headers_free(resp->headers, resp->header_count);
+        if (req->body) free(req->body);
+        nl_http_headers_free(req->headers, req->header_count);
+        free(req);
+        free(resp);
         free(buffer);
     }
 

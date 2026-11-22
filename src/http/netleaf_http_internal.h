@@ -49,7 +49,10 @@
  * ============================================================ */
 #define MAX_HEADERS 64
 #define MAX_HEADER_NAME 128
-#define MAX_HEADER_VALUE 1024
+/* 规范：单个请求头字段值长度最多 4096 字节（第200轮澄清：该上限不再作为
+ * 内嵌缓冲大小，头值改为按需 malloc 动态分配，判定 `strlen(value) > 4096`
+ * 即回 431 不截断）。结构体因此回落到约 9KB。 */
+#define MAX_HEADER_VALUE 4096
 #define NL_HTTP_MAX_PATH 4096
 #define BUFFER_SIZE 16384
 
@@ -63,8 +66,13 @@
 
 struct nl_http_header {
     char name[MAX_HEADER_NAME];
-    char value[MAX_HEADER_VALUE];
+    /* 值按需动态分配（malloc(strlen+1)，第200轮起），上限 4096 由解析处判定；
+     * 由 nl_http_headers_free 统一释放，禁止内嵌大数组。 */
+    char* value;
 };
+
+/* 释放头值数组中已动态分配的 value（req/resp 销毁前调用） */
+NL_HTTP_INT_API void nl_http_headers_free(struct nl_http_header* headers, int count);
 
 struct nl_http_request {
     nlh_http_method_t method;
@@ -265,6 +273,8 @@ NL_HTTP_INT_API void h2_connection_cleanup(struct nl_http2_connection* conn);
 /* HTTP/1 解析与生成 */
 NL_HTTP_INT_API long nl_http_find_terminator(const char* buf, size_t total);
 nlh_http_method_t nl_http_parse_method(const char* method);
+/* 解析请求：0 = 成功；-1 = 格式错误；-2 = 头字段超限（名字/值/条目数
+ * 超出 MAX_HEADER_* / MAX_HEADERS），上层应回 431（v3.1.0）。 */
 NL_HTTP_INT_API int nl_http_parse_request(nl_http_request_t* req, const char* data, size_t len);
 NL_HTTP_INT_API void nl_http_generate_response_http1(nl_http_response_t* resp, char** out, size_t* out_len);
 
@@ -282,8 +292,14 @@ typedef int (*nl_http_write_fn)(void* ctx, const char* data, size_t len);
 
 /* 读取一个完整 HTTP/1 请求（头部 + Content-Length 指定的 body）。
  * 内部按需扩容，最大 max_cap 字节；成功返回 malloc 的缓冲（NUL 结尾），
- * 由调用方 free；连接提前关闭且无任何数据时返回 NULL。 */
+ * 由调用方 free；连接提前关闭且无任何数据时返回 NULL。
+ * continue_cb/continue_ctx 可为 NULL；非 NULL 且请求带
+ * "Expect: 100-continue" 时，在收 body 前经该回调发出
+ * "HTTP/1.1 100 Continue\r\n\r\n"（v3.1.0，消除客户端上传白等）。
+ * 请求超 max_cap 时返回已读的部分（头部完整、body 不全），
+ * 调用方应以 nl_http_request_body_complete 判定并回 413。 */
 NL_HTTP_INT_API char* nl_http_read_request_full(nl_http_recv_fn recv_fn, void* ctx,
+                                               nl_http_write_fn continue_cb, void* continue_ctx,
                                                size_t initial_cap, size_t max_cap,
                                                size_t* out_len);
 

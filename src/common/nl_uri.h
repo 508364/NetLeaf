@@ -84,6 +84,15 @@ NL_API char* nl_url_encode(const char* input);
 NL_API int nl_uri_normalize(const char* uri, char* out, size_t cap);
 
 /**
+ * @brief 端点内根目录语义的规范化（第203轮，目录端点专用）。
+ * 与 nl_uri_normalize 完全一致，唯一区别：越根 `..` 不返回
+ * NL_URI_ESCAPES 而是被忽略 —— 对"端点即根目录"的 URL 而言
+ * `/web/../../x` 应等价于 `/x`（保持在端点内），而非全局 403。
+ * @return NL_URI_OK / NL_URI_*（不再产生 ESCAPES）。
+ */
+NL_API int nl_uri_normalize_clamp(const char* uri, char* out, size_t cap);
+
+/**
  * @brief 物理文件隔离：把 URL 路径安全解析到 root 目录之下。
  * 保证：返回 0 时 *out 要么是 root 下真实存在的文件（已解析符号链接 /
  * junction 并校验前缀边界），要么是 root 下词法安全的不存在路径

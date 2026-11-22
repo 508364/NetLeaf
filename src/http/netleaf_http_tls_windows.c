@@ -71,12 +71,40 @@
 #include "netleaf_http.h"
 #include "http/netleaf_http_internal.h"
 
-/* HTTPS 客户端：封装 TCP socket + TLS 上下文 + 目标主机名 */
+/* nl_log_error 定义于 netleaf_core（src/common/nl_logsys.c），无属性声明
+ * 经 netleaf_core 导入库解析（同 linux 适配层做法）。 */
+void nl_log_error(const char* format, ...);
+
+/* HTTPS/HTTP 客户端：封装 socket + TLS 上下文 + 目标主机名。
+ * tls_ctx == NULL 表示明文 HTTP（cfg 传 NULL 时，v3.1.0 起支持）。 */
 struct nl_http_client {
     SOCKET sock;
     NL_HTTPS_TLS_CTX* tls_ctx;
     char* hostname;
 };
+
+/* 客户端发送：TLS 循环加密发送（mbedTLS 单次约 16KB 上限），明文循环 send。 */
+static int nlh_client_send(nl_http_client_t* client, const char* data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int n;
+        if (client->tls_ctx) {
+            n = NL_HTTPS_TLS_send(client->tls_ctx, data + off, len - off);
+        } else {
+            n = send(client->sock, data + off, (int)(len - off), 0);
+        }
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* 客户端接收：分 TLS / 明文；返回读到的字节数，<=0 表示对端关闭/出错。 */
+static int nlh_client_recv(nl_http_client_t* client, char* buf, size_t len) {
+    if (client->tls_ctx)
+        return NL_HTTPS_TLS_recv(client->tls_ctx, buf, (int)len);
+    return recv(client->sock, buf, (int)len, 0);
+}
 
 int nl_http_server_enable_tls(nl_http_server_t* server,
                               const nl_http_tls_server_cfg_t* cfg) {
@@ -85,13 +113,16 @@ int nl_http_server_enable_tls(nl_http_server_t* server,
      * 写入实为越界写，且配置从未被消费。现固定返回不可用，服务端 TLS /
      * HTTPS-2 请使用本文件提供的 nlh_tls_server_*。 */
     (void)server; (void)cfg;
+    nl_log_error("[nlh] nlh_server_enable_tls 已停用（返回 UNAVAILABLE），"
+                 "服务端 TLS 请改用 nlh_tls_server_*");
     return NL_HTTP_TLS_UNAVAILABLE;
 }
 
 nl_http_client_t* nl_http_client_connect(const char* host, int port,
                                           const nl_http_tls_client_cfg_t* cfg) {
-    if (!NL_HTTPS_TLS_is_available()) return NULL;
-    if (!host || !cfg) return NULL;
+    /* cfg == NULL → 明文 HTTP（v3.1.0）；非 NULL → TLS 握手。 */
+    if (cfg && !NL_HTTPS_TLS_is_available()) return NULL;
+    if (!host) return NULL;
 
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -114,32 +145,35 @@ nl_http_client_t* nl_http_client_connect(const char* host, int port,
     }
     freeaddrinfo(res);
 
-    NL_HTTPS_TLS_CTX* tls_ctx = NL_HTTPS_TLS_create();
-    if (!tls_ctx) {
-        closesocket(sock);
-        return NULL;
-    }
+    NL_HTTPS_TLS_CTX* tls_ctx = NULL;
+    if (cfg) {
+        tls_ctx = NL_HTTPS_TLS_create();
+        if (!tls_ctx) {
+            closesocket(sock);
+            return NULL;
+        }
 
-    NL_HTTPS_TLS_CONFIG tls_cfg;
-    memset(&tls_cfg, 0, sizeof(tls_cfg));
-    tls_cfg.ca_file    = cfg->ca_file;
-    tls_cfg.cert_file  = cfg->cert_file;
-    tls_cfg.key_file   = cfg->key_file;
-    tls_cfg.verify_peer = cfg->verify ? 1 : 0;
-    tls_cfg.is_server  = 0;
-    tls_cfg.handshake_timeout_ms = 10000;
+        NL_HTTPS_TLS_CONFIG tls_cfg;
+        memset(&tls_cfg, 0, sizeof(tls_cfg));
+        tls_cfg.ca_file    = cfg->ca_file;
+        tls_cfg.cert_file  = cfg->cert_file;
+        tls_cfg.key_file   = cfg->key_file;
+        tls_cfg.verify_peer = cfg->verify ? 1 : 0;
+        tls_cfg.is_server  = 0;
+        tls_cfg.handshake_timeout_ms = 10000;
 
-    if (NL_HTTPS_TLS_configure(tls_ctx, &tls_cfg) != NL_HTTPS_TLS_OK ||
-        NL_HTTPS_TLS_set_hostname(tls_ctx, host) != NL_HTTPS_TLS_OK ||
-        NL_HTTPS_TLS_handshake_ex(tls_ctx, NL_HTTPS_TO_INT(sock), 10000) != NL_HTTPS_TLS_OK) {
-        NL_HTTPS_TLS_destroy(tls_ctx);
-        closesocket(sock);
-        return NULL;
+        if (NL_HTTPS_TLS_configure(tls_ctx, &tls_cfg) != NL_HTTPS_TLS_OK ||
+            NL_HTTPS_TLS_set_hostname(tls_ctx, host) != NL_HTTPS_TLS_OK ||
+            NL_HTTPS_TLS_handshake_ex(tls_ctx, NL_HTTPS_TO_INT(sock), 10000) != NL_HTTPS_TLS_OK) {
+            NL_HTTPS_TLS_destroy(tls_ctx);
+            closesocket(sock);
+            return NULL;
+        }
     }
 
     nl_http_client_t* client = calloc(1, sizeof(nl_http_client_t));
     if (!client) {
-        NL_HTTPS_TLS_destroy(tls_ctx);
+        if (tls_ctx) NL_HTTPS_TLS_destroy(tls_ctx);
         closesocket(sock);
         return NULL;
     }
@@ -148,7 +182,7 @@ nl_http_client_t* nl_http_client_connect(const char* host, int port,
     client->tls_ctx = tls_ctx;
     client->hostname = _strdup(host);
     if (!client->hostname) {
-        NL_HTTPS_TLS_destroy(tls_ctx);
+        if (tls_ctx) NL_HTTPS_TLS_destroy(tls_ctx);
         closesocket(sock);
         free(client);
         return NULL;
@@ -195,21 +229,21 @@ int nl_http_client_request(nl_http_client_t* client,
     }
     if (req_len < 0) return NL_HTTP_TLS_UNAVAILABLE;
 
-    if (NL_HTTPS_TLS_send(client->tls_ctx, req_buf, (size_t)req_len) != req_len)
+    if (nlh_client_send(client, req_buf, (size_t)req_len) != 0)
         return NL_HTTP_TLS_UNAVAILABLE;
 
     if (body && body_len > 0) {
-        if (NL_HTTPS_TLS_send(client->tls_ctx, body, body_len) != (int)body_len)
+        if (nlh_client_send(client, body, body_len) != 0)
             return NL_HTTP_TLS_UNAVAILABLE;
     }
 
     if (out_buf && out_buf_size > 0) {
         size_t total = 0;
         while (total < out_buf_size - 1) {
-            int n = NL_HTTPS_TLS_recv(client->tls_ctx, out_buf + total,
-                                (int)(out_buf_size - 1 - total));
+            int n = nlh_client_recv(client, out_buf + total,
+                                    out_buf_size - 1 - total);
             if (n <= 0) break;
-            total += n;
+            total += (size_t)n;
         }
         out_buf[total] = '\0';
         if (out_body_len) *out_body_len = total;
@@ -374,31 +408,50 @@ static void nlh_tls_h1_session(NL_HTTPS_TLS_CTX* tls,
         /* 读满整个请求：头部 + Content-Length 指定的 body。
          * 只读到头部终止符会让带体请求（注册/登录/上传）拿不到 body。 */
         char* buffer = nl_http_read_request_full(nlh_tls_recv_cb, tls,
+                                                 nlh_tls_write_cb, tls,
                                                  BUFFER_SIZE, NL_HTTPS_MAX_REQUEST,
                                                  &total);
         if (!buffer || total == 0) { free(buffer); break; }
 
-        nl_http_request_t req;
-        nl_http_response_t resp;
-        memset(&req, 0, sizeof(req));
-        memset(&resp, 0, sizeof(resp));
-        resp.status = 200;
+        /* 请求体超上限（64MiB）：回 413 关连接，不把截断数据当完整请求（v3.1.0） */
+        if (!nl_http_request_body_complete(buffer, total)) {
+            static const char r413[] = "HTTP/1.1 413 Request Entity Too Large\r\n"
+                                       "Connection: close\r\nContent-Length: 0\r\n\r\n";
+            nlh_tls_write_cb(tls, r413, sizeof(r413) - 1);
+            free(buffer);
+            break;
+        }
+
+        /* req/resp 头值已动态分配（结构体约 9KB）；保留堆分配（v3.1.0） */
+        nl_http_request_t* req = (nl_http_request_t*)malloc(sizeof(*req));
+        nl_http_response_t* resp = (nl_http_response_t*)malloc(sizeof(*resp));
+        if (!req || !resp) { free(req); free(resp); free(buffer); break; }
+        memset(req, 0, sizeof(*req));
+        memset(resp, 0, sizeof(*resp));
+        resp->status = 200;
         int parsed = 0;
 
-        if (nl_http_parse_request(&req, buffer, total) == 0) {
+        int parse_rc = nl_http_parse_request(req, buffer, total);
+        if (parse_rc == 0) {
             parsed = 1;
-            const char* conn_hdr = nl_http_request_get_header(&req, "Connection");
+            const char* conn_hdr = nl_http_request_get_header(req, "Connection");
             if (conn_hdr && strcasecmp(conn_hdr, "close") == 0) keep_alive = 0;
-            if (req.version == NL_HTTP_VERSION_1_0) {
-                const char* ka = nl_http_request_get_header(&req, "Keep-Alive");
+            if (req->version == NL_HTTP_VERSION_1_0) {
+                const char* ka = nl_http_request_get_header(req, "Keep-Alive");
                 if (!ka) keep_alive = 0;
             }
             if (handler) {
-                handler(&req, &resp, user_data);
+                handler(req, resp, user_data);
             } else {
-                nl_http_response_set_body(&resp,
+                nl_http_response_set_body(resp,
                     "<html><body><h1>Hello, NetLeaf HTTPS/1.1!</h1></body></html>", 58);
             }
+        } else if (parse_rc == -2) {
+            /* 头字段超限：回 431 关连接，不再静默截断（v3.1.0） */
+            keep_alive = 0;
+            resp->status = 431;
+            nl_http_response_set_header(resp, "Connection", "close");
+            nl_http_response_set_body(resp, "", 0);
         } else {
             keep_alive = 0;
         }
@@ -406,20 +459,24 @@ static void nlh_tls_h1_session(NL_HTTPS_TLS_CTX* tls,
         char* response_data = NULL;
         size_t response_len = 0;
         if (keep_alive && parsed)
-            nl_http_response_set_header(&resp, "Connection", "keep-alive");
-        nl_http_generate_response_http1(&resp, &response_data, &response_len);
+            nl_http_response_set_header(resp, "Connection", "keep-alive");
+        nl_http_generate_response_http1(resp, &response_data, &response_len);
         if (response_data && response_len > 0)
             nlh_tls_write_cb(tls, response_data, response_len); /* 循环部分写：mbedTLS 单次约 16KB 上限，只调一次会截断大响应 */
         free(response_data);
         /* 文件响应：头部已带 Content-Length，正文在此分块加密发出
          * （TLS 无法使用内核 TransmitFile 零拷贝） */
-        if (resp.file_path) {
-            nl_http_stream_file_chunks(resp.file_path, resp.file_size, nlh_tls_write_cb, tls);
-            free(resp.file_path);
-            resp.file_path = NULL;
+        if (resp->file_path) {
+            nl_http_stream_file_chunks(resp->file_path, resp->file_size, nlh_tls_write_cb, tls);
+            free(resp->file_path);
+            resp->file_path = NULL;
         }
-        if (resp.body) free(resp.body);
-        if (req.body) free(req.body);
+        if (resp->body) free(resp->body);
+        nl_http_headers_free(resp->headers, resp->header_count);
+        if (req->body) free(req->body);
+        nl_http_headers_free(req->headers, req->header_count);
+        free(req);
+        free(resp);
         free(buffer);
     }
 }

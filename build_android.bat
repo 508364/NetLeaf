@@ -16,7 +16,7 @@ REM Output: build-android\<abi>\stage-lib\  (libnetleaf*.so + public headers)
 REM ============================================================
 
 setlocal enabledelayedexpansion
-set "VERSION=3.0.1"
+set "VERSION=3.1.0"
 set "MIN_SDK=21"
 set "SRC_DIR=%~dp0"
 set "SRC_DIR=%SRC_DIR:~0,-1%"

@@ -1,6 +1,6 @@
 # 扩展示例 API 使用指南（extension_showcase）
 
-> 适用范围：NetLeaf `3.0.1` / NL 扩展系统 `NL_MODULE_VERSION = 3.0.1`
+> 适用范围：NetLeaf `3.1.0` / NL 扩展系统 `NL_MODULE_VERSION = 3.1.0`
 > 配套示例：[examples/extension_showcase/](../examples/extension_showcase/)
 > 相关文档：[扩展系统开发教程](extension_tutorial.md) · [插件开发指南](plugin_development.md)
 

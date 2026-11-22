@@ -1648,7 +1648,8 @@ typedef enum {
     NL_ROUTE_TYPE_CONTENT = 0,    // Static content (html/vue/json)
     NL_ROUTE_TYPE_FILE = 1,       // File-based (hot reload)
     NL_ROUTE_TYPE_REDIRECT = 2,   // HTTP 302 redirect
-    NL_ROUTE_TYPE_PROXY = 3       // Reverse proxy (upstream http/https/tcp)
+    NL_ROUTE_TYPE_PROXY = 3,      // Reverse proxy (upstream http/https/tcp)
+    NL_ROUTE_TYPE_DIR = 4         // 第203轮：目录/文件端点（端点即根）
 } nl_route_type_t;
 
 // 上游协议类型（反代使用）
@@ -1933,15 +1934,44 @@ static void pr_parse_upstream_bytes(nl_web_macos_engine_t* eng, int idx, const c
 }
 
 static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
-    // 路径匹配（剥离 query）在公共层实现，三端语义一致
-    // 第195轮：单遍扫描实现"精确 > 最长前缀"（nginx location 规则）——
-    // 精确命中立即返回；前缀命中只记录最长者，扫完再回填。
+    char lit[4096];                               // 字面 path（剥 query/fragment；引擎 path 缓冲 4096）
+    size_t ln = 0;
+    while (path[ln] && path[ln] != '?' && path[ln] != '#') ln++;
+    if (ln >= sizeof(lit)) ln = sizeof(lit) - 1;  // 超长截断 → 与 normalize ENOSPC 同为拒绝
+    memcpy(lit, path, ln);
+    lit[ln] = '\0';
+
     int idx = 0;
-    int best_idx = -1;
-    size_t best_len = 0;
+    int dir_idx = -1, best_idx = -1;
+    size_t dir_len = 0, best_len = 0;
     int has_best = 0;
     pthread_mutex_lock(&s->mutex);
+    // 第203轮：路径匹配三阶段（保持"精确 > 前缀"）：
+    //   ① 字面精确（剥 query、不解码不折叠）
+    //   ② DIR 字面前缀（最长优先，边界 = 下一字符 '/' 或结尾）—— 目录端点把
+    //      端点当根，"/web/../../x" 这类全局越根路径必须先按字面命中 /web
+    //      端点，再由公共层 clamp 解释，不能被 normalize 折叠成 /x 后错配
+    //   ③ 规范化匹配（nl_px_path_match 内部 normalize，精确 > 最长前缀；
+    //      DIR 路由不参与 —— 其前缀匹配由②带边界负责，避免 /webx 被 /web 吞掉）
+    // 命中优先级：精确 > DIR 前缀 > 其它前缀。
     for (nl_web_route_t* r = s->routes; r; r = r->next, idx++) {
+        if (strcmp(r->path, lit) == 0) {          // ① 字面精确
+            pthread_mutex_unlock(&s->mutex);
+            return idx;
+        }
+        if (r->type == NL_ROUTE_TYPE_DIR) {       // ② DIR 字面前缀
+            size_t plen = strlen(r->path);
+            if (ln >= plen && memcmp(r->path, lit, plen) == 0 &&
+                (lit[plen] == '\0' || lit[plen] == '/') &&
+                (dir_idx < 0 || plen > dir_len)) {
+                dir_len = plen;
+                dir_idx = idx;
+            }
+        }
+    }
+    idx = 0;
+    for (nl_web_route_t* r = s->routes; r; r = r->next, idx++) {
+        if (r->type == NL_ROUTE_TYPE_DIR) continue;       // ③ 排除 DIR（边界由②负责）
         if (nl_px_path_match(r->path, path)) {
             pthread_mutex_unlock(&s->mutex);
             return idx;
@@ -1956,6 +1986,7 @@ static int pr_lookup_route_idx(nl_web_server_t* s, const char* path) {
         }
     }
     pthread_mutex_unlock(&s->mutex);
+    if (dir_idx >= 0) return dir_idx;             // DIR 端点优先于其它前缀
     return has_best ? best_idx : -1;
 }
 
@@ -2124,6 +2155,12 @@ static int pr_local_lookup_macos(void* ctx, const char* path, nl_px_local_route*
         out->upstream = r->upstream;
         out->dir_prefix = r->is_prefix ? r->path : NULL;   // 第195轮：目录转发
         out->up_uri = r->up_uri;                           // 空=路径原样透传
+        break;
+    case NL_ROUTE_TYPE_DIR:
+        // 第203轮：目录/文件端点——端点即根，file_path 存磁盘根（目录或文件）
+        out->type = NL_PX_LOCAL_DIR;
+        out->file_path = r->file_path;
+        out->dir_prefix = r->path;
         break;
     default:
         ok = 0;
@@ -3058,19 +3095,22 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
 
     /* 第192轮：RFC 3986 端点规范化（剥 query/fragment、percent-decode、
      * dot-segment 归一）。路由查找与本地响应用 norm_path；代理转发
-     * （反代请求行 / TCP 透传）保留原始 path（含 query，字节原样）。 */
+     * （反代请求行 / TCP 透传）保留原始 path（含 query，字节原样）。
+     * 第203轮：normalize 失败不再立即拒绝 —— 可能是目录端点的越根 ".."
+     * （clamp 语义），先按字面查表；命中非 DIR 路由才按原规则 403/400。 */
     char norm_path[4096];
+    int norm_ok = 1;
+    int norm_uri_rc = NL_URI_OK;
     if (strcmp(path, "*") == 0) {
         norm_path[0] = '*';        /* OPTIONS *（RFC 7230 §7.1）：无路由，维持 404 */
         norm_path[1] = '\0';
     } else {
-        int uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
-        if (uri_rc != NL_URI_OK) {
-            int esc = (uri_rc == NL_URI_ESCAPES);
-            send_http_error(client, esc ? 403 : 400,
-                            esc ? "Forbidden" : "Bad Request");
-            close(client);
-            return;
+        norm_uri_rc = nl_uri_normalize(path, norm_path, sizeof(norm_path));
+        if (norm_uri_rc != NL_URI_OK) {
+            norm_ok = 0;
+            /* 用原始 path 继续查表（DIR 字面前缀可命中；normalize 失败的
+             * nl_px_path_match* 返回 0，不会误中其它路由） */
+            snprintf(norm_path, sizeof(norm_path), "%s", path);
         }
     }
 
@@ -3080,16 +3120,46 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
     if (!route) {
         // 第195轮：先精确 strcmp（hash 同款语义），未中再按最长前缀挑目录路由
         // ——"精确 > 最长前缀"与引擎路径 pr_lookup_route_idx 一致。
+        // 第203轮：DIR 路由单独按字面前缀（带边界）匹配，优先于其它前缀；
+        // 其规范化前缀匹配由 nl_px_path_match_prefix 内部 normalize 失败返回 0 排除。
+        // DIR 字面前缀必须试"原始 path 剥 query"—— norm 会吃掉端点前缀
+        // （"/web/../p" → "/p"），仅用 norm_path 匹配将漏掉 DIR 端点。
         nl_web_route_t* best = NULL;
         size_t best_len = 0;
+        nl_web_route_t* dir_best = NULL;
+        size_t dir_len = 0;
+        char lit[4096];
+        size_t ln = 0;
+        while (path[ln] && path[ln] != '?' && path[ln] != '#') ln++;
+        if (ln >= sizeof(lit)) ln = sizeof(lit) - 1;
+        memcpy(lit, path, ln);
+        lit[ln] = '\0';
         for (nl_web_route_t* r = server->routes; r; r = r->next) {
             if (strcmp(r->path, norm_path) == 0) { route = r; break; }
+            if (r->type == NL_ROUTE_TYPE_DIR) {
+                size_t plen = strlen(r->path);
+                if (ln >= plen && memcmp(r->path, lit, plen) == 0 &&
+                    (lit[plen] == '\0' || lit[plen] == '/') &&
+                    (!dir_best || plen > dir_len)) {
+                    dir_best = r; dir_len = plen;
+                }
+                continue;
+            }
             if (r->is_prefix && nl_px_path_match_prefix(r->path, norm_path)) {
                 size_t plen = strlen(r->path);
                 if (!best || plen > best_len) { best = r; best_len = plen; }
             }
         }
-        if (!route) route = best;
+        if (!route) route = dir_best ? dir_best : best;
+    }
+    if (!norm_ok && (!route || route->type != NL_ROUTE_TYPE_DIR)) {
+        /* 非法端点只有目录端点可 clamp 放行；未命中也按 400（与引擎 plan_build 同规则） */
+        int esc = (norm_uri_rc == NL_URI_ESCAPES);
+        pthread_mutex_unlock(&server->mutex);
+        send_http_error(client, esc ? 403 : 400,
+                        esc ? "Forbidden" : "Bad Request");
+        close(client);
+        return;
     }
     if (route) {
         if (route->type == NL_ROUTE_TYPE_REDIRECT) {
@@ -3139,6 +3209,41 @@ static void nl_handle_client(nl_web_server_t* server, int client) {
                 
                 send_http_response(client, route->content_type, file_content, read_size);
                 free(file_content);
+                close(client);
+                return;
+            }
+            else if (route->type == NL_ROUTE_TYPE_DIR) {
+                // 第203轮：目录/文件端点 —— 复用公共层 plan（端点即根、../ clamp、
+                // MIME 猜测、错误码映射均与引擎路径同一份实现）
+                pthread_mutex_unlock(&server->mutex);
+                int is_head = (strcmp(method, "HEAD") == 0);
+                nl_px_local_plan plan;
+                if (nl_px_local_plan_build(server, &g_pr_local_ops_macos, path,
+                                           is_head, &plan) != 1 || plan.head_len == 0) {
+                    send_http_error(client, 404, "Not Found");
+                    close(client);
+                    return;
+                }
+                if (write(client, plan.head, plan.head_len) < 0) {
+                    close(client);
+                    return;
+                }
+                if (plan.status == 200 && plan.type == NL_PX_LOCAL_FILE &&
+                    !is_head && plan.file_size > 0) {
+                    FILE* fp = fopen(plan.file_path, "rb");
+                    if (!fp) { close(client); return; }
+                    char chunk[65536];
+                    long long remain = plan.file_size;
+                    while (remain > 0) {
+                        size_t want = (remain > (long long)sizeof(chunk))
+                                      ? sizeof(chunk) : (size_t)remain;
+                        size_t got = fread(chunk, 1, want, fp);
+                        if (got == 0) break;
+                        if (write(client, chunk, got) < 0) break;
+                        remain -= (long long)got;
+                    }
+                    fclose(fp);
+                }
                 close(client);
                 return;
             }
@@ -4454,6 +4559,43 @@ int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upst
 int nl_web_add_proxy_dir(nl_web_server_t* server, const char* prefix, const char* upstream) {
     if (!prefix || prefix[0] != '/') return NL_EINVAL;   // 目录前缀必须是绝对路径
     return nl_web_add_proxy_common(server, prefix, upstream, 1);
+}
+
+// 第203轮：目录/文件端点 —— 端点即根。
+//   target 为目录：端点下任意路径映射到目录内（端点内 "../" 被 clamp 保持
+//     在该目录中，既不逃逸出端点目录，也不允许跳出端点前缀到达全局路径）；
+//   target 为文件：端点下任意请求都服务该文件（文件即根）。
+// 与 nl_web_add_html_file（精确 FILE 路由）的区别：后者按整条 URL 精确匹配，
+// 本 API 按前缀接管端点下所有子路径。
+int nl_web_add_dir(nl_web_server_t* server, const char* prefix, const char* target) {
+    if (!server || !prefix || !target || !target[0]) return NL_EINVAL;
+    if (prefix[0] != '/') return NL_EINVAL;               // 端点前缀必须是绝对路径
+
+    pthread_mutex_lock(&server->mutex);
+    nl_web_route_t* route = (nl_web_route_t*)calloc(1, sizeof(nl_web_route_t));
+    if (!route) {
+        pthread_mutex_unlock(&server->mutex);
+        return NL_ENOMEM;
+    }
+    // 前缀规范化：去尾部 '/'（"/web/" → "/web"），保证字面前缀匹配与
+    // pl_dir_resolve 的字面剥前缀一致；规范化后拒绝根 "/"（会吞掉所有路由）
+    snprintf(route->path, sizeof(route->path), "%s", prefix);
+    size_t pl = strlen(route->path);
+    while (pl > 1 && route->path[pl - 1] == '/') route->path[--pl] = '\0';
+    if (route->path[1] == '\0') {
+        free(route);
+        pthread_mutex_unlock(&server->mutex);
+        return NL_EINVAL;
+    }
+    snprintf(route->file_path, sizeof(route->file_path), "%s", target);  // 端点根（目录或文件）
+    route->type = NL_ROUTE_TYPE_DIR;
+    route->is_prefix = 1;                                // 前缀接管端点下子路径
+    route->next = server->routes;
+    server->routes = route;
+    nl_route_hash_insert_simple(server, route);
+    pthread_mutex_unlock(&server->mutex);
+    nl_log(NL_LOG_INFO, "Added dir endpoint: %s -> %s", route->path, route->file_path);
+    return NL_OK;
 }
 
 // Runtime route management APIs (v2.2.2)

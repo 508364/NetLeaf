@@ -2,7 +2,7 @@
   <img src="Logo.svg" width="72" height="72" alt="NetLeaf Logo">
   <h1>NetLeaf</h1>
   <p><b>NetLeaf</b> 是一个现代化的、高性能的跨平台网络库（Windows/Linux/macOS/Android），采用 <b>NL扩展系统</b> 架构。提供 TCP/UDP、HTTP/1.1 + HTTP/2、WebSocket、MQTT v5.0 协议支持，内置全异步 Web 引擎、TLS/SSL 加密、智能路由、多语言等扩展模块。</p>
-  <img src="https://img.shields.io/badge/NetLeaf-v3.0.1-blue?style=for-the-badge" alt="NetLeaf Version">
+  <img src="https://img.shields.io/badge/NetLeaf-v3.1.0-blue?style=for-the-badge" alt="NetLeaf Version">
   <img src="https://img.shields.io/badge/NL%E6%89%A9%E5%B1%95%E7%B3%BB%E7%BB%9F-Active-green?style=for-the-badge" alt="NL Extension System">
   <a href="https://github.com/Mbed-TLS/mbedtls"><img src="https://img.shields.io/badge/TLS-mbedTLS%202.28/3.6-brightgreen?style=for-the-badge" alt="mbedTLS"></a>
   <a href="https://mqttt.com"><img src="https://img.shields.io/badge/MQTT-5.0/3.1.1-yellow?style=for-the-badge" alt="MQTT v5.0/3.1.1"></a>
@@ -303,6 +303,14 @@ ctest --test-dir build --output-on-failure
 
 ## 更新日志
 
+### v3.1.0（2026-11-22）
+
+- **`nlh_*` HTTP 协议层修复**：补 `100 Continue` 握手（curl >1MB 上传白等 1s → 4MB 实测 23ms）；头字段超限（值 >4096B 规范上限 / 条目 >64）回 `431` 不再静默截断；请求体超 64MiB 总上限回 `413` 不再提前回 200 脏数据；修复请求头扫描漏掉最后一个头行（`Content-Length` 恒丢失）的连带缺陷
+- **`nlh_resp_file` 缺文件回 404**：文件不存在时立即 `404 + 空正文`（旧为 200+头 后 0 字节挂死，实测 655s）
+- **明文 HTTP 客户端**：`nlh_client_connect(host, port, NULL)` 支持不走 TLS 的明文路径；`nlh_client_request` 文档明确 `out_buf` 为原始响应并新增 `nlh_resp_body_offset()` 切割辅助
+- **`nlh_server_enable_tls` 防误用**：标记 deprecated 并在调用时输出运行时错误日志，提示改用 `nlh_tls_server_*`
+- **版本 3.1.0**；双平台 ctest 11/11 通过（新增 HttpFramesTest 边界用例组）
+
 ### v3.0.1（2026-11-21）
 
 - **统一日志系统**：三平台重复日志实现（各 ~120 行）下沉为单份平台无关核心 `src/common/nl_logsys.c`（净删约 360 行）；时间戳精确到毫秒、输出携带线程 ID、级别定宽对齐；新增文件落盘 + 按大小轮转（`nl_log_set_file` / `nl_log_close_file`）与级别查询（`nl_log_get_level`）；控制台输出按级别着色（遵循 `NO_COLOR`）；`http_tls` 裸 `fprintf` 收敛为 `nl_log_error`；新增回归测试 `LogSystemTest`（Windows/Linux 双平台 11/11 通过）
@@ -334,6 +342,7 @@ ctest --test-dir build --output-on-failure
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
+| 3.1.0 | 2026-11-22 | `nlh_*` HTTP 协议修复（100-continue、431 头超限、413 总上限、头扫描漏末行）；`nlh_resp_file` 缺文件回 404；明文 HTTP 客户端（`cfg=NULL`）与 `nlh_resp_body_offset` 响应切割；`nlh_server_enable_tls` deprecated 防误用 |
 | 3.0.1 | 2026-11-08 | LinkAgg 反向数据池（宿主主动拉取、超时重试、健康标记）；TLS2/TLS3 非阻塞异步模式；三平台共享核心 netleaf_linkagg_core.c；Windows 命名管道字节模式；修复 TLS 握手 INVALID_STATE；HTTP/2/HTTPS 大响应截断与流泄漏 OOM 修复、安卓后端独立化（2026-11-13）；跨协议反代 5 项缺陷修复、HPACK 容量更新解码、Linux/macOS worker 池改为 `nl_server_start_workers()` 显式启用（2026-11-15）；统一日志系统（毫秒时间戳/线程ID/颜色/文件轮转）、QUIC/H3 停止支持（2026-11-21） |
 | 3.0.0 | 2026-10-31 | Web 引擎全异步重构（sendfile 零拷贝、多实例、测试体系）；HTTP/2 补完；HTTPS/2；Windows 全 IOCP 化 + UDP 16 槽接收环；QUIC 拆出独立扩展 |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS 重构（`netleaf_https` 独立、tls2/tls3 拆分）；MQTT 默认开启；`nl_util` 公共工具层；H2/QUIC 帧补全；Android 构建支持 |

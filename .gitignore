@@ -105,3 +105,24 @@ site/
 *.bak
 /releases
 /build
+
+# Local build dirs (bench/test 编译输出，含 asan/tsan 变体)
+build_bench*/
+build_p11/
+build_quic/
+
+# Debug dumps（含密钥转储等敏感调试产物，禁止上传）
+dump/
+
+# Accidental artifacts
+44333
+devnull
+
+# Python
+__pycache__/
+*.pyc
+venv_*/
+
+# Packet captures & key dumps（抓包/密钥转储，禁止上传）
+*.bin
+test/aioquic_1rtt_secrets.txt

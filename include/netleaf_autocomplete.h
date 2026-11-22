@@ -26,12 +26,12 @@ extern "C" {
 #ifdef NL_VERSION
 #define NL_AUTOCOMPLETE_VERSION NL_VERSION
 #else
-#define NL_AUTOCOMPLETE_VERSION "3.0.1"
+#define NL_AUTOCOMPLETE_VERSION "3.1.0"
 #endif
 
 #define NL_AUTOCOMPLETE_VERSION_MAJOR 3
-#define NL_AUTOCOMPLETE_VERSION_MINOR 0
-#define NL_AUTOCOMPLETE_VERSION_PATCH 1
+#define NL_AUTOCOMPLETE_VERSION_MINOR 1
+#define NL_AUTOCOMPLETE_VERSION_PATCH 0
 
 // =========================================
 // Module Information

@@ -157,12 +157,36 @@ int nl_http_parse_request(nl_http_request_t* req, const char* data, size_t len) 
         }
 
         char* colon = strchr(line, ':');
-        if (colon && req->header_count < MAX_HEADERS) {
+        if (colon) {
+            /* v3.1.0：头字段超限（名字 ≥128B、值 >4096B、条目 >64）
+             * 不再静默截断/丢弃，返回 -2 让上层回 431（RFC 6585）。
+             * 值上限 4096 为规范要求；头值改为动态分配（第200轮）。 */
+            if (req->header_count >= MAX_HEADERS) {
+                free(buffer);
+                nl_http_headers_free(req->headers, req->header_count);
+                return -2;
+            }
             *colon = '\0';
-            snprintf(req->headers[req->header_count].name, MAX_HEADER_NAME, "%s", line);
             char* value = colon + 1;
             while (*value == ' ') value++;
-            snprintf(req->headers[req->header_count].value, MAX_HEADER_VALUE, "%s", value);
+            if (strlen(line) >= MAX_HEADER_NAME || strlen(value) > MAX_HEADER_VALUE) {
+                free(buffer);
+                nl_http_headers_free(req->headers, req->header_count);
+                return -2;
+            }
+            snprintf(req->headers[req->header_count].name, MAX_HEADER_NAME, "%s", line);
+            /* 按需分配头值（不再内嵌 4KB 缓冲，结构体从 270KB 回落到约 9KB） */
+            {
+                size_t vlen = strlen(value);
+                char* vbuf = (char*)malloc(vlen + 1);
+                if (!vbuf) {
+                    free(buffer);
+                    nl_http_headers_free(req->headers, req->header_count);
+                    return -1;
+                }
+                memcpy(vbuf, value, vlen + 1);
+                req->headers[req->header_count].value = vbuf;
+            }
             req->header_count++;
         }
 
@@ -243,6 +267,15 @@ void nl_http_generate_response_http1(nl_http_response_t* resp, char** out, size_
     *out_len = len;
 }
 
+/* nlh_client_request 的 out_buf 返回原始响应（状态行+头+\r\n\r\n+body），
+ * 本函数返回 body 起点偏移，供调用方切割；未找到头结束符返回 0。 */
+size_t nlh_resp_body_offset(const char* raw, size_t len) {
+    if (!raw || len < 4) return 0;
+    long t = nl_http_find_terminator(raw, len);
+    if (t < 0) return 0;
+    return (size_t)t + 4;
+}
+
 /* ============================================================
  * 传输无关的请求读取 / 文件流式发送
  *
@@ -276,7 +309,11 @@ static int nl_http_scan_request(const char* buf, size_t total, size_t* need_tota
     int has_len = 0;
     int chunked = 0;
 
-    const char* eoh = buf + (size_t)term;
+    /* eoh 指向最后一个头行的 \r\n 之后（term+2），而非 term：
+     * term 处是"最后一行的 \r"，其 \n 在 term+1。原先 eoh=buf+term 会让
+     * 最后一行（常见就是 Content-Length）的 \n 落在 memchr 范围之外而被
+     * 跳过——has_len 恒为 0、请求被提前判为完整（v3.1.0 修复）。 */
+    const char* eoh = buf + (size_t)term + 2;
     const char* p = buf;
     const char* eol = memchr(p, '\n', (size_t)(eoh - p));
     if (!eol) return -1;
@@ -324,7 +361,41 @@ int nl_http_request_body_complete(const char* buf, size_t total) {
     return nl_http_scan_request(buf, total, &need) == 1;
 }
 
+/* 请求头中是否带 "Expect: 100-continue"（大小写不敏感）。
+ * 用于在收 body 前先回 100 Continue，消除客户端上传前的白等。 */
+static int nl_http_expect_100(const char* buf, size_t total) {
+    long term = nl_http_find_terminator(buf, total);
+    if (term < 0) return 0;
+    /* 同 scan：eoh 需覆盖最后一个头行的 \n（term+1），否则最后一行漏扫 */
+    const char* eoh = buf + (size_t)term + 2;
+    const char* p = buf;
+    const char* eol = memchr(p, '\n', (size_t)(eoh - p));
+    if (!eol) return 0;
+    p = eol + 1;                      /* 跳过请求行 */
+    while (p < eoh) {
+        eol = memchr(p, '\n', (size_t)(eoh - p));
+        if (!eol) break;
+        size_t line_len = (size_t)(eol - p);
+        if (line_len && p[line_len - 1] == '\r') line_len--;
+        if (line_len == 0) break;
+        if (nl_http_ci_prefix(p, line_len, "Expect")) {
+            const char* colon = memchr(p, ':', line_len);
+            if (colon) {
+                const char* v = colon + 1;
+                const char* ve = p + line_len;
+                for (const char* q = v; q + 12 <= ve; q++) {
+                    if (nl_http_ci_prefix(q, (size_t)(ve - q), "100-continue"))
+                        return 1;
+                }
+            }
+        }
+        p = eol + 1;
+    }
+    return 0;
+}
+
 char* nl_http_read_request_full(nl_http_recv_fn recv_fn, void* ctx,
+                                nl_http_write_fn continue_cb, void* continue_ctx,
                                 size_t initial_cap, size_t max_cap,
                                 size_t* out_len) {
     if (out_len) *out_len = 0;
@@ -339,6 +410,7 @@ char* nl_http_read_request_full(nl_http_recv_fn recv_fn, void* ctx,
     size_t total = 0;
     size_t need = 0;
     int have_need = 0;
+    int cont_sent = 0;
     buf[0] = '\0';
 
     for (;;) {
@@ -373,10 +445,22 @@ char* nl_http_read_request_full(nl_http_recv_fn recv_fn, void* ctx,
         if (st == 1) break;          /* 完整请求 */
         if (st < 0) continue;        /* 头部未齐，继续读 */
 
-        /* 头部已齐但 body 不足：按 Content-Length 扩容后继续读 */
+        /* 头部已齐、body 未收满 */
         have_need = 1;
         need = next_need;
-        if (need > max_cap) break;   /* 超出上限：返回已读部分，不 OOM */
+        if (need > max_cap) break;   /* 超出上限：返回已读部分，由上层回 413 */
+
+        /* 客户端带 Expect: 100-continue 时先回 100 Continue，否则 curl 等
+         * 客户端会白等约 1s 才开始上传（v3.1.0）。超限请求不回 100，直接
+         * 走上层 413，避免无谓地收完超大 body。 */
+        if (!cont_sent) {
+            cont_sent = 1;
+            if (continue_cb && nl_http_expect_100(buf, total)) {
+                static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                (void)continue_cb(continue_ctx, cont, sizeof(cont) - 1);
+            }
+        }
+
         if (need > cap) {
             char* nb = (char*)realloc(buf, need);
             if (!nb) break;
@@ -1117,6 +1201,8 @@ static void h2_release_stream(struct nl_http2_connection* conn, struct nl_http2_
     if (*pp == stream) *pp = stream->next;
     if (stream->request.body) free(stream->request.body);
     if (stream->response.body) free(stream->response.body);
+    nl_http_headers_free(stream->request.headers, stream->request.header_count);
+    nl_http_headers_free(stream->response.headers, stream->response.header_count);
     free(stream);
 }
 
@@ -1291,8 +1377,16 @@ int h2_apply_header_block(struct nl_http2_connection* conn, struct nl_http2_stre
             } else if (name[0] != '\0' && name[0] != ':') {
                 if (stream->request.header_count < MAX_HEADERS) {
                     snprintf(stream->request.headers[stream->request.header_count].name, MAX_HEADER_NAME, "%s", name);
-                    snprintf(stream->request.headers[stream->request.header_count].value, MAX_HEADER_VALUE, "%s", value);
-                    stream->request.header_count++;
+                    /* 头值按需动态分配（第200轮，与 H1 解析一致） */
+                    {
+                        size_t vlen = strlen(value);
+                        char* vbuf = (char*)malloc(vlen + 1);
+                        if (vbuf) {
+                            memcpy(vbuf, value, vlen + 1);
+                            stream->request.headers[stream->request.header_count].value = vbuf;
+                            stream->request.header_count++;
+                        }
+                    }
                 }
             }
         } else {
@@ -1383,13 +1477,17 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
             }
 
             if (handler) {
-                nl_http_response_t resp = {0};
-                resp.status = 200;
-                handler(&stream->request, &resp, user_data);
-                h2_send_headers(io, fd, conn, stream, &resp);
+                /* resp 约 9KB（头值已动态分配），保留堆分配（v3.1.0） */
+                nl_http_response_t* resp = (nl_http_response_t*)calloc(1, sizeof(*resp));
+                if (!resp) break;
+                resp->status = 200;
+                handler(&stream->request, resp, user_data);
+                h2_send_headers(io, fd, conn, stream, resp);
 
-                if (resp.body) free(resp.body);
-                if (resp.file_path) free(resp.file_path);
+                if (resp->body) free(resp->body);
+                if (resp->file_path) free(resp->file_path);
+                nl_http_headers_free(resp->headers, resp->header_count);
+                free(resp);
             }
             break;
         }
@@ -1431,12 +1529,16 @@ int h2_process_frame(struct nl_http_io* io, nl_http_handle_t fd, struct nl_http2
             conn->pending_headers_stream = 0;
 
             if (handler) {
-                nl_http_response_t resp = {0};
-                resp.status = 200;
-                handler(&stream->request, &resp, user_data);
-                h2_send_headers(io, fd, conn, stream, &resp);
-                if (resp.body) free(resp.body);
-                if (resp.file_path) free(resp.file_path);
+                /* resp 约 9KB（头值已动态分配），保留堆分配（v3.1.0） */
+                nl_http_response_t* resp = (nl_http_response_t*)calloc(1, sizeof(*resp));
+                if (!resp) break;
+                resp->status = 200;
+                handler(&stream->request, resp, user_data);
+                h2_send_headers(io, fd, conn, stream, resp);
+                if (resp->body) free(resp->body);
+                if (resp->file_path) free(resp->file_path);
+                nl_http_headers_free(resp->headers, resp->header_count);
+                free(resp);
             }
             break;
         }
@@ -1611,6 +1713,8 @@ void h2_connection_cleanup(struct nl_http2_connection* conn) {
         struct nl_http2_stream* next = stream->next;
         if (stream->request.body) free(stream->request.body);
         if (stream->response.body) free(stream->response.body);
+        nl_http_headers_free(stream->request.headers, stream->request.header_count);
+        nl_http_headers_free(stream->response.headers, stream->response.header_count);
         free(stream);
         stream = next;
     }
@@ -1634,6 +1738,14 @@ nl_http_version_t nl_http_request_get_version(const nl_http_request_t* req) {
 const char* nl_http_request_get_path(const nl_http_request_t* req) {
     if (!req) return NULL;
     return req->path;
+}
+
+NL_HTTP_INT_API void nl_http_headers_free(struct nl_http_header* headers, int count) {
+    if (!headers) return;
+    for (int i = 0; i < count; i++) {
+        free(headers[i].value);
+        headers[i].value = NULL;
+    }
 }
 
 const char* nl_http_request_get_header(const nl_http_request_t* req, const char* name) {
@@ -1663,8 +1775,14 @@ void nl_http_response_set_status(nl_http_response_t* resp, int status) {
 void nl_http_response_set_header(nl_http_response_t* resp, const char* name, const char* value) {
     if (!resp || !name || !value || resp->header_count >= MAX_HEADERS) return;
 
+    /* 头值按需动态分配（第200轮），超 4096 规范上限或 OOM 则丢弃该头 */
+    if (strlen(value) > MAX_HEADER_VALUE) return;
+    char* vbuf = (char*)malloc(strlen(value) + 1);
+    if (!vbuf) return;
+
     snprintf(resp->headers[resp->header_count].name, MAX_HEADER_NAME, "%s", name);
-    snprintf(resp->headers[resp->header_count].value, MAX_HEADER_VALUE, "%s", value);
+    memcpy(vbuf, value, strlen(value) + 1);
+    resp->headers[resp->header_count].value = vbuf;
     resp->header_count++;
 }
 
@@ -1703,6 +1821,18 @@ void nl_http_response_set_file(nl_http_response_t* resp, const char* path, size_
         resp->file_size = 0;
         return;
     }
+
+    /* v3.1.0：文件不存在/不可读时不再回 200+头 然后 0 字节挂死，
+     * 改为 404 + 空正文，客户端立即得到确定的错误响应。 */
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        resp->file_size = 0;
+        resp->status = 404;
+        nl_http_response_set_body(resp, "", 0);
+        return;
+    }
+    fclose(f);
+
     resp->file_path = (char*)malloc(strlen(path) + 1);
     if (resp->file_path) {
         strcpy(resp->file_path, path);

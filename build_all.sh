@@ -13,7 +13,7 @@
 # ============================================================
 set -uo pipefail
 
-VERSION="3.0.1"
+VERSION="3.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
@@ -124,7 +124,7 @@ build_arch() {
     local cmake_args=(
         "-DCMAKE_BUILD_TYPE=Release"
         "-DBUILD_SHARED_LIBS=ON"
-        "-DBUILD_EXAMPLES=ON"
+        "-DBUILD_EXAMPLES=OFF"
         "-DBUILD_TESTS=OFF"
         "-DBUILD_TLS=OFF"
         "-DBUILD_TLS3=ON"
@@ -163,30 +163,113 @@ build_arch() {
     return 0
 }
 
-# 打包该架构产物（库 + 公共头文件）
+# 打包该架构产物（目录结构 v3.1.0：
+#   <包根>/LICENSE、README*.md、netleaf.pc
+#   <包根>/lib/bin/     共享库（不打包 .a 静态库）
+#   <包根>/lib/cmake/NetLeaf/  CMake package config
+#   <包根>/include/     公共头文件（平铺，含原 optimize/ 下头文件）
+#   包内含顶层目录 NetLeaf-<版本>-linux-<arch>/）
 package_arch() {
     local arch="$1"
     local name="${ARCH_NAME[$arch]:-$arch}"
     local arch_dir="${BUILD_DIR}/linux_${arch}"
-    local pkg_tmp="${arch_dir}/pkg_tmp"
-    local out="${RELEASES_DIR}/NetLeaf-${VERSION}-linux-${arch}.tar.gz"
+    local pkg_root="${arch_dir}/pkg_tmp"
+    local pkg_name="NetLeaf-${VERSION}-linux-${arch}"
+    local pkg="${pkg_root}/${pkg_name}"
+    local out="${RELEASES_DIR}/${pkg_name}.tar.gz"
 
-    rm -rf "${pkg_tmp}"
-    mkdir -p "${pkg_tmp}"
+    rm -rf "${pkg_root}"
+    mkdir -p "${pkg}/lib/bin" "${pkg}/include"
     shopt -s nullglob
-    local f
-    for f in "${arch_dir}"/lib/*.so "${arch_dir}"/lib/*.so.* "${arch_dir}"/lib/*.a; do
-        cp -f "$f" "${pkg_tmp}/" 2>/dev/null || true
+    local f base name
+    # 第200轮：符号链接不入包——只取真实文件，跳过 .so / .so.N 链接，
+    # 主文件 .so.<版本号> 去掉版本后缀重命名为 .so
+    # （如 libnetleaf.so.3.1.0 → libnetleaf.so、libnetleaf_mqtt.so.3.1.0 → libnetleaf_mqtt.so）。
+    # 只打包共享库，.a 静态库（mbedtls/p256m 等）不再入包。
+    for f in "${arch_dir}"/lib/*.so "${arch_dir}"/lib/*.so.*; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        base="$(basename "$f")"
+        if [[ "$base" == *.so.* ]]; then
+            name="${base%%.so.*}.so"      # 去掉 .so.<版本号> 后缀
+        else
+            name="$base"
+        fi
+        cp -f "$f" "${pkg}/lib/bin/${name}" || true
     done
-    for f in "${SCRIPT_DIR}"/include/*.h; do
-        cp -f "$f" "${pkg_tmp}/" 2>/dev/null || true
+    # 第200轮方案1：库名去版本后，用 patchelf 同步 SONAME / NEEDED / RUNPATH。
+    # 不同步则扩展的 NEEDED 仍是 libnetleaf.so.3，包内已无此文件，干净机器上
+    # 扩展加载必失败；RUNPATH 原为构建机绝对路径，一并改为 $ORIGIN（同目录），
+    # 包解压到任意位置均可自洽使用。系统库（libc.so.6 等）不在包内，映射目标
+    # 不存在即跳过，不受影响。
+    if command -v patchelf >/dev/null 2>&1; then
+        local dep newdep sn
+        for f in "${pkg}"/lib/bin/*.so; do
+            [[ -f "$f" && ! -L "$f" ]] || continue
+            sn="$(patchelf --print-soname "$f" 2>/dev/null || true)"
+            if [[ -n "$sn" && "$sn" == *.so.* ]]; then
+                newdep="${sn%%.so.*}.so"
+                if [[ -f "${pkg}/lib/bin/${newdep}" ]]; then
+                    patchelf --set-soname "$newdep" "$f"
+                fi
+            fi
+            for dep in $(patchelf --print-needed "$f" 2>/dev/null); do
+                if [[ "$dep" == *.so.* ]]; then
+                    newdep="${dep%%.so.*}.so"
+                    if [[ "$newdep" != "$dep" && -f "${pkg}/lib/bin/${newdep}" ]]; then
+                        patchelf --replace-needed "$dep" "$newdep" "$f"
+                    fi
+                fi
+            done
+            patchelf --set-rpath '$ORIGIN' "$f"
+        done
+    else
+        # 回退（环境无 patchelf）：无法改写 SONAME/NEEDED，改为按源文件的原
+        # SONAME 在包内补建相对符号链接（如 libnetleaf.so.3 → libnetleaf.so），
+        # 使扩展的 NEEDED 与主程序链接时记录的 SONAME 仍能解析到主文件，
+        # 防止用本包编译/运行时加载失败。RUNPATH 仍为构建机路径，
+        # 使用时需以 LD_LIBRARY_PATH 指向包内 lib/bin。
+        echo "[WARN] patchelf 未安装：改用 SONAME 符号链接回退（安装 patchelf 可获得完全自洽的包）"
+        if command -v readelf >/dev/null 2>&1; then
+            local srcf sn
+            for srcf in "${arch_dir}"/lib/*.so "${arch_dir}"/lib/*.so.*; do
+                [[ -f "$srcf" && ! -L "$srcf" ]] || continue
+                base="$(basename "$srcf")"
+                if [[ "$base" == *.so.* ]]; then name="${base%%.so.*}.so"; else name="$base"; fi
+                sn="$(readelf -d "$srcf" 2>/dev/null | grep '(SONAME)' | grep -o '\[[^]]*\]' | head -n1)"
+                sn="${sn#\[}"
+                sn="${sn%\]}"
+                if [[ -n "$sn" && "$sn" != "$name" && -f "${pkg}/lib/bin/${name}" && ! -e "${pkg}/lib/bin/${sn}" ]]; then
+                    ln -s "$name" "${pkg}/lib/bin/${sn}"
+                fi
+            done
+        else
+            echo "[WARN] readelf 不可用，无法创建 SONAME 符号链接回退"
+        fi
+    fi
+    # 公共头文件平铺到 include/（原 include/optimize/ 下的头文件也平铺进来，
+    # 包内头文件互相包含均为同目录引号包含，平铺后依然可用）
+    for f in "${SCRIPT_DIR}"/include/*.h "${SCRIPT_DIR}"/include/optimize/*.h; do
+        cp -f "$f" "${pkg}/include/" 2>/dev/null || true
     done
-    # 子目录头文件（include/optimize）需保留相对路径
-    cp -rf "${SCRIPT_DIR}"/include/optimize "${pkg_tmp}/" 2>/dev/null || true
+    # 说明文档与许可证
+    for f in README.md README_EN.md LICENSE; do
+        cp -f "${SCRIPT_DIR}/${f}" "${pkg}/" 2>/dev/null || true
+    done
+    # pkg-config（放包根，prefix=${pcfiledir} 相对定位）
+    if [[ -f "${arch_dir}/pkgmeta/netleaf.pc" ]]; then
+        cp -f "${arch_dir}/pkgmeta/netleaf.pc" "${pkg}/"
+    fi
+    # CMake package config（放 lib/cmake/NetLeaf/，find_package 可直接定位包根）
+    if [[ -f "${arch_dir}/pkgmeta/NetLeafConfig.cmake" ]]; then
+        mkdir -p "${pkg}/lib/cmake/NetLeaf"
+        cp -f "${arch_dir}/pkgmeta/NetLeafConfig.cmake" \
+              "${arch_dir}/pkgmeta/NetLeafConfigVersion.cmake" \
+              "${pkg}/lib/cmake/NetLeaf/"
+    fi
     shopt -u nullglob
 
-    tar -czf "${out}" -C "${pkg_tmp}" . 2>/dev/null || true
-    rm -rf "${pkg_tmp}"
+    tar -czf "${out}" -C "${pkg_root}" "${pkg_name}" 2>/dev/null || true
+    rm -rf "${pkg_root}"
     echo -e "${GREEN}[Pack] ${out}${NC}"
 }
 

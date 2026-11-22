@@ -13,10 +13,10 @@
 #include "netleaf_module.h"
 
 // Version macros
-#define NETLEAF_VERSION "3.0.1"
+#define NETLEAF_VERSION "3.1.0"
 #define NETLEAF_VERSION_MAJOR 3
-#define NETLEAF_VERSION_MINOR 0
-#define NETLEAF_VERSION_PATCH 1
+#define NETLEAF_VERSION_MINOR 1
+#define NETLEAF_VERSION_PATCH 0
 
 // Network types
 typedef enum {
@@ -1057,6 +1057,28 @@ NL_API int nl_web_add_proxy(nl_web_server_t* server, const char* path, const cha
  * @see nl_web_add_proxy
  */
 NL_API int nl_web_add_proxy_dir(nl_web_server_t* server, const char* prefix, const char* upstream);
+
+/**
+ * @brief Add a directory/file endpoint — 端点即根（第203轮）
+ * @param server Web server handle
+ * @param prefix URL 端点前缀，必须以 '/' 开头且不能为根 "/"（e.g. "/web"）；
+ *               尾部 '/' 会被去掉（"/web/" 与 "/web" 等价）。
+ * @param target 磁盘目录或文件的绝对/相对路径。
+ * @details 端点下任意路径映射到 target，**target 在端点看来就是根目录**：
+ *          - target 为目录：端点 /web 指向 ~/net/web 后，对 /web 而言
+ *            ~/net/web 即 / 根，`../` 相对端点根解释并被 clamp ——
+ *            `/web/../../x` 等价于端点内 `/x`，既不逃逸出端点目录，
+ *            也不允许通过 `../` 跳出端点前缀到达全局路径；
+ *          - target 为文件：端点下任意请求都服务该文件（文件即根）。
+ *          目录请求无文件时按扩展名猜 Content-Type，目录以 '/' 结尾时
+ *          查找 index.html。命中规则：精确匹配 > DIR 端点前缀 > 其它前缀。
+ *          与 nl_web_add_html_file（整条 URL 精确匹配的 FILE 路由）不同，
+ *          本 API 按前缀接管端点下所有子路径。
+ * @return NL_OK on success, NL_EINVAL（prefix/target 非法或为根 "/"）/
+ *         NL_ENOMEM on error
+ * @see nl_web_add_html_file
+ */
+NL_API int nl_web_add_dir(nl_web_server_t* server, const char* prefix, const char* target);
 
 /**
  * @brief Enable or disable automatic encoding handling

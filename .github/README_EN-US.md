@@ -177,11 +177,11 @@ BSD 3-Clause License
 
 ## Version
 
-3.0.1
+3.1.0
 
 ## Optional Modules
 
-The following modules are separated from the main NetLeaf library, sharing the same version number (v3.0.1) and built together by default.
+The following modules are separated from the main NetLeaf library, sharing the same version number (v3.1.0) and built together by default.
 
 ### 1. Auto-complete Module (netleaf_autocomplete)
 

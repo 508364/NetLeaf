@@ -31,6 +31,7 @@ struct sockaddr;
 #define NL_PX_LOCAL_FILE      1
 #define NL_PX_LOCAL_REDIRECT  2
 #define NL_PX_LOCAL_PROXY     3
+#define NL_PX_LOCAL_DIR       4   /* 第203轮：目录/文件端点（端点即根） */
 
 /* 上游协议（仅 PROXY 有效） */
 #define NL_PX_LOCAL_PROTO_HTTP   0
@@ -52,7 +53,9 @@ typedef struct nl_px_local_route {
     const char* content;       /* CONTENT：内容（不要求 NUL 结尾，见 content_len） */
     size_t content_len;        /* CONTENT：0 表示用 strlen(content) */
     const char* content_type;  /* CONTENT/FILE：MIME，空则 application/octet-stream */
-    const char* file_path;     /* FILE：磁盘路径 */
+    const char* file_path;     /* FILE：磁盘路径；DIR：端点根（目录或文件） */
+    /* 第203轮：DIR 端点 —— file_path 为磁盘根（目录或文件），dir_prefix
+     * 为 URL 端点前缀（如 "/web"）。端点内 "../" 按端点根 clamp 解释。 */
     const char* redirect_url;  /* REDIRECT：Location */
     const char* upstream;      /* PROXY：host:port（IPv6 可写 [::1]:8080） */
     /* 第195轮：目录转发（nginx proxy_pass URI 拼接）。dir_prefix 非空=前缀路由；
@@ -81,8 +84,10 @@ typedef struct nl_px_local_plan {
     size_t head_len;
     const char* body;        /* CONTENT：路由内容（借用，不拥有） */
     size_t body_len;
-    const char* file_path;   /* FILE：磁盘路径 */
-    long long file_size;     /* FILE：字节数 */
+    /* 第203轮：改内嵌数组 —— plan 会整体 memcpy 进延迟发送上下文，
+     * 指针指向栈缓冲会悬空；DIR 解析结果（绝对路径）在栈上生成必须拷贝。 */
+    char file_path[1024];    /* FILE/DIR：磁盘路径（拷贝，非借用） */
+    long long file_size;     /* FILE/DIR：字节数 */
 } nl_px_local_plan;
 
 /*

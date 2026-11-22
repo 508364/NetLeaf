@@ -1,5 +1,60 @@
 # NetLeaf 版本历史
 
+## v3.1.0（2026-11-22）
+
+### 目录/文件端点（第203轮）
+
+- 新增 `nl_web_add_dir(server, prefix, target)`：把 URL 前缀注册为**端点**，端点指向磁盘**目录或文件**，目标即端点眼中的根目录——`/web` 指向 `~/net/web` 时，对该端点而言 `~/net/web` 就是 `/`，`../` 上跳也保持在该目录内（越根 `..` 忽略不逃逸）
+- 路由类型新增 `NL_ROUTE_TYPE_DIR`（三平台 `nl_route_t` 与公共层 `NL_PX_LOCAL_DIR`），结构零新增字段：`path` 存端点前缀、`file_path` 存磁盘根、`is_prefix=1`
+- **三阶段路由查找**：① 字面精确（剥 query 不解码）→ ② DIR 字面前缀（最长优先，边界必须是 `/` 或结尾，`/web` 不吞 `/webx`）→ ③ 规范化匹配；优先级 精确 > DIR 前缀 > 其它前缀
+- **公共层 lookup 统一改传原始 path**（`nl_px_local_dispatch` / `nl_px_local_plan_build`）：规范化会吃掉端点前缀（`/web/../p` → `/p`），否则 DIR 字面前缀无法命中；`norm_ok` 降级为校验信号——未命中且规范化失败仍 400/404，命中 DIR 则放行进端点内 clamp
+- **端点内 clamp 规范化** `nl_uri_normalize_clamp`（`nl_uri.c/.h`）：与全局 `nl_uri_normalize` 同源，`clamp=1` 时越根 `..` 忽略不报 `ESCAPES`；配合 `%` 重编码防双重解码、`nl_uri_resolve_file` realpath 二次校验
+- **端点指向文件**：端点即该文件，任意余段（`/single/anything/deep?x=1`）均服务此文件
+- **错误映射**：端点根下目标不存在 → 404（`PL_DIR_ENOENT`）；`ESCAPES/EROOT` → 403；ENOSPC → 500；其余规范化错误 → 400
+- **注册约定**：前缀去尾 `/`（`/web/` → `/web`）、拒绝根 `/` 与非绝对前缀（防吞掉所有路由）；DIR 路由不参与第③阶段规范化匹配
+- **legacy 同步发送路径**（三平台 `nl_handle_client`，`NETLEAF_LEGACY_WORKER_POOL` 下才编译）：normalize 失败改为延迟拒绝（记 `norm_ok` 用原始 path 继续查表）、hash 未命中回退中 DIR 单独按原始 path 字面前缀匹配且优先于其它前缀、命中后复用 `nl_px_local_plan_build` 同步发文件体
+- 测试：`test_web_engine.c` 新增 `case_dir_endpoint`（13 项断言：目录根 index、端点内文件/子目录、`/d/../page.html` 与 `/d/../../page.html` clamp 200、越界 `../` 拿端点外诱饵文件 404 且无泄露、文件端点任意余段、`/dx` 不被 `/d` 吞、404、HEAD 无 body、非法端点注册被拒）
+- 实测：Windows mingw x64 与 Linux（WSL）双平台构建通过，ctest **11/11** 全绿
+
+### HTTP 客户端/服务端缺陷修复（第196轮）
+
+- `nlh_client_connect` 支持明文 HTTP：`cfg=NULL` 时走非 TLS 路径，不再误报失败
+- 修复 64MiB 请求体上限提前约 200 字节判定完成（请求体没收完就回包）的问题
+- 新增 `Expect: 100-continue`（100 Continue）支持
+- 请求头单个值 1023 字节静默截断 → 按需扩容，超限返回 431（第199轮微调为规范上限 4096）
+- `nlh_resp_file` 文件不存在时返回 404，不再返回 200 且连接挂死
+- `nlh_server_enable_tls` 桩函数误用风险：补导出符号警告与文档说明
+- `nlh_client_request` 输出缓冲区响应切割行为补充说明/辅助
+
+### 头值上限微调与栈占用治理（第199轮，第200轮修正）
+
+- `MAX_HEADER_VALUE` 按规范从 1024 调整为 **4096**，超限回 431 不截断；`quic_h3_legacy.c` 同名宏同步
+- 第199轮曾将 `headers[64]×4097B` 整体作为内嵌缓冲（结构体膨胀至约 270KB）并把六个平台服务循环/H2 回包处的 req/resp 改为堆分配；**第200轮澄清修正**：头值缓冲不再内嵌，改为**按需 `malloc(strlen+1)` 动态分配**（`struct nl_http_header.value` 由数组改为 `char*`），结构体回落到约 9KB，4096 仅作为超限判定值
+- 新增释放契约 `nl_http_headers_free()`（`NL_HTTP_INT_API` 导出）：所有 req/resp/stream 销毁前统一释放已分配头值；覆盖六个平台服务循环、H2 两处 resp、H2 流销毁、QUIC/H3 流与回包处（quic 扩展为自包含副本，布局与释放逻辑同步）；HPACK 动态表结构保持不变
+
+### 预构建包库命名与依赖自洽修正（第201轮）
+
+- Linux/macOS 预构建包**不再收录符号链接**：只取真实文件，主文件去版本号重命名为单一名（`libnetleaf.so.3.1.0` → `libnetleaf.so`、`libnetleaf.3.1.0.dylib` → `libnetleaf.dylib`），取代第197轮的 `cp -Pf` 保链接方案
+- Linux 打包用 patchelf 同步包内所有库的 **SONAME / NEEDED / RUNPATH**（NEEDED `libnetleaf.so.3` → `libnetleaf.so`、系统库不动、RUNPATH 改 `$ORIGIN`），否则扩展在干净机器上按旧 SONAME 找不到主库
+- **patchelf 缺失回退**：按源文件原 SONAME 在包内补建相对符号链接（`libnetleaf.so.3` → `libnetleaf.so` 等），保证用本包编译 `-lnetleaf` 与运行时 NEEDED 解析不失败（此时 RUNPATH 仍为构建机路径，使用需 `LD_LIBRARY_PATH` 指向包内 `lib/bin`）；回退路径已实测：纯净环境 ldd/dlopen、带符号引用的编译+运行均通过
+- macOS 对称修正：用 `install_name_tool` 把包内 dylib 的 **id 与依赖引用**统一改写为 `@rpath/<无版本名>`（含构建机绝对路径引用），系统库自动跳过；工具解析兼容 macOS 主机裸名与 osxcross `<triplet>-` 前缀
+- 实测：Linux/ macOS x86_64 打包（有 patchelf/install_name_tool 时）包内 0 符号链接；Linux 纯净环境（`env -i`）ldd/dlopen 扩展通过，无 `LD_LIBRARY_PATH` 时靠 `$ORIGIN` 亦可加载；无 patchelf 回退包亦通过 ldd/dlopen/编译+运行验证
+
+### 版本与构建（第197轮）
+
+- 全部构建脚本版本号统一为 3.1.0（Linux/macOS/Windows MSVC/Windows LLVM-MinGW/Android）
+- 两个演示程序（example_server / example_extension）改为可选且默认关闭：`BUILD_EXAMPLES=OFF`（CMake 默认值及所有构建脚本、wiki 文档同步）
+- Linux/macOS 预构建包符号链接去重：`cp -f` 改为 `cp -Pf`，`libnetleaf.so` / `.so.N` / `.so.N.N.N` 三份相同内容不再重复占空间（zip 无此问题，Windows 不受影响；**第201轮起改为不收链接 + 主文件重命名 + 依赖同步，见上节**）
+- 预构建包目录结构重排，包内含顶层目录 `NetLeaf-<版本>-<平台>-<arch>/`：
+  - 根：README.md、README_EN.md、LICENSE、netleaf.pc
+  - `lib/bin/`：共享库（**`.a` 静态库不再入包**）
+  - `lib/cmake/NetLeaf/`：CMake package config
+  - `include/`：公共头文件平铺（原 `include/optimize/` 下头文件一并平铺）
+- 新增 pkg-config 与 CMake 包配置生成与分发：
+  - `cmake/netleaf.pc.in` → 构建时生成 `netleaf.pc`，打包到包根（`prefix=${pcfiledir}` 相对定位，`PKG_CONFIG_PATH=<包根> pkg-config --cflags --libs netleaf`；`libdir=${prefix}/lib/bin`、`includedir=${prefix}/include`）
+  - `cmake/NetLeafConfig.cmake.in` + `write_basic_package_version_file` → 生成 `NetLeafConfig.cmake` / `NetLeafConfigVersion.cmake`，打包到 `lib/cmake/NetLeaf/`（`CMAKE_PREFIX_PATH=<包根> find_package(NetLeaf REQUIRED)`，提供 `NetLeaf::netleaf` 及各扩展导入目标）
+  - 生成逻辑位于根 `CMakeLists.txt`（输出到 `<build>/pkgmeta/`），各平台打包脚本自动收录
+
 ## v3.0.1（2026-11-21）
 
 ### 统一日志系统升级

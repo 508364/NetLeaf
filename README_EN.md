@@ -1,6 +1,6 @@
 <img src="Logo.svg" width="40" height="40" align="left">
 
-# NetLeaf v3.0.1
+# NetLeaf v3.1.0
 
 High-performance cross-platform network library (Windows/Linux/macOS/Android) built on the **NL Extension System**. Supports TCP/UDP, HTTP/1.1 + HTTP/2, WebSocket, and MQTT v5.0, with a fully asynchronous web engine, TLS/SSL encryption, smart routing, and multi-language extensions.
 
@@ -227,6 +227,14 @@ Registered suites: `ModulesTest` / `FullTest` / `VariableSubstitutionTest` / `Al
 
 Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Features, API Reference, Examples, Troubleshooting, plus TLS/MQTT/Vue/IPC/Lang/LinkAgg/Extension topics). Full changelog: [CHANGELOG.md](CHANGELOG.md).
 
+## What's New in v3.1.0 (2026-11-22)
+
+- **`nlh_*` HTTP protocol fixes**: added the `100 Continue` handshake (curl uploads >1MB no longer idle-wait 1s — 4MB measured 23ms); oversized header fields (value >4096B per spec / >64 entries) now get `431` instead of silent truncation; requests over the 64MiB total limit get a clean `413` instead of an early corrupt `200`; fixed request-header scanning skipping the last header line (`Content-Length` was always missed)
+- **`nlh_resp_file` returns 404 on missing files**: immediate `404 + empty body` (previously `200 + headers` then 0-byte hang, measured 655s)
+- **Plaintext HTTP client**: `nlh_client_connect(host, port, NULL)` now works without TLS; `nlh_client_request` documents `out_buf` as the raw response and a new `nlh_resp_body_offset()` helper splits off the body
+- **`nlh_server_enable_tls` misuse guard**: marked deprecated and logs a runtime error pointing to `nlh_tls_server_*`
+- **Version 3.1.0**; ctest 11/11 on both platforms (new HttpFramesTest boundary case group)
+
 ## What's New in v3.0.1 (2026-11-21)
 
 - **Unified logging**: the three per-platform logging copies (~120 lines each) merged into one platform-independent core `src/common/nl_logsys.c` (~360 lines removed); millisecond timestamps, thread IDs, padded level fields; new file sink with size-based rotation (`nl_log_set_file` / `nl_log_close_file`) and level query (`nl_log_get_level`); per-level ANSI colors on consoles (honors `NO_COLOR`); bare `fprintf` calls in `http_tls` now go through `nl_log_error`; new regression test `LogSystemTest` (11/11 on both Windows and Linux)
@@ -256,6 +264,7 @@ Full documentation lives in [wiki/](wiki/Home.md) (Quickstart, Installation, Fea
 
 | Version | Date | Highlights |
 | --- | --- | --- |
+| 3.1.0 | 2026-11-22 | `nlh_*` HTTP protocol fixes (100-continue, 431 oversized headers, 413 total limit, last-header scan); `nlh_resp_file` 404 on missing file; plaintext HTTP client (`cfg=NULL`) + `nlh_resp_body_offset` response splitter; deprecated `nlh_server_enable_tls` misuse guard |
 | 3.0.1 | 2026-11-08 | LinkAgg reverse data pool (host pulls, timeout retry, health marking); TLS2/TLS3 non-blocking async; shared core `netleaf_linkagg_core.c`; Windows named pipes byte mode; TLS handshake INVALID_STATE fix; HTTP/2/HTTPS large-response truncation & stream-leak OOM fixes, Android backend split-out (2026-11-13); cross-protocol reverse-proxy fixes, HPACK capacity-update decoding, Linux/macOS worker pool now gated behind `nl_server_start_workers()` (2026-11-15); unified logging (ms timestamps/thread IDs/colors/file rotation), QUIC/H3 discontinued (2026-11-21) |
 | 3.0.0 | 2026-10-31 | Async web engine (sendfile zero-copy, multi-instance, test suite); HTTP/2 completion; HTTPS/2; Windows full IOCP + UDP receive ring; QUIC split out |
 | 2.4.2 | 2026-09-30 | HTTPS/TLS refactor (`netleaf_https` split, tls2/tls3); MQTT on by default; `nl_util`; H2/QUIC frame fixes; Android build support |

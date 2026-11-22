@@ -35,7 +35,9 @@
  * ============================================================ */
 #define MAX_HEADERS 64
 #define MAX_HEADER_NAME 128
-#define MAX_HEADER_VALUE 1024
+/* 与 src/http/netleaf_http_internal.h 同步：规范上限 4096B；
+ * 头值按需动态分配（第200轮），此宏仅为上限判定值 */
+#define MAX_HEADER_VALUE 4096
 #define NL_HTTP_MAX_PATH 4096
 
 #define H3_DEFAULT_MAX_STREAMS 100
@@ -153,7 +155,9 @@ typedef struct {
 
 struct nl_http_header {
     char name[MAX_HEADER_NAME];
-    char value[MAX_HEADER_VALUE];
+    /* 值按需动态分配（第200轮，与 src/http/netleaf_http_internal.h 布局同步）；
+     * h3_stream_free 统一释放 */
+    char* value;
 };
 
 struct nl_http_request {
@@ -542,6 +546,9 @@ void h3_stream_free(struct nl_http3_stream* stream) {
         if (stream->recv_buffer) free(stream->recv_buffer);
         if (stream->request.body) free(stream->request.body);
         if (stream->response.body) free(stream->response.body);
+        /* 头值动态分配，统一释放（第200轮） */
+        for (int i = 0; i < stream->request.header_count; i++) free(stream->request.headers[i].value);
+        for (int i = 0; i < stream->response.header_count; i++) free(stream->response.headers[i].value);
         free(stream);
     }
 }
@@ -610,8 +617,16 @@ int h3_process_stream_frame(struct nl_http_io* io, struct nl_http3_connection* c
                         snprintf(stream->request.path, NL_HTTP_MAX_PATH, "%s", value);
                     } else if (name[0] != ':' && stream->request.header_count < MAX_HEADERS) {
                         snprintf(stream->request.headers[stream->request.header_count].name, MAX_HEADER_NAME, "%s", name);
-                        snprintf(stream->request.headers[stream->request.header_count].value, MAX_HEADER_VALUE, "%s", value);
-                        stream->request.header_count++;
+                        /* 头值按需动态分配（第200轮） */
+                        {
+                            size_t vlen = strlen(value);
+                            char* vbuf = (char*)malloc(vlen + 1);
+                            if (vbuf) {
+                                memcpy(vbuf, value, vlen + 1);
+                                stream->request.headers[stream->request.header_count].value = vbuf;
+                                stream->request.header_count++;
+                            }
+                        }
                     }
                 }
 
@@ -625,9 +640,11 @@ int h3_process_stream_frame(struct nl_http_io* io, struct nl_http3_connection* c
 
             /* 调用 handler 并回包 */
             if (handler) {
-                nl_http_response_t resp = {0};
-                resp.status = 200;
-                handler(&stream->request, &resp, user_data);
+                /* resp 约 270KB（headers[64]×4097B），堆分配（v3.1.0） */
+                nl_http_response_t* resp = (nl_http_response_t*)calloc(1, sizeof(*resp));
+                if (!resp) break;
+                resp->status = 200;
+                handler(&stream->request, resp, user_data);
 
                 /* 用连接的堆 send_buffer 组装回包（原先两次 64KB 栈缓冲
                  * 合并复用，削减每请求 128KB 栈占用）。 */
@@ -640,16 +657,17 @@ int h3_process_stream_frame(struct nl_http_io* io, struct nl_http3_connection* c
                     resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, 10);
                     conn->send_buffer[resp_offset++] = 0x88; /* 静态表 :status=200 (idx 8, 1-based) */
 
-                    for (int i = 0; i < resp.header_count && resp_offset + 32 < cap; i++) {
+                    for (int i = 0; i < resp->header_count && resp_offset + 32 < cap; i++) {
                         conn->send_buffer[resp_offset++] = 0x00;
                         resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, 0);
-                        size_t name_len = strlen(resp.headers[i].name);
+                        size_t name_len = strlen(resp->headers[i].name);
                         resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, name_len);
-                        memcpy(conn->send_buffer + resp_offset, resp.headers[i].name, name_len);
+                        memcpy(conn->send_buffer + resp_offset, resp->headers[i].name, name_len);
                         resp_offset += name_len;
-                        size_t value_len = strlen(resp.headers[i].value);
+                        if (!resp->headers[i].value) continue; /* 动态分配失败的空值跳过 */
+                        size_t value_len = strlen(resp->headers[i].value);
                         resp_offset += quic_write_varint(conn->send_buffer + resp_offset, cap - resp_offset, value_len);
-                        memcpy(conn->send_buffer + resp_offset, resp.headers[i].value, value_len);
+                        memcpy(conn->send_buffer + resp_offset, resp->headers[i].value, value_len);
                         resp_offset += value_len;
                     }
 
@@ -657,20 +675,23 @@ int h3_process_stream_frame(struct nl_http_io* io, struct nl_http3_connection* c
                                  &conn->client_addr, conn->client_addr_len);
 
                     /* 数据帧（若有 body） */
-                    if (resp.body && resp.body_size > 0 &&
-                        resp.body_size < cap) {
+                    if (resp->body && resp->body_size > 0 &&
+                        resp->body_size < cap) {
                         size_t data_offset = 0;
                         conn->send_buffer[data_offset++] = NL_H3_FRAME_DATA;
-                        data_offset += quic_write_varint(conn->send_buffer + data_offset, cap - data_offset, resp.body_size);
-                        memcpy(conn->send_buffer + data_offset, resp.body, resp.body_size);
-                        data_offset += resp.body_size;
+                        data_offset += quic_write_varint(conn->send_buffer + data_offset, cap - data_offset, resp->body_size);
+                        memcpy(conn->send_buffer + data_offset, resp->body, resp->body_size);
+                        data_offset += resp->body_size;
 
                         io->udp_send(io, conn->fd, conn->send_buffer, data_offset,
                                      &conn->client_addr, conn->client_addr_len);
                     }
 
-                    if (resp.body) free(resp.body);
+                    if (resp->body) free(resp->body);
                 }
+                /* 头值动态分配，统一释放（第200轮） */
+                for (int i = 0; i < resp->header_count; i++) free(resp->headers[i].value);
+                free(resp);
             }
             break;
         }

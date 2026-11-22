@@ -129,14 +129,17 @@ NL_API char* nl_url_encode(const char* input) {
 /* ============================================================
  * remove_dot_segments（原地，RFC 3986 §5.2.4 变体）
  * 输入保证：以 '/' 开头、NUL 结尾、无 '%'、无控制字符、无 '\'。
- * 规则：折叠空段与 "."；".." 弹出上一段，栈空即越根 → ESCAPES；
+ * 规则：折叠空段与 "."；".." 弹出上一段，栈空即越根：
+ *       clamp=0 → 返回 NL_URI_ESCAPES（全局端点语义）；
+ *       clamp=1 → 忽略该 ".."（第203轮：端点内根目录语义，见
+ *       nl_uri_normalize_clamp）；
  *       保留原输入的尾部 '/' 语义。
  * 注意：输出 w 恒 <= 读指针 r。首段无需补 '/'（输入自带前导 '/'）；
  *       后续段的分隔符写在 w 处 —— 该位置正是输入中已被消费的 '/'，
  *       同值覆盖不破坏数据；w == r 时跳过拷贝（原实现先写 '/' 再从
  *       已被覆盖的位置 memcpy，产生 "//" 与垃圾字节）。
  * ============================================================ */
-static int nl__remove_dot_segments(char* s) {
+static int nl__remove_dot_segments(char* s, int clamp) {
     size_t len = strlen(s);
     uint16_t seg_pos[NL_URI_MAX_SEG];   /* 各段起始（分隔符位）在输出中的下标 */
     int nseg = 0;
@@ -153,9 +156,14 @@ static int nl__remove_dot_segments(char* s) {
         if (seglen == 0 || (seglen == 1 && r[0] == '.')) {
             /* 空段（"//"）或 "."：折叠 */
         } else if (seglen == 2 && r[0] == '.' && r[1] == '.') {
-            if (nseg == 0) return NL_URI_ESCAPES;   /* 越根 */
-            nseg--;
-            w = s + seg_pos[nseg];                  /* 弹出上一段 */
+            if (nseg == 0) {
+                /* 越根：clamp=0 拒绝（攻击特征 → 403）；
+                 * clamp=1 忽略（端点即根，../ 保持在端点内） */
+                if (!clamp) return NL_URI_ESCAPES;
+            } else {
+                nseg--;
+                w = s + seg_pos[nseg];              /* 弹出上一段 */
+            }
         } else {
             if (nseg >= NL_URI_MAX_SEG) return NL_URI_ENOSPC;
             seg_pos[nseg++] = (uint16_t)(w - s);    /* 段起点（含分隔符位） */
@@ -178,9 +186,9 @@ static int nl__remove_dot_segments(char* s) {
 }
 
 /* ============================================================
- * nl_uri_normalize
+ * 规范化主体（clamp=0 全局端点语义 / clamp=1 端点内根目录语义）
  * ============================================================ */
-NL_API int nl_uri_normalize(const char* uri, char* out, size_t cap) {
+static int nl__normalize_ex(const char* uri, char* out, size_t cap, int clamp) {
     if (!uri || !out || cap < 2) return NL_URI_EINVAL;
 
     const char* p = uri;
@@ -235,7 +243,18 @@ NL_API int nl_uri_normalize(const char* uri, char* out, size_t cap) {
     out[w] = '\0';
     if (out[0] != '/') return NL_URI_EINVAL;
 
-    return nl__remove_dot_segments(out);
+    return nl__remove_dot_segments(out, clamp);
+}
+
+NL_API int nl_uri_normalize(const char* uri, char* out, size_t cap) {
+    return nl__normalize_ex(uri, out, cap, 0);
+}
+
+/* 第203轮：端点内根目录语义 —— 与 nl_uri_normalize 相同，但越根 ".."
+ * 不报 ESCAPES 而是忽略（/web/../../x → /x，保持在端点根内）。
+ * 用于"端点指向目录"（nl_web_add_dir）的余段解析。 */
+NL_API int nl_uri_normalize_clamp(const char* uri, char* out, size_t cap) {
+    return nl__normalize_ex(uri, out, cap, 1);
 }
 
 /* ============================================================

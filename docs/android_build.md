@@ -1,6 +1,6 @@
 # NetLeaf Android 构建指南
 
-NetLeaf v3.0.1 支持 Android（Bionic）交叉编译。复用 Linux/epoll 风格的 POSIX 源，
+NetLeaf v3.1.0 支持 Android（Bionic）交叉编译。复用 Linux/epoll 风格的 POSIX 源，
 CMake 通过 `elseif(ANDROID)` 分支自动切换编译选项、源文件列表与核心库链接。
 
 > **范围说明**：Android 目前覆盖**核心库**（`netleaf_core`，含 TCP/UDP、HTTP、

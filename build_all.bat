@@ -13,7 +13,7 @@ REM For LLVM-MinGW instead of MSVC use: build_all-Clang.bat
 REM ============================================================
 
 setlocal enabledelayedexpansion
-set "VERSION=3.0.1"
+set "VERSION=3.1.0"
 set "SRC_DIR=%~dp0"
 set "SRC_DIR=%SRC_DIR:~0,-1%"
 
@@ -76,7 +76,7 @@ echo.
 if not exist "%SRC_DIR%\releases" mkdir "%SRC_DIR%\releases"
 
 REM BUILD_TLS(tls2) conflicts with BUILD_TLS3 inside one build tree; pick TLS3.
-set "NL_OPTS=-DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON -DBUILD_TLS=OFF -DBUILD_TLS3=ON -DBUILD_LANG=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON"
+set "NL_OPTS=-DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_TLS=OFF -DBUILD_TLS3=ON -DBUILD_LANG=ON -DBUILD_MQTT=ON -DBUILD_MQTT_SERVER=ON"
 
 if "%BUILD_X64%"=="1"   call :build_arch x64   x64   && call :package x64
 if "%BUILD_X86%"=="1"   call :build_arch x86   Win32 && call :package x86
@@ -131,16 +131,31 @@ REM ============================================================
 :package
 set "PACK_ARCH=%~1"
 set "BDIR=%SRC_DIR%\build_msvc_%PACK_ARCH%"
-set "PKG=%BDIR%\pkg_out"
+set "PKG_NAME=NetLeaf-%VERSION%-windows-%PACK_ARCH%-msvc"
+set "PKG=%BDIR%\pkg_out\%PKG_NAME%"
 echo [Pack] %PACK_ARCH% ...
-if exist "%PKG%" rmdir /s /q "%PKG%"
-mkdir "%PKG%"
-copy /Y "%BDIR%\bin\Release\*.dll" "%PKG%\" >nul 2>nul
-copy /Y "%BDIR%\bin\*.dll" "%PKG%\" >nul 2>nul
-copy /Y "%BDIR%\lib\Release\*.lib" "%PKG%\" >nul 2>nul
-copy /Y "%BDIR%\lib\*.lib" "%PKG%\" >nul 2>nul
-xcopy "%SRC_DIR%\include\*" "%PKG%" /E /Y /Q >nul 2>nul
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%PKG%\*' -DestinationPath '%SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-msvc.zip' -Force"
-rmdir /s /q "%PKG%"
+if exist "%BDIR%\pkg_out" rmdir /s /q "%BDIR%\pkg_out"
+mkdir "%PKG%\lib\bin"
+mkdir "%PKG%\lib\cmake\NetLeaf"
+mkdir "%PKG%\include"
+REM 库文件（dll + 导入库）放 lib\bin
+copy /Y "%BDIR%\bin\Release\*.dll" "%PKG%\lib\bin\" >nul 2>nul
+copy /Y "%BDIR%\bin\*.dll" "%PKG%\lib\bin\" >nul 2>nul
+copy /Y "%BDIR%\lib\Release\*.lib" "%PKG%\lib\bin\" >nul 2>nul
+copy /Y "%BDIR%\lib\*.lib" "%PKG%\lib\bin\" >nul 2>nul
+REM 公共头文件平铺到 include\（原 include\optimize\ 下头文件也平铺进来）
+copy /Y "%SRC_DIR%\include\*.h" "%PKG%\include\" >nul 2>nul
+copy /Y "%SRC_DIR%\include\optimize\*.h" "%PKG%\include\" >nul 2>nul
+REM 说明文档与许可证
+copy /Y "%SRC_DIR%\README.md" "%PKG%\" >nul 2>nul
+copy /Y "%SRC_DIR%\README_EN.md" "%PKG%\" >nul 2>nul
+copy /Y "%SRC_DIR%\LICENSE" "%PKG%\" >nul 2>nul
+REM pkg-config（放包根，prefix=${pcfiledir} 相对定位）
+copy /Y "%BDIR%\pkgmeta\netleaf.pc" "%PKG%\" >nul 2>nul
+REM CMake package config（放 lib\cmake\NetLeaf\，find_package 可直接定位包根）
+copy /Y "%BDIR%\pkgmeta\NetLeafConfig.cmake" "%PKG%\lib\cmake\NetLeaf\" >nul 2>nul
+copy /Y "%BDIR%\pkgmeta\NetLeafConfigVersion.cmake" "%PKG%\lib\cmake\NetLeaf\" >nul 2>nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%PKG%' -DestinationPath '%SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-msvc.zip' -Force"
+rmdir /s /q "%BDIR%\pkg_out"
 echo [OK] %SRC_DIR%\releases\NetLeaf-%VERSION%-windows-%PACK_ARCH%-msvc.zip
 exit /b 0

@@ -35,12 +35,15 @@
 #ifdef _WIN32
     #include <windows.h>
     #include <process.h>   /* WS 反代用例的上游线程 */
+    #include <direct.h>    /* 第203轮：_mkdir 建目录端点测试目录 */
     static void nl_sleep_ms(int ms) { Sleep((DWORD)ms); }
     /* nl_sock_t 由 netleaf.h 定义（_WIN32 下 = SOCKET） */
     #define NL_SOCK_INVALID INVALID_SOCKET
     #define nl_sock_close closesocket
     #define nl_sock_send send
     #define nl_sock_recv recv
+    #define nl_test_mkdir(p) _mkdir(p)
+    #define nl_test_rmdir(p) _rmdir(p)
 #else
     #include <sys/socket.h>
     #include <sys/time.h>
@@ -50,12 +53,15 @@
     #include <signal.h>
     #include <strings.h>
     #include <pthread.h>   /* WS 反代用例的上游线程 */
+    #include <sys/stat.h>  /* 第203轮：mkdir 建目录端点测试目录 */
     static void nl_sleep_ms(unsigned int ms) { usleep(ms * 1000u); }
     /* nl_sock_t 由 netleaf.h 定义（POSIX 下 = int） */
     #define NL_SOCK_INVALID (-1)
     #define nl_sock_close close
     #define nl_sock_send send
     #define nl_sock_recv recv
+    #define nl_test_mkdir(p) mkdir(p, 0755)
+    #define nl_test_rmdir(p) rmdir(p)
 #endif
 
 #define BASE_PORT 18881
@@ -872,6 +878,126 @@ static void case_proxy_dir(void) {
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* 第203轮用例：DIR 端点（端点即根，../ clamp 不逃逸）                 */
+/* ------------------------------------------------------------------ */
+static void dir_write_text(const char* path, const char* content) {
+    FILE* fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(content, 1, strlen(content), fp);
+    fclose(fp);
+}
+
+/* 发一个请求并返回状态码（连接失败 = -1）。 */
+static int dir_get_status(int port, const char* path, char* buf, int buf_cap,
+                          const char* method) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "%s %s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+             method, path);
+    int n = http_exchange(port, req, buf, buf_cap);
+    return (n > 0) ? http_status(buf) : -1;
+}
+
+static void case_dir_endpoint(void) {
+    printf("\n[用例] l. DIR 端点（文件/目录即端点根，../ clamp）\n");
+
+    /* 布置：目录端点根 + 其中文件/子目录 + 端点外同名诱饵文件 */
+    nl_test_mkdir("nl_test_web_dir");
+    nl_test_mkdir("nl_test_web_dir/sub");
+    dir_write_text("nl_test_web_dir/index.html", "INDEX-OK");
+    dir_write_text("nl_test_web_dir/page.html", "PAGE-OK");
+    dir_write_text("nl_test_web_dir/sub/inner.txt", "INNER-OK");
+    dir_write_text("nl_test_single.txt", "SINGLE-OK");
+    dir_write_text("nl_test_outside.txt", "OUTSIDE-SECRET");   /* 端点外文件 */
+
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start server", 0); return; }
+
+    expect("注册目录端点 /d", nl_web_add_dir(s, "/d", "nl_test_web_dir") == 0);
+    expect("注册文件端点 /single", nl_web_add_dir(s, "/single", "nl_test_single.txt") == 0);
+    /* 对照路由：/dx 不得被 /d 吞掉（前缀边界） */
+    expect("注册对照路由 /dx", nl_web_add_route(s, "/dx", "dx-content", "text/plain") == 0);
+    /* 非法端点：根 / 与非绝对前缀必须被拒 */
+    expect("拒绝根端点 /", nl_web_add_dir(s, "/", "nl_test_web_dir") != 0);
+    expect("拒绝非绝对前缀", nl_web_add_dir(s, "bad", "nl_test_web_dir") != 0);
+    nl_sleep_ms(50);
+
+    char buf[8192];
+    const char* body;
+
+    /* 1) 目录根：/d/ 与 /d 均服务 index.html */
+    int st = dir_get_status(port, "/d/", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /d/ → 200 index.html", st == 200 && body && strstr(body, "INDEX-OK"));
+    st = dir_get_status(port, "/d", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /d → 200 index.html", st == 200 && body && strstr(body, "INDEX-OK"));
+    expect("GET /d/ Content-Type: text/html",
+           strstr(buf, "Content-Type: text/html") != NULL);
+
+    /* 2) 端点内普通文件 + 子目录 */
+    st = dir_get_status(port, "/d/page.html", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /d/page.html → 200", st == 200 && body && strstr(body, "PAGE-OK"));
+    st = dir_get_status(port, "/d/sub/inner.txt", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /d/sub/inner.txt → 200", st == 200 && body && strstr(body, "INNER-OK"));
+
+    /* 3) ../ clamp：端点内上跳等价于端点根解释，不逃逸 */
+    st = dir_get_status(port, "/d/../page.html", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /d/../page.html → 端点内 200（clamp）",
+           st == 200 && body && strstr(body, "PAGE-OK"));
+    st = dir_get_status(port, "/d/../../page.html", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /d/../../page.html → 端点内 200（越根 .. 忽略）",
+           st == 200 && body && strstr(body, "PAGE-OK"));
+
+    /* 4) 越界不逃逸：../ 想拿端点外文件，clamp 后仍在端点内 → 404 且无泄露 */
+    st = dir_get_status(port, "/d/../nl_test_outside.txt", buf, sizeof(buf), "GET");
+    expect("GET /d/../nl_test_outside.txt → 404（不逃逸端点）", st == 404);
+    expect("响应体不含端点外内容",
+           strstr(buf, "OUTSIDE-SECRET") == NULL);
+
+    /* 5) 文件端点：任意余段均服务该文件 */
+    st = dir_get_status(port, "/single", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /single → 200 该文件", st == 200 && body && strstr(body, "SINGLE-OK"));
+    st = dir_get_status(port, "/single/anything/deep?x=1", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /single/anything/deep?x=1 → 200 该文件",
+           st == 200 && body && strstr(body, "SINGLE-OK"));
+
+    /* 6) 前缀边界：/dx 不被 /d 吞 */
+    st = dir_get_status(port, "/dx", buf, sizeof(buf), "GET");
+    body = http_body(buf);
+    expect("GET /dx → 200 对照路由（不被 /d 吞）",
+           st == 200 && body && strstr(body, "dx-content"));
+
+    /* 7) 端点内不存在 → 404 */
+    st = dir_get_status(port, "/d/nonexist.txt", buf, sizeof(buf), "GET");
+    expect("GET /d/nonexist.txt → 404", st == 404);
+
+    /* 8) HEAD：200 且无响应体 */
+    st = dir_get_status(port, "/d/page.html", buf, sizeof(buf), "HEAD");
+    body = http_body(buf);
+    expect("HEAD /d/page.html → 200 无 body",
+           st == 200 && body && body[0] == '\0');
+
+    engine_stop(s);
+
+    /* 清理布置的临时文件/目录 */
+    remove("nl_test_web_dir/index.html");
+    remove("nl_test_web_dir/page.html");
+    remove("nl_test_web_dir/sub/inner.txt");
+    nl_test_rmdir("nl_test_web_dir/sub");
+    nl_test_rmdir("nl_test_web_dir");
+    remove("nl_test_single.txt");
+    remove("nl_test_outside.txt");
+}
+
 int main(void) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -890,6 +1016,7 @@ int main(void) {
     case_sequential();
     case_slowloris();
     case_abort();
+    case_dir_endpoint();
 
     printf("\n==== 汇总: %d 项, 通过 %d, 失败 %d ====\n",
            g_total, g_total - g_fail, g_fail);
