@@ -1,5 +1,55 @@
 # NetLeaf 版本历史
 
+## v3.1.0-11/28-2b（2026-11-28）
+
+### HTTP TRACE / CONNECT 方法支持
+
+- 核心枚举 `nl_http_method_t` 新增 `NL_METHOD_TRACE` / `NL_METHOD_CONNECT`，优化层 `nlh_http_method_t` 新增 `NL_HTTP_TRACE` / `NL_HTTP_CONNECT`，`nl_http_parse_method()` 识别两种方法；三平台 legacy 路径 method 字符串解析同步补齐（macOS 顺带补齐缺失的 HEAD/OPTIONS）
+- **TRACE 回显（RFC 9110 §9.3.1）**：引擎在 body 剥离**之前**取原始请求字节（剥离会 memmove 掉头块），构造 `200 OK` + `Content-Type: message/http`，body = 请求行+头，`Connection` 随状态机 KA 位；发送后走统一收口，TRACE 后同连接可继续复用；本地路由 404 时按路径正常拒绝
+- **CONNECT 真隧道（方案A + 白名单）**：新增 `nl_web_connect_allow(server, host, port)`（最多 16 条、port=0 任意端口、**空名单默认拒绝全部**）；CONNECT 分支插在路由查找之前（`host:port` 查表必 404），按白名单校验（不区分大小写）→ 403；建连失败 502；成功回 `200 Connection Established` 后进入原始字节双向泵（复用现有隧道机），隧道结束双端 close 回收
+- 测试：新增用例 o（TRACE 200/message/http/回显请求行与自定义头/keep-alive 复用，8 项断言）、用例 p（本地 echo 服务器隧道往返 + 白名单 403 拒绝）
+
+### WSS（WebSocket over TLS）
+
+- 新增 `nl_ws_server_enable_tls(server, cert_file, key_file)`：独立 WS 服务器可选 TLS（PEM 路径由调用方传入，不硬编码密钥）；未 enable 时与明文行为完全一致
+- 新增平台无关运行时后端 `src/common/nl_ws_tls.c/.h`：核心库不直接链接 TLS 扩展（tls3/tls2 反向链接核心，硬链会循环依赖/Windows 构建死锁），改为 dlopen/LoadLibrary 加载 `netleaf_tls3`/`netleaf_tls2` 并解析符号（tls3 优先回退 tls2）；每连接一个服务端 TLS ctx（10s 握手超时），统一 `nl_ws_io_recv/send` 在 conn==NULL 时走明文
+- 三平台 WS 线程接线：accept 后 TLS 握手 → HTTP 升级握手 → frame 读写全部走 TLS，关闭前释放 ctx（明文为 no-op）；mbedTLS 单次写 16KB 上限在发送侧循环处理
+- 顺带修复 macOS WS 客户端线程野指针（原把已 free 的 fd 指针强转 server），改用 `ws_thread_arg_t` 传递 server+fd（与 Linux 对齐）
+- 实测：Linux 自签证书 + `openssl s_client` TLS 握手成功；明文路径 ctest 回归无变化
+
+### 内存优化
+
+- 核实三平台 `pr_free_slot` 回收本就齐全、空载无每槽预分配、`pr_hbuf_out` 本就按需——非泄漏
+- **`pr_outbuf` 8KB**：accept 处预分配改为本地路由构造响应时首次懒分配（Linux/macOS）
+- **`pr_up_buf` 64KB**：proxy 分发处预分配改为首次收到上游数据时才分配（Linux/macOS）——上游未响应的连接（含 HTTPS 隧道等待期）从 ~72KB/条 降至 ~16KB/条
+- 实测（Linux）：空载 1.9MB → 1.79MB；2000 连接 5776KB → 5716KB（本地路由场景差异小，收益主要在 proxy 场景）
+
+### TCP/UDP 通用服务器性能
+
+- **TCP_NODELAY**：Linux/macOS `nl_server` accept 后（worker 池与 legacy 单线程两路径）补设，小响应不再受 Nagle 延迟；Windows AcceptEx 路径已有
+- **每连接 malloc 消除**：Linux/macOS worker 路径请求缓冲改 worker 线程级复用、legacy 路径改 listener 线程复用（顺带删除 Linux 死代码缓冲）；Windows UDP 16 槽接收环每包 `malloc/free` 改栈缓冲，消除分配失败丢包分支
+- worker 污锁经核实已是最短临界区（入队/出队各一次、处理期不持锁），不合并（有丢唤醒风险）；nl_server 无静态文件 read+send 路径，sendfile 不适用
+
+### Linux 编译警告清理
+
+- `nl_px_local.c` const 丢弃（原地规范化确认可写后强转）；`netleaf_linux.c` `nl_web_open_listen` 第 5 参误传 `&opt` 指针（**真 bug**，改传值）；toml 序列化 switch 补 `NL_TOML_NULL`/default
+- `nl_px_h2.c` 4 处 `%s` 格式截断改 `strnlen+memcpy` 有界拷贝；H2 preface 字面量 25B 塞 24B 数组改尺寸 +1；路径/上游拼接 3 处改手写有界拼接（放不下走 404/截断）
+- Windows `__declspec(thread)` 在 MinGW 下告警 → `NL_WIN_TLS` 宏按 `_MSC_VER` 分流
+- 实测：Linux 构建 0 警告 0 错误；Linux/Windows 双平台全量 ctest **11/11**
+
+### Web 引擎 keep-alive 连接复用与稳定性修复
+
+修复引擎线程模型压测报告中的全部 5 项缺陷（三平台 Linux/Windows/macOS 统一状态机）：
+
+- **keep-alive 语义修正（缺陷1）**：新增公共层 `nl_px_req_keepalive()` / `nl_px_req_content_length()` 判定请求 framing；本地路由统一等完整头后按 ka 设 `PR_ST_KA` 位、剥离 body（未到则记 DRAIN），响应完成走 `pr_conn_finish` 收口——按 KA 位真复用或关闭，响应头 `Connection` 与实际行为一致；错误响应（>=400）固定 `Connection: close`
+- **流式响应后连接状态污染（缺陷2）**：SERVE_FILE/SERVE_OUT/proxy 各完成点统一走 finish 收口，文件路由响应完后同连接下一请求不再返回 400；body 分段转发补 `*hlen=0` 防跨段累加
+- **连接耗尽 fd 泄漏（缺陷3）**：Linux HUP/ERR 路径两端 fd 均 close+epoll DEL（原上游错误时客户端 fd 泄漏）；macOS EV_ERROR 双端收口、pump 补 `rc==0` 处理、空闲扫描回收前 EV_DELETE
+- **引擎线程饥饿（缺陷4）**：新增线程本地路由预查缓存（`g_pr_pre_route`/`g_pr_pre_path`，Linux/macOS `__thread`、Windows `__declspec(thread)`），plan_build 免二次拿路由表锁；Windows dispatch 两次临界区合并为一次
+- **proxy 复用（方案E）**：分发时保留 KA 位，完成点（上游 DONE 且无剩余）上游归池 + 客户端按 KA 位复用/关；管道化残留 Linux 递归 dispatch 处理，Windows/macOS 拒绝复用直接关（顺序请求不受影响）
+- **DRAIN 阶段**：请求 body 未收完先精确计数收完（Linux 独立事件分支、Windows `pr_post_drain_recv` 按 8KB 分段 post、macOS 同构），再定复用或关闭，防带未读数据 close 触发 RST 冲掉响应
+- **测试（缺陷5）**：`test_web_engine.c` 新增长连接用例——l（同连接二次请求 + 404 真关断言）、m（1MB FILE 后复用非 400，Windows SKIP）、n（POST body 延后到达 DRAIN 后复用），断言 75→80
+- 实测：Linux/Windows 双平台全量 ctest **11/11**；keep-alive 压测全轮 fail=0，QPS 随引擎线程 1→2→4 递增（15632→23026→25020），500 并发长连接无耗尽；macOS 改动完成代码自查（无本机工具链未编译）
+
 ## v3.1.0（2026-11-22）
 
 ### 目录/文件端点

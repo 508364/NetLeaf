@@ -65,6 +65,21 @@ NL_API void nl_ws_server_destroy(nl_websocket_server_t* server);
 NL_API int nl_ws_server_start(nl_websocket_server_t* server);
 NL_API void nl_ws_server_stop(nl_websocket_server_t* server);
 
+/**
+ * 第205轮 WSS：给独立 WebSocket 服务器启用 TLS（WSS）。
+ *
+ * 必须在 nl_ws_server_start() 之前调用；cert_file / key_file 为 PEM 格式的
+ * 证书与私钥文件路径，由调用方提供（库内不硬编码任何密钥材料）。
+ *
+ * 返回 0=成功；-1=失败（参数非法、服务器已在运行、TLS 后端不可用——
+ * 运行时会优先加载 netleaf_tls3，缺失时回退 netleaf_tls2，两者皆无则失败）。
+ *
+ * 未 enable 时行为与明文完全一致；enable 后每个连接在 HTTP 升级握手前
+ * 先完成服务端 TLS 握手，后续读写全部走 TLS。
+ */
+NL_API int nl_ws_server_enable_tls(nl_websocket_server_t* server,
+                                   const char* cert_file, const char* key_file);
+
 NL_API void nl_ws_server_set_on_connect(nl_websocket_server_t* server, nl_ws_connect_handler handler, void* user_data);
 NL_API void nl_ws_server_set_on_message(nl_websocket_server_t* server, nl_ws_message_handler handler, void* user_data);
 NL_API void nl_ws_server_set_on_close(nl_websocket_server_t* server, nl_ws_close_handler handler, void* user_data);

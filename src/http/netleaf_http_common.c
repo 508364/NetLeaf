@@ -107,6 +107,8 @@ nlh_http_method_t nl_http_parse_method(const char* method) {
     if (strcmp(method, "HEAD") == 0) return NL_HTTP_HEAD;
     if (strcmp(method, "OPTIONS") == 0) return NL_HTTP_OPTIONS;
     if (strcmp(method, "PATCH") == 0) return NL_HTTP_PATCH;
+    if (strcmp(method, "TRACE") == 0) return NL_HTTP_TRACE;     /* 第205轮 */
+    if (strcmp(method, "CONNECT") == 0) return NL_HTTP_CONNECT; /* 第205轮 */
     return NL_HTTP_UNKNOWN;
 }
 

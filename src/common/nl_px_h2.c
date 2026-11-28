@@ -295,7 +295,9 @@ static int nl_h2_skip_resp_header(const char* name) {
 /* ============================================================
  * 首包判定
  * ============================================================ */
-static const char nl_h2_magic[NL_PX_H2_PREFACE_LEN] =
+/* 尺寸 +1 容纳字符串终止符：字面量共 25B，若声明为 24 会截掉 '\0'
+ * 触发 -Wunterminated-string-initialization；所有比较仍按前 24B 进行 */
+static const char nl_h2_magic[NL_PX_H2_PREFACE_LEN + 1] =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 int nl_px_h2_preface_check(const char* data, size_t len) {
@@ -1034,9 +1036,14 @@ static int nl_h2s_decode_request(nl_px_h2sess* s, uint32_t sid,
         if (name[0] == '\0') continue;   /* 动态表容量更新，无头字段 */
         if (disc) continue;
         if (name[0] == ':') {
-            if (nl_h2_ci_eq(name, ":method")) snprintf(st->method, sizeof(st->method), "%s", value);
-            else if (nl_h2_ci_eq(name, ":path")) snprintf(st->path, sizeof(st->path), "%s", value);
-            else if (nl_h2_ci_eq(name, ":authority")) snprintf(st->authority, sizeof(st->authority), "%s", value);
+            /* 有界拷贝（非 snprintf）：value 源 4096B 可能长于目标，截断语义
+             * 不变，且不触发 -Wformat-truncation */
+            #define NL_H2_COPY(dst) do { size_t _n = strnlen(value, sizeof(dst) - 1); \
+                memcpy(dst, value, _n); dst[_n] = '\0'; } while (0)
+            if (nl_h2_ci_eq(name, ":method")) NL_H2_COPY(st->method);
+            else if (nl_h2_ci_eq(name, ":path")) NL_H2_COPY(st->path);
+            else if (nl_h2_ci_eq(name, ":authority")) NL_H2_COPY(st->authority);
+            #undef NL_H2_COPY
             continue;
         }
         if (nl_h2_skip_req_header(name)) continue;
@@ -1350,7 +1357,8 @@ static int nl_h2s_seed_upgrade(nl_px_h2sess* s, const char* initial, size_t len)
                                   value, sizeof(value));
         if (r <= 0) break;
         if (nl_h2_ci_eq(name, "host")) {
-            snprintf(st->authority, sizeof(st->authority), "%s", value);
+            size_t an = strnlen(value, sizeof(st->authority) - 1);   /* 有界拷贝，防截断告警 */
+            memcpy(st->authority, value, an); st->authority[an] = '\0';
             continue;
         }
         /* 升级请求携带的 HTTP2-Settings（base64url 的 SETTINGS 载荷）：
@@ -1738,7 +1746,8 @@ static int nl_h2u_parse_req(const char* init, size_t len, nl_h2u_req* r) {
                                    value, sizeof(value));
         if (rr <= 0) break;
         if (nl_h2_ci_eq(name, "host")) {
-            snprintf(r->host, sizeof(r->host), "%s", value);
+            size_t hn = strnlen(value, sizeof(r->host) - 1);   /* 有界拷贝，防截断告警 */
+            memcpy(r->host, value, hn); r->host[hn] = '\0';
             continue;
         }
         if (nl_h2_skip_req_header(name)) continue;

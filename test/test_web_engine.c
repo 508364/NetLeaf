@@ -15,6 +15,9 @@
  *   j. WS 升级隧道反代：101 切换 + 双向裸字节回显 + 头透传
  *   k. PROXY 目录转发（第195轮）：nginx location 语义——透传 / 最长前缀 /
  *      精确优先 / proxy_pass URI 拼接 / query 保留 / 前缀边界
+ *   l. keep-alive 同连接顺序二次请求 + 错误响应固定 close（第204轮缺陷1/5）
+ *   m. FILE 流式响应后同连接下一请求非 400（第204轮缺陷2）
+ *   n. POST body 分片到达（DRAIN 阶段）后同连接复用（第204轮 body 消费）
  *
  * 构建：随 test/CMakeLists.txt 注册（WebEngineTest）。
  * 跨平台：POSIX socket + Windows winsock（netleaf.h 内部已含 winsock2.h）。
@@ -998,6 +1001,387 @@ static void case_dir_endpoint(void) {
     remove("nl_test_outside.txt");
 }
 
+/* ------------------------------------------------------------------ */
+/* 第204轮：keep-alive 长连接状态机用例（缺陷1/2/5）                    */
+/* ------------------------------------------------------------------ */
+
+/* 按 Content-Length 收满一个完整响应（不依赖对端关闭；头分段到达安全）。
+ * 返回总字节数；连接错误且一字节未收到时返回 <=0。 */
+static int http_recv_full(nl_sock_t fd, char* out, int cap) {
+    int total = 0;
+    out[0] = '\0';
+    /* 阶段1：等 \r\n\r\n（响应头完整） */
+    while (total < cap - 1 && !strstr(out, "\r\n\r\n")) {
+        int n = nl_sock_recv(fd, out + total, cap - 1 - total, 0);
+        if (n <= 0) return total > 0 ? total : n;
+        total += n;
+        out[total] = '\0';
+    }
+    if (!strstr(out, "\r\n\r\n")) return total;
+    /* 阶段2：头已完整，解析 Content-Length（无则按 0：204/空 body） */
+    long cl = 0;
+    const char* clv = http_header_val(out, "Content-Length:");
+    if (clv) cl = strtol(clv, NULL, 10);
+    const char* body = http_body(out);
+    long have = body ? (long)(total - (body - out)) : 0;
+    /* 阶段3：收满 body（不等服务端关闭 —— keep-alive 连接不会被关闭） */
+    while (have < cl && total < cap - 1) {
+        int n = nl_sock_recv(fd, out + total, cap - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+        out[total] = '\0';
+        have += n;
+    }
+    return total;
+}
+
+/* 建立一条到 port 的阻塞长连接（5s 接收超时防挂死）。 */
+static nl_sock_t ka_connect(int port) {
+    nl_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == NL_SOCK_INVALID) return fd;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(0x7F000001);   /* 127.0.0.1 */
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        nl_sock_close(fd);
+        return NL_SOCK_INVALID;
+    }
+#ifdef _WIN32
+    DWORD rto = 5000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rto, sizeof(rto));
+#else
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    return fd;
+}
+
+/* l. keep-alive：同一连接顺序两次请求均成功；错误响应固定 close 且真关。
+ *    覆盖缺陷1（头与行为一致）与缺陷5（长连接复用用例）。 */
+static void case_keepalive_reuse(void) {
+    printf("\n[用例] l. keep-alive 同连接二次请求\n");
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start server", 0); return; }
+    nl_web_add_route(s, "/ka", "ka-body", "text/plain");
+    nl_sleep_ms(50);
+
+    nl_sock_t fd = ka_connect(port);
+    expect("建立长连接", fd != NL_SOCK_INVALID);
+    if (fd == NL_SOCK_INVALID) { engine_stop(s); return; }
+
+    char buf[4096];
+    /* 请求1：显式 keep-alive */
+    const char* req1 = "GET /ka HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n";
+    expect("请求1 发送", nl_sock_send(fd, req1, (int)strlen(req1), 0) > 0);
+    int n1 = http_recv_full(fd, buf, sizeof(buf));
+    expect("请求1 收到响应", n1 > 0);
+    expect("请求1 状态 200", n1 > 0 && http_status(buf) == 200);
+    expect("请求1 Connection: keep-alive（缺陷1：头与行为一致）",
+           n1 > 0 && strstr(buf, "Connection: keep-alive") != NULL);
+    expect("请求1 body 匹配", n1 > 0 && strstr(buf, "ka-body") != NULL);
+
+    /* 请求2：同一连接、不带 Connection 头（HTTP/1.1 默认持久） */
+    const char* req2 = "GET /ka HTTP/1.1\r\nHost: t\r\n\r\n";
+    expect("请求2 同连接发送", nl_sock_send(fd, req2, (int)strlen(req2), 0) > 0);
+    int n2 = http_recv_full(fd, buf, sizeof(buf));
+    expect("请求2 收到响应（连接被复用）", n2 > 0);
+    expect("请求2 状态 200", n2 > 0 && http_status(buf) == 200);
+    expect("请求2 body 匹配", n2 > 0 && strstr(buf, "ka-body") != NULL);
+    nl_sock_close(fd);
+
+    /* 错误响应固定 close：404 请求声明 keep-alive，服务端必须响应 close 并真关 */
+    fd = ka_connect(port);
+    if (fd != NL_SOCK_INVALID) {
+        const char* req3 = "GET /no-such HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n";
+        nl_sock_send(fd, req3, (int)strlen(req3), 0);
+        int n3 = http_recv_full(fd, buf, sizeof(buf));
+        expect("404 响应收到", n3 > 0 && http_status(buf) == 404);
+        expect("404 Connection: close（缺陷1：错误固定关）",
+               n3 > 0 && strstr(buf, "Connection: close") != NULL);
+        char probe;
+        int pr = nl_sock_recv(fd, &probe, 1, 0);
+        expect("404 后服务端真关闭连接", pr == 0);
+        nl_sock_close(fd);
+    } else {
+        expect("404 场景建连", 0);
+    }
+
+    engine_stop(s);
+}
+
+/* m. 文件路由流式响应完成后，同一连接的下一请求必须正常（非 400）——缺陷2。
+ *    Windows 基线未实现 nl_web_add_html_file，条件编译跳过（与用例 b 同）。 */
+#ifndef _WIN32
+static void case_file_then_reuse(void) {
+    printf("\n[用例] m. FILE 流式响应后同连接复用\n");
+    const char* path = "nl_test_web_ka.tmp";
+    FILE* fp = fopen(path, "wb");
+    if (!fp) { expect("创建临时文件", 0); return; }
+    char block[4096];
+    memset(block, 'B', sizeof(block));
+    for (int i = 0; i < 256; i++)   /* 256 * 4KB = 1MB */
+        fwrite(block, 1, sizeof(block), fp);
+    fclose(fp);
+
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start server", 0); remove(path); return; }
+    nl_web_add_html_file(s, "/fk", path);
+    nl_web_add_route(s, "/ka2", "after-file", "text/plain");
+    nl_sleep_ms(50);
+
+    nl_sock_t fd = ka_connect(port);
+    expect("建立长连接", fd != NL_SOCK_INVALID);
+    if (fd == NL_SOCK_INVALID) { engine_stop(s); remove(path); return; }
+
+    const long cap = 1024 * 1024 + 8192;
+    char* buf = (char*)malloc((size_t)cap);
+    if (!buf) { expect("malloc", 0); nl_sock_close(fd); engine_stop(s); remove(path); return; }
+
+    const char* req1 = "GET /fk HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n";
+    nl_sock_send(fd, req1, (int)strlen(req1), 0);
+    int n1 = http_recv_full(fd, buf, (int)cap);
+    expect("FILE 响应 200", n1 > 0 && http_status(buf) == 200);
+    expect("FILE Connection: keep-alive",
+           n1 > 0 && strstr(buf, "Connection: keep-alive") != NULL);
+    {
+        const char* body = (n1 > 0) ? http_body(buf) : NULL;
+        expect("FILE body 1MB 完整",
+               body && (long)(n1 - (body - buf)) == 1024 * 1024);
+    }
+
+    /* 同连接第二请求：旧实现在流式响应后此请求返回 400（缺陷2） */
+    const char* req2 = "GET /ka2 HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n";
+    nl_sock_send(fd, req2, (int)strlen(req2), 0);
+    int n2 = http_recv_full(fd, buf, (int)cap);
+    expect("FILE 后同连接请求非 400（缺陷2）", n2 > 0 && http_status(buf) == 200);
+    expect("FILE 后 body 匹配", n2 > 0 && strstr(buf, "after-file") != NULL);
+
+    free(buf);
+    nl_sock_close(fd);
+    engine_stop(s);
+    remove(path);
+}
+#else
+static void case_file_then_reuse(void) { printf("\n[用例] m. FILE 后复用 [SKIP: Windows 未实现 nl_web_add_html_file]\n"); }
+#endif
+
+/* n. POST 请求体分片到达（头先到、body 晚到）→ DRAIN 阶段收齐 body 后
+ *    连接仍可复用（第204轮 body 消费状态机）。 */
+static void case_post_drain_reuse(void) {
+    printf("\n[用例] n. POST body 分片到达后同连接复用\n");
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start server", 0); return; }
+    nl_web_add_route(s, "/p", "post-ok", "text/plain");
+    nl_sleep_ms(50);
+
+    nl_sock_t fd = ka_connect(port);
+    expect("建立长连接", fd != NL_SOCK_INVALID);
+    if (fd == NL_SOCK_INVALID) { engine_stop(s); return; }
+
+    char buf[4096];
+    /* 头先到（body 8 字节延后 100ms）：服务端应先响应，再进入 DRAIN 消费 body */
+    const char* hdr = "POST /p HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\n"
+                      "Connection: keep-alive\r\n\r\n";
+    expect("POST 头发送", nl_sock_send(fd, hdr, (int)strlen(hdr), 0) > 0);
+    nl_sleep_ms(100);
+    expect("POST body 发送", nl_sock_send(fd, "12345678", 8, 0) > 0);
+
+    int n1 = http_recv_full(fd, buf, sizeof(buf));
+    expect("POST 响应 200", n1 > 0 && http_status(buf) == 200);
+    expect("POST Connection: keep-alive",
+           n1 > 0 && strstr(buf, "Connection: keep-alive") != NULL);
+
+    const char* req2 = "GET /p HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n";
+    expect("drain 后同连接 GET 发送", nl_sock_send(fd, req2, (int)strlen(req2), 0) > 0);
+    int n2 = http_recv_full(fd, buf, sizeof(buf));
+    expect("drain 后同连接 GET 200", n2 > 0 && http_status(buf) == 200);
+    expect("drain 后 body 匹配", n2 > 0 && strstr(buf, "post-ok") != NULL);
+    nl_sock_close(fd);
+    engine_stop(s);
+}
+
+/* o. TRACE 回显（RFC 9110 §9.3.1）：200 + Content-Type: message/http，
+ *    body = 原始请求（行+头），且 keep-alive 下同连接可继续复用。 */
+static void case_trace(void) {
+    printf("\n[用例] o. TRACE 回显 message/http\n");
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start server", 0); return; }
+    nl_web_add_route(s, "/t", "trace-target", "text/plain");
+    nl_sleep_ms(50);
+
+    nl_sock_t fd = ka_connect(port);
+    expect("建立长连接", fd != NL_SOCK_INVALID);
+    if (fd == NL_SOCK_INVALID) { engine_stop(s); return; }
+
+    char buf[8192];
+    const char* req = "TRACE /t HTTP/1.1\r\nHost: trace.example\r\n"
+                      "X-Custom: echo-me\r\nConnection: keep-alive\r\n\r\n";
+    expect("TRACE 发送", nl_sock_send(fd, req, (int)strlen(req), 0) > 0);
+    int n = http_recv_full(fd, buf, sizeof(buf) - 1);
+    if (n > 0) buf[n] = '\0'; else buf[0] = '\0';
+
+    expect("TRACE 200", n > 0 && http_status(buf) == 200);
+    expect("TRACE Content-Type: message/http",
+           n > 0 && strstr(buf, "Content-Type: message/http") != NULL);
+    /* body 回显原始请求行与自定义头 */
+    expect("TRACE 回显请求行", n > 0 && strstr(buf, "TRACE /t HTTP/1.1") != NULL);
+    expect("TRACE 回显自定义头", n > 0 && strstr(buf, "X-Custom: echo-me") != NULL);
+    expect("TRACE Connection: keep-alive",
+           n > 0 && strstr(buf, "Connection: keep-alive") != NULL);
+
+    /* keep-alive：TRACE 后同连接 GET 仍可用（回显不污染状态机） */
+    const char* req2 = "GET /t HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n";
+    expect("TRACE 后复用 GET 发送", nl_sock_send(fd, req2, (int)strlen(req2), 0) > 0);
+    int n2 = http_recv_full(fd, buf, sizeof(buf) - 1);
+    if (n2 > 0) buf[n2] = '\0'; else buf[0] = '\0';
+    expect("TRACE 后复用 GET 200", n2 > 0 && http_status(buf) == 200);
+    expect("TRACE 后 body 匹配", n2 > 0 && strstr(buf, "trace-target") != NULL);
+
+    nl_sock_close(fd);
+    engine_stop(s);
+}
+
+/* ------------------------------------------------------------------ */
+/* 第205轮 CONNECT：本地 TCP echo 上游（accept 后 recv→原样 send 回）   */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int port;
+    volatile int ready;
+} echo_ctx_t;
+
+#ifdef _WIN32
+static unsigned __stdcall echo_proc(void* p) {
+#else
+static void* echo_proc(void* p) {
+#endif
+    echo_ctx_t* ctx = (echo_ctx_t*)p;
+    nl_sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == NL_SOCK_INVALID) return 0;
+    {
+        int yes = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)ctx->port);
+    a.sin_addr.s_addr = htonl(0x7F000001);   /* 127.0.0.1 */
+    if (bind(ls, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 4) != 0) {
+        nl_sock_close(ls);
+        return 0;
+    }
+    ctx->ready = 1;
+    nl_sock_t c = accept(ls, NULL, NULL);
+    if (c != NL_SOCK_INVALID) {
+        for (;;) {   /* 原样回显，验证隧道双向裸字节（不经 HTTP 解析） */
+            char b[512];
+            int m = nl_sock_recv(c, b, (int)sizeof(b), 0);
+            if (m <= 0) break;
+            if (nl_sock_send(c, b, m, 0) <= 0) break;
+        }
+        nl_sock_close(c);
+    }
+    nl_sock_close(ls);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+/* p. CONNECT 真隧道 + 目标白名单（第205轮）：
+ *    白名单命中 → 200 Connection Established + 同连接裸字节 echo 往返；
+ *    白名单未命中（注册别的 host）→ 403 Forbidden（默认安全语义）。 */
+static void case_connect(void) {
+    printf("\n[用例] p. CONNECT 真隧道 + 目标白名单\n");
+    int echo_port = g_port++;   /* 第205轮：echo 上游端口递增规避冲突 */
+    echo_ctx_t ectx;
+    memset(&ectx, 0, sizeof(ectx));
+    ectx.port = echo_port;
+#ifdef _WIN32
+    HANDLE eth = (HANDLE)_beginthreadex(NULL, 0, echo_proc, &ectx, 0, NULL);
+#else
+    pthread_t eth;
+    pthread_create(&eth, NULL, echo_proc, &ectx);
+#endif
+    for (int i = 0; i < 100 && !ectx.ready; i++) nl_sleep_ms(10);
+    expect("echo 上游就绪", ectx.ready != 0);
+
+    int port = g_port++;
+    nl_web_server_t* s = engine_start(port, 0, 0);
+    if (!s) { expect("start CONNECT server", 0); return; }
+    expect("注册白名单 127.0.0.1", nl_web_connect_allow(s, "127.0.0.1", 0) == 0);
+    nl_sleep_ms(50);
+
+    nl_sock_t fd = ka_connect(port);
+    expect("CONNECT 建连", fd != NL_SOCK_INVALID);
+    if (fd != NL_SOCK_INVALID) {
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: tun\r\n\r\n", echo_port);
+        expect("CONNECT 发送", nl_sock_send(fd, req, (int)strlen(req), 0) > 0);
+        char buf[4096];
+        int n = http_recv_full(fd, buf, sizeof(buf) - 1);
+        if (n > 0) buf[n] = '\0'; else buf[0] = '\0';
+        expect("CONNECT 200", n > 0 && http_status(buf) == 200);
+        expect("CONNECT Connection Established",
+               n > 0 && strstr(buf, "Connection Established") != NULL);
+        /* 同连接裸字节 → echo 上游原样返回（验证真隧道而非 HTTP 代理） */
+        expect("隧道发 ping", nl_sock_send(fd, "ping", 4, 0) == 4);
+        memset(buf, 0, sizeof(buf));
+        int m = nl_sock_recv(fd, buf, sizeof(buf) - 1, 0);
+        expect("隧道 echo ping", m == 4 && memcmp(buf, "ping", 4) == 0);
+        nl_sock_close(fd);
+    }
+
+    /* 白名单拒绝：另一实例只放行别的 host → CONNECT 127.0.0.1 必须 403 */
+    int port2 = g_port++;
+    nl_web_server_t* s2 = engine_start(port2, 0, 0);
+    if (s2) {
+        expect("拒绝实例注册别的 host",
+               nl_web_connect_allow(s2, "example.com", 0) == 0);
+        nl_sleep_ms(50);
+        char req2[256];
+        snprintf(req2, sizeof(req2),
+                 "CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: tun\r\n\r\n", echo_port);
+        char buf2[4096];
+        int n2 = http_exchange(port2, req2, buf2, sizeof(buf2));
+        expect("白名单拒绝 403", n2 > 0 && http_status(buf2) == 403);
+        engine_stop(s2);
+    } else {
+        expect("start deny server", 0);
+    }
+    engine_stop(s);
+
+    /* 解除 echo 线程可能阻塞的 accept（隧道失败时它仍在等连接），再 join */
+    {
+        nl_sock_t ub = socket(AF_INET, SOCK_STREAM, 0);
+        if (ub != NL_SOCK_INVALID) {
+            struct sockaddr_in ua;
+            memset(&ua, 0, sizeof(ua));
+            ua.sin_family = AF_INET;
+            ua.sin_port = htons((unsigned short)echo_port);
+            ua.sin_addr.s_addr = htonl(0x7F000001);
+            (void)connect(ub, (struct sockaddr*)&ua, sizeof(ua));
+            nl_sock_close(ub);
+        }
+    }
+#ifdef _WIN32
+    if (eth) {
+        WaitForSingleObject(eth, 5000);
+        CloseHandle(eth);
+    }
+#else
+    pthread_join(eth, NULL);
+#endif
+}
+
 int main(void) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
@@ -1017,6 +1401,11 @@ int main(void) {
     case_slowloris();
     case_abort();
     case_dir_endpoint();
+    case_keepalive_reuse();      /* 第204轮缺陷1/5 */
+    case_file_then_reuse();      /* 第204轮缺陷2 */
+    case_post_drain_reuse();     /* 第204轮 body 消费 */
+    case_trace();                /* 第205轮 TRACE 回显 */
+    case_connect();              /* 第205轮 CONNECT 真隧道 + 目标白名单 */
 
     printf("\n==== 汇总: %d 项, 通过 %d, 失败 %d ====\n",
            g_total, g_total - g_fail, g_fail);

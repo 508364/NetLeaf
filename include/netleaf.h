@@ -49,7 +49,9 @@ typedef enum {
     NL_METHOD_DELETE,
     NL_METHOD_PATCH,
     NL_METHOD_HEAD,
-    NL_METHOD_OPTIONS
+    NL_METHOD_OPTIONS,
+    NL_METHOD_TRACE,      /* 第205轮：回显请求（message/http） */
+    NL_METHOD_CONNECT     /* 第205轮：隧道/未实现时回 501 */
 } nl_http_method_t;
 
 // HTTP handler type
@@ -1035,6 +1037,11 @@ NL_API int nl_web_add_html_file(nl_web_server_t* server, const char* path, const
  * @see nl_web_add_proxy_dir
  */
 NL_API int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream);
+
+/* 第205轮 CONNECT：注册允许的隧道目标。host 精确匹配（不区分大小写），
+ * port=0 表示任意端口。空名单 = 拒绝所有 CONNECT（默认安全）。
+ * 最多 16 条，超出返回 -1。建议 start 前调用。返回 0=ok。 */
+NL_API int nl_web_connect_allow(nl_web_server_t* server, const char* host, int port);
 
 /**
  * @brief Add a directory (prefix) reverse proxy route — nginx `location` semantics — **Beta**

@@ -80,7 +80,7 @@ typedef struct nl_px_local_ops {
 typedef struct nl_px_local_plan {
     int status;              /* 200 / 301 / 302 / 404 / 500 */
     int type;                /* NL_PX_LOCAL_CONTENT / FILE / REDIRECT */
-    char head[1024];         /* 完整 HTTP/1.1 响应头（含 \r\n\r\n，Connection: close） */
+    char head[1024];         /* 完整 HTTP/1.1 响应头（含 \r\n\r\n；Connection 值由 plan_build 的 keepalive 决定） */
     size_t head_len;
     const char* body;        /* CONTENT：路由内容（借用，不拥有） */
     size_t body_len;
@@ -92,12 +92,17 @@ typedef struct nl_px_local_plan {
 
 /*
  * 构造本地路由响应计划（HTTP/1.1）。
+ * keepalive：1 = 2xx/3xx 响应头写 Connection: keep-alive（调用方响应完必须
+ *   真正复用连接，3xx 重定向头同样随此位）；0 = 写 close（响应完必须关闭）。
+ *   错误响应（404/403/400/500）固定 Connection: close —— 调用方对
+ *   status >= 400 必须关闭连接（第204轮：3xx 不再一律 close）。
  * 返回 1 = 已生成（out 有效）；0 = 未命中或 PROXY（平台走原 404 / 反代路径）；
  *      -1 = 参数错误。
  * 文件不存在回 404、超过 10MB 回 500，均以 head 表达（body 为空）。
  */
 int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
-                           const char* path, int is_head, nl_px_local_plan* out);
+                           const char* path, int is_head, int keepalive,
+                           nl_px_local_plan* out);
 
 /* ============================================================
  * 监听地址族选择（三平台共用）

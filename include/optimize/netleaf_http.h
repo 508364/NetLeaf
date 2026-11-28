@@ -174,6 +174,8 @@ typedef enum {
     NL_HTTP_HEAD,
     NL_HTTP_OPTIONS,
     NL_HTTP_PATCH,
+    NL_HTTP_TRACE,        /* 第205轮：回显请求（message/http） */
+    NL_HTTP_CONNECT,      /* 第205轮：隧道/未实现时回 501 */
     NL_HTTP_UNKNOWN
 } nlh_http_method_t;
 

@@ -657,9 +657,10 @@ static int pl_dir_resolve(const nl_px_local_route* route, const char* path,
         rem_in_work = 0;
     }
 
-    /* 2) 端点内 clamp 规范化：越根 ".." 忽略（端点即根，../ 不逃逸） */
+    /* 2) 端点内 clamp 规范化：越根 ".." 忽略（端点即根，../ 不逃逸）
+     * rem_in_work=1 时 rem 必指向 work 内部（可写缓冲），原地写强转去 const */
     char nrem[NL_URI_MAX];
-    int rc = rem_in_work ? nl_uri_normalize_clamp(rem, rem, sizeof(work))   /* 原地 */
+    int rc = rem_in_work ? nl_uri_normalize_clamp(rem, (char*)rem, sizeof(work))   /* 原地 */
                          : nl_uri_normalize_clamp(rem, nrem, sizeof(nrem));
     if (rc != NL_URI_OK) return rc;
     const char* use = rem_in_work ? rem : nrem;
@@ -851,7 +852,8 @@ static void pl_plan_status(nl_px_local_plan* out, int status, const char* head) 
 }
 
 int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
-                           const char* path, int is_head, nl_px_local_plan* out) {
+                           const char* path, int is_head, int keepalive,
+                           nl_px_local_plan* out) {
     if (!ops || !ops->lookup || !path || !out) return -1;
     memset(out, 0, sizeof(*out));
     out->status = 200;
@@ -883,7 +885,8 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
     if (route.type == NL_PX_LOCAL_REDIRECT) {
         int code = route.redirect_code > 0 ? route.redirect_code : 302;
         const char* loc = route.redirect_url ? route.redirect_url : "/";
-        int n = nl_px_build_redirect_head(out->head, sizeof(out->head), code, loc);
+        int n = nl_px_build_redirect_head(out->head, sizeof(out->head), code, loc,
+                                          keepalive);
         if (n < 0) { pl_plan_status(out, 500, PL_PLAN_500); return 1; }
         out->status = code;
         out->type = NL_PX_LOCAL_REDIRECT;
@@ -898,7 +901,7 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
         const char* ct = (route.content_type && route.content_type[0])
                              ? route.content_type : "text/plain; charset=utf-8";
         int n = nl_px_build_body_head(out->head, sizeof(out->head), ct,
-                                      (long long)blen, 0);
+                                      (long long)blen, 0, keepalive);
         if (n < 0) { pl_plan_status(out, 500, PL_PLAN_500); return 1; }
         out->status = 200;
         out->type = NL_PX_LOCAL_CONTENT;
@@ -946,7 +949,7 @@ int nl_px_local_plan_build(void* ctx, const nl_px_local_ops* ops,
         } else {
             ct = "application/octet-stream";
         }
-        int n = nl_px_build_body_head(out->head, sizeof(out->head), ct, sz, 0);
+        int n = nl_px_build_body_head(out->head, sizeof(out->head), ct, sz, 0, keepalive);
         if (n < 0) { pl_plan_status(out, 500, PL_PLAN_500); return 1; }
         out->status = 200;
         out->type = NL_PX_LOCAL_FILE;

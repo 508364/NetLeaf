@@ -614,8 +614,12 @@ static DWORD WINAPI listener_thread(LPVOID lpParam) {
                 // 先重投保证 handler 执行期间仍保持全部 NL_UDP_RCV_SLOTS 个 outstanding
                 // WSARecvFrom，内核持续异步填充空闲槽位。
                 size_t dlen = (size_t)bytes_xfer;
-                char* copy = (char*)malloc(dlen);
-                if (copy) memcpy(copy, slot->buf, dlen);
+                // 第205轮性能：datagram 拷贝改用栈缓冲（dlen ≤ 槽位 wb.len =
+                // BUFFER_SIZE，由 WSARecvFrom 保证），消除每包一次 malloc/free；
+                // 语义不变——缓冲仍仅在本次 handler 调用期间有效，且栈缓冲
+                // 不再有 malloc 失败导致丢弃该包的分支。
+                char copy[BUFFER_SIZE];
+                memcpy(copy, slot->buf, dlen);
 
                 // handler 仍在 → 立即重投（addrbuf/buf 归还内核；peer 已解到局部变量）
                 // handler 被动态清空 → 不重投，槽位耗尽后 GQCS 自然睡眠
@@ -636,14 +640,11 @@ static DWORD WINAPI listener_thread(LPVOID lpParam) {
                 }
 
                 // 拷贝缓冲只在本次 handler 调用期间有效（与旧 slot->buf 契约一致：
-                // handler 不得在调用后保留指针），调用完即回收
-                if (copy) {
-                    if (server->udp_handler_v2) {
-                        server->udp_handler_v2(copy, dlen, peer_addr, peer_port, server->user_data);
-                    } else if (server->udp_handler) {
-                        server->udp_handler(copy, dlen, server->user_data);
-                    }
-                    free(copy);
+                // handler 不得在调用后保留指针）
+                if (server->udp_handler_v2) {
+                    server->udp_handler_v2(copy, dlen, peer_addr, peer_port, server->user_data);
+                } else if (server->udp_handler) {
+                    server->udp_handler(copy, dlen, server->user_data);
                 }
             } else {
                 // bytes_xfer == 0 + gle==ERROR_OPERATION_ABORTED 常见于 server 关闭
@@ -1829,6 +1830,8 @@ static DWORD WINAPI router_server_thread(LPVOID arg) {
         else if (strcmp(method_str, "PATCH") == 0) method = NL_METHOD_PATCH;
         else if (strcmp(method_str, "HEAD") == 0) method = NL_METHOD_HEAD;
         else if (strcmp(method_str, "OPTIONS") == 0) method = NL_METHOD_OPTIONS;
+        else if (strcmp(method_str, "TRACE") == 0) method = NL_METHOD_TRACE;     /* 第205轮 */
+        else if (strcmp(method_str, "CONNECT") == 0) method = NL_METHOD_CONNECT; /* 第205轮 */
         
         char* body_start = strstr(buffer, "\r\n\r\n");
         const char* body = NULL;
@@ -2078,7 +2081,8 @@ static const nl_px_pool_ops g_pr_pool_ops = {
 #define PR_DEFER_CLOSE_MAX 32
 
 // 第191轮：延迟操作槽 —— 离开 pr_loop_cs 后由 consume loop 执行。
-// kind=PR_DEFER_CLOSE：has_plan=1 按 plan 发送响应头+body 后关闭（CONTENT 快路径）；
+// kind=PR_DEFER_CLOSE：has_plan=1 按 plan 发送响应头+body 后关闭（CONTENT 快路径；
+// 第204轮起仅 ka=0 且无 DRAIN 时入队，ka=1 走同步路径发完复用）；
 // kind=PR_DEFER_RECV ：post 首包 WSARecv（accept 路径的内核调用移出锁，~150us/次）。
 #define PR_DEFER_CLOSE 0
 #define PR_DEFER_RECV  1
@@ -2158,6 +2162,7 @@ struct nl_web_server {
     int force_legacy_pool;    // P5: 强制走 legacy worker 池（0=默认引擎）
     // ---- P6/P7 能力对齐（Windows IOCP 引擎）----
     int64_t *pr_last_active_ms; // [idx] -> 最近活跃毫秒（GetTickCount64 时钟，P7 空闲扫描）
+    int64_t *pr_req_drain;     // [idx] -> 第204轮：请求 body 待消费余量（DRAIN 阶段递减）
     DWORD   *pr_conn_id;        // [idx] -> slot 连接代号（slot 复用竞态防护）
     DWORD    pr_conn_id_next;   // 连接代号单调递增计数（从 1 起）
     CRITICAL_SECTION pr_loop_cs; // IOCP 完成处理临界区（P6 多消费线程串行化）
@@ -2168,6 +2173,11 @@ struct nl_web_server {
     int pr_engine_thread_count; // 额外消费线程实际创建数
     // HTTPS 上游隧道线程计数：拆卸时须等待归零，避免线程访问已释放的槽位数组
     volatile LONG pr_tls_threads;
+    // 第205轮 CONNECT：目标白名单（固定 16 条，不 malloc；host 精确匹配不区分
+    // 大小写，port=0 任意端口；空名单 = 拒绝所有 CONNECT，默认安全）
+    char connect_allow_host[16][256];
+    int  connect_allow_port[16];
+    int  connect_allow_cnt;
 };
 static struct nl_web_server* g_web_servers = NULL;
 static CRITICAL_SECTION g_web_servers_mutex;
@@ -2281,6 +2291,8 @@ static int  pr_h2_start_bridge(nl_web_server_t* s, int idx, SOCKET cfd,
 // ---------------------------------------------------------------------------
 #define PR_ST_DIR_W   0x01   // 方向：等上游可读（写下游）
 #define PR_ST_UP_EOF  0x02   // 上游已 EOF，写尽后关闭
+#define PR_ST_KA      0x04   // 第204轮：客户端请求意图 keep-alive（响应头与复用判定依据）
+#define PR_ST_DRAIN   0x08   // 第204轮：请求 body 消费阶段（收完按 KA 复用/关闭）
 #define PR_ST_TLS     0x40   // HTTPS 上游：已交给隧道线程，引擎不再碰该槽的 fd
 #define PR_ST_ACTIVE  0x80   // 该槽活跃
 #define PR_PROXY_BUF_SZ 65536
@@ -2353,10 +2365,66 @@ static void pr_free_slot(nl_web_server_t* s, int idx) {
     if (s->pr_remain)  s->pr_remain[idx]  = 0;
     if (s->pr_up) nl_px_upstate_reset(&s->pr_up[idx]);
     if (s->pr_last_active_ms) s->pr_last_active_ms[idx] = 0;
+    if (s->pr_req_drain) s->pr_req_drain[idx] = 0;   // 第204轮
     // 作废当前连接代号：旧连接的迟到完成事件（含空闲超时强关后的）将被丢弃
     if (s->pr_conn_id) s->pr_conn_id[idx] = ++s->pr_conn_id_next;
     s->pr_free[++(s->pr_free_top)] = idx;
     if (s->pr_count > 0) s->pr_count--;
+}
+
+/* 第204轮：keep-alive 复用 —— 清 per-请求状态、切回非阻塞并重新挂起客户端
+ * 接收。调用前提：响应已发完、请求 body 已收齐、hbuf 无管道化残留。 */
+static void pr_conn_keep_win(nl_web_server_t* s, int idx) {
+    SOCKET cfd = s->pr_fd_client[idx];
+    char*  hbuf = s->pr_hbuf[idx];
+    s->pr_state[idx]       = PR_ST_ACTIVE;   // 清 DIR_W / KA / DRAIN / UP_EOF
+    s->pr_route_idx[idx]   = -1;
+    s->pr_remain[idx]      = 0;
+    s->pr_up_pend_len[idx] = 0;
+    s->pr_up_req_len[idx]  = 0;
+    if (s->pr_up) nl_px_upstate_reset(&s->pr_up[idx]);
+    s->pr_hdr_len[idx]     = 0;
+    if (s->pr_req_drain) s->pr_req_drain[idx] = 0;
+    if (s->pr_last_active_ms) s->pr_last_active_ms[idx] = pr_pool_now_ms();
+    u_long nb_on = 1;
+    ioctlsocket(cfd, FIONBIO, &nb_on);
+    pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+    memset(cctx, 0, sizeof(*cctx));
+    cctx->idx      = idx;
+    cctx->conn_id  = s->pr_conn_id[idx];
+    cctx->ev       = IOCP_EV_CLIENT_READ;
+    cctx->sock     = cfd;
+    cctx->buf      = hbuf;
+    cctx->buflen   = 8192;
+    WSABUF wb = {8192, hbuf};
+    DWORD flags = 0, recvd = 0;
+    WSARecv(cfd, &wb, 1, &recvd, &flags, (LPOVERLAPPED)cctx, NULL);
+}
+
+/* 第204轮：按剩余量挂起一次 body 消费接收（len 精确限制，段内超出 body 的
+ * 字节留在内核缓冲，作为下一请求由正常接收路径读取）。 */
+static void pr_post_drain_recv(nl_web_server_t* s, int idx) {
+    SOCKET cfd = s->pr_fd_client[idx];
+    char*  hbuf = s->pr_hbuf[idx];
+    size_t want = 8192;
+    if (s->pr_req_drain && s->pr_req_drain[idx] > 0 &&
+        (size_t)s->pr_req_drain[idx] < want)
+        want = (size_t)s->pr_req_drain[idx];
+    u_long nb_on = 1;
+    ioctlsocket(cfd, FIONBIO, &nb_on);
+    pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+    memset(cctx, 0, sizeof(*cctx));
+    cctx->idx      = idx;
+    cctx->conn_id  = s->pr_conn_id[idx];
+    cctx->ev       = IOCP_EV_CLIENT_READ;
+    cctx->sock     = cfd;
+    cctx->buf      = hbuf;
+    cctx->buflen   = (int)want;
+    WSABUF wb;
+    wb.buf = hbuf;
+    wb.len = (ULONG)want;
+    DWORD flags = 0, recvd = 0;
+    WSARecv(cfd, &wb, 1, &recvd, &flags, (LPOVERLAPPED)cctx, NULL);
 }
 
 // 响应 framing（header/chunked/101 隧道）与请求重组已下沉至 src/common/nl_proxy_core.c，
@@ -2475,9 +2543,61 @@ static int pr_build_upstream_http(nl_web_server_t* s, int idx,
  * 进程内路由分发（H2 stream 直调，免去本机回放 socket 一跳）
  * 回调由公共层 nl_px_local_dispatch 调用：只读路由表 / 建上游连接。
  * ============================================================ */
+/* 第204轮：请求级路由预查缓存（线程本地）——引擎 dispatch 已查过一次路由，
+ * plan_build 内部回调命中此缓存可免再走 pr_lookup_route_idx + 链表遍历的
+ * 两次 s->mutex（缺陷4：多消费线程下路由表锁竞争拖垮吞吐）。仅引擎分发
+ * 路径写入、同请求内 plan_build 一次性消费；H2/legacy 等调用方为 NULL。 */
+#ifdef _MSC_VER
+#define NL_WIN_TLS __declspec(thread)   /* MSVC */
+#else
+#define NL_WIN_TLS __thread             /* MinGW/GCC（__declspec(thread) 会告警） */
+#endif
+static NL_WIN_TLS nl_web_route_t* g_pr_pre_route = NULL;
+static NL_WIN_TLS char g_pr_pre_path[4096];
+
 static int pr_local_lookup(void* ctx, const char* path, nl_px_local_route* out) {
     nl_web_server_t* s = (nl_web_server_t*)ctx;
     if (!s || !path || !out) return 0;
+    if (g_pr_pre_route && strcmp(g_pr_pre_path, path) == 0) {
+        /* 命中预查缓存：免两次 s->mutex；一次性消费杜绝陈旧指针 */
+        nl_web_route_t* pre = g_pr_pre_route;
+        g_pr_pre_route = NULL;
+        memset(out, 0, sizeof(*out));
+        out->redirect_code = (s->redirect_type == NL_REDIRECT_PERMANENT) ? 301 : 302;
+        switch (pre->type) {
+        case NL_ROUTE_TYPE_CONTENT:
+            out->type = NL_PX_LOCAL_CONTENT;
+            out->content = pre->content;
+            out->content_len = pre->content_size;
+            out->content_type = pre->content_type;
+            return 1;
+        case NL_ROUTE_TYPE_FILE:
+            out->type = NL_PX_LOCAL_FILE;
+            out->file_path = pre->file_path;
+            out->content_type = pre->content_type;
+            return 1;
+        case NL_ROUTE_TYPE_REDIRECT:
+            out->type = NL_PX_LOCAL_REDIRECT;
+            out->redirect_url = pre->redirect_url;
+            return 1;
+        case NL_ROUTE_TYPE_PROXY:
+            out->type = NL_PX_LOCAL_PROXY;
+            out->protocol = (pre->protocol == NL_PROXY_HTTPS) ? NL_PX_LOCAL_PROTO_HTTPS
+                          : (pre->protocol == NL_PROXY_TCP) ? NL_PX_LOCAL_PROTO_TCP
+                          : NL_PX_LOCAL_PROTO_HTTP;
+            out->upstream = pre->upstream;
+            out->dir_prefix = pre->is_prefix ? pre->path : NULL;
+            out->up_uri = pre->up_uri;
+            return 1;
+        case NL_ROUTE_TYPE_DIR:
+            out->type = NL_PX_LOCAL_DIR;
+            out->file_path = pre->file_path;
+            out->dir_prefix = pre->path;
+            return 1;
+        default:
+            return 0;
+        }
+    }
     int ridx = pr_lookup_route_idx(s, path);
     if (ridx < 0) return 0;
     nl_web_route_t* r = NULL;
@@ -2593,6 +2713,7 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
     // P7: 空闲超时扫描 + slot 复用竞态防护（conn_id 代号）
     s->pr_last_active_ms = (int64_t*)calloc((size_t)cap, sizeof(int64_t));
     s->pr_conn_id        = (DWORD*)calloc((size_t)cap, sizeof(DWORD));
+    s->pr_req_drain      = (int64_t*)calloc((size_t)cap, sizeof(int64_t));   // 第204轮
     for (int i = 0; i < cap; i++) {
         s->pr_fd_client[i]   = INVALID_SOCKET;
         s->pr_fd_upstream[i] = 0;
@@ -2607,7 +2728,7 @@ void nl_web_proxy_engine(nl_web_server_t* s, SOCKET listen_sock) {
         !s->pr_hdr_len || !s->pr_remain || !s->pr_free ||
         !s->pr_up || !s->pr_up_key ||
         !s->pr_up_pend || !s->pr_up_pend_len || !s->pr_up_req_len ||
-        !s->pr_last_active_ms || !s->pr_conn_id) {
+        !s->pr_last_active_ms || !s->pr_conn_id || !s->pr_req_drain) {
         goto cleanup_fail;
     }
     // 初始化上游 keep-alive 连接池（公共层实现；全局空闲 256，单 key 8，空闲 30s 回收）
@@ -2755,6 +2876,7 @@ cleanup_fail:
     free(s->pr_up_req_len);  s->pr_up_req_len  = NULL;
     free(s->pr_last_active_ms); s->pr_last_active_ms = NULL;  // P7
     free(s->pr_conn_id);        s->pr_conn_id        = NULL;  // slot 复用竞态防护
+    free(s->pr_req_drain);      s->pr_req_drain      = NULL;  // 第204轮
     s->pr_cap = s->pr_count = 0;
     // P6: 释放完成处理临界区（与引擎入口 InitializeCriticalSection 配对；
     // 重复 start/stop 每次引擎启动重新初始化，不泄漏）
@@ -2858,6 +2980,28 @@ static inline void pr_close_defer(pr_defer_t* arr, int* n, SOCKET fd) {
     } else {
         closesocket(fd);
     }
+}
+
+/* 第205轮 CONNECT：直连隧道目标（nl_proxy_fill_addr 解析 → socket → connect），
+ * 5 秒收发超时防挂死。不复用 nl_proxy_connect_upstream（它按 route 取地址，
+ * CONNECT 语义要求直接用解析出的 host:port 建连）。成功返回 socket，
+ * 失败返回 INVALID_SOCKET。 */
+static SOCKET pr_connect_direct(const char* host, int port) {
+    struct sockaddr_storage ss;
+    int af = nl_proxy_fill_addr(host, port, &ss);
+    if (af == 0) return INVALID_SOCKET;
+    SOCKET fd = socket(af, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return INVALID_SOCKET;
+    DWORD tv_ms = 5000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_ms, sizeof(tv_ms));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv_ms, sizeof(tv_ms));
+    int len = (af == AF_INET6) ? (int)sizeof(struct sockaddr_in6)
+                               : (int)sizeof(struct sockaddr_in);
+    if (connect(fd, (struct sockaddr*)&ss, len) == SOCKET_ERROR) {
+        closesocket(fd);
+        return INVALID_SOCKET;
+    }
+    return fd;
 }
 
 static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
@@ -3019,7 +3163,8 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
             DWORD flags_c = 0, dummy_c = 0;
             WSARecv(cfd, &wsabuf_c, 1, &dummy_c, &flags_c, (LPOVERLAPPED)cctx2, NULL);
 
-            s->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
+            /* 第204轮：保留 PR_ST_KA（完成点复用判定依据），清 UP_EOF/DRAIN 等旧状态 */
+s->pr_state[idx] = (s->pr_state[idx] & PR_ST_KA) | PR_ST_DIR_W | PR_ST_ACTIVE;
             return;
         }
 
@@ -3035,6 +3180,29 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
             }
 
             if (nread > 0 && s->pr_last_active_ms) s->pr_last_active_ms[idx] = pr_pool_now_ms();  // P7: 客户端数据到达，刷新活跃时间
+
+            /* 第204轮：请求 body 消费阶段 —— 响应已发完，按 Content-Length 丢弃
+             * 余量（本地路由 body 无人读）。收完后按 keep-alive 决定复用或关闭；
+             * 字节不计入 hbuf/hlen，缓冲留给复用后的下一请求。 */
+            if (s->pr_state[idx] & PR_ST_DRAIN) {
+                if (s->pr_req_drain) {
+                    s->pr_req_drain[idx] -= nread;
+                    if (s->pr_req_drain[idx] < 0) s->pr_req_drain[idx] = 0;
+                }
+                if (s->pr_req_drain && s->pr_req_drain[idx] > 0) {
+                    pr_post_drain_recv(s, idx);   // 未收齐：按余量继续收
+                    return;
+                }
+                s->pr_state[idx] &= (uint8_t)~PR_ST_DRAIN;
+                if (s->pr_state[idx] & PR_ST_KA) {
+                    pr_conn_keep_win(s, idx);     // body 收齐 → 复用连接
+                    return;
+                }
+                closesocket(cfd);
+                s->pr_fd_client[idx] = INVALID_SOCKET;
+                pr_free_slot(s, idx);             // ka=0 → body 收完再关（防 RST）
+                return;
+            }
 
             char* hbuf = s->pr_hbuf[idx];
             int* hlen = &s->pr_hdr_len[idx];
@@ -3087,14 +3255,167 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                     pr_free_slot(s, idx);
                     return;
                 }
+                /* ---- 第205轮 CONNECT：HTTP CONNECT 真隧道 + 目标白名单 ----
+                 * path 是 authority（host:port，无 '/'），查路由表必 404 —— 必须
+                 * 在 pr_lookup_route_idx 之前分发。空名单 = 拒绝所有 CONNECT
+                 * （默认安全）。隧道自成一体：up_parse=TUNNEL 后双向裸字节经
+                 * CLIENT_READ / UPSTREAM_READ 完成分支透传，不走 KA 复用收口。 */
+                if (strcmp(method, "CONNECT") == 0) {
+                    /* a. 白名单检查：host 精确匹配（不区分大小写），port=0 任意端口 */
+                    char thost[256];
+                    int tport = 443;
+                    int allowed = 0;
+                    if (nl_px_split_hostport(path, thost, sizeof(thost), &tport, 443)) {
+                        EnterCriticalSection(&s->mutex);
+                        for (int ai = 0; ai < s->connect_allow_cnt; ai++) {
+                            if ((s->connect_allow_port[ai] == 0 ||
+                                 s->connect_allow_port[ai] == tport) &&
+                                _stricmp(s->connect_allow_host[ai], thost) == 0) {
+                                allowed = 1;
+                                break;
+                            }
+                        }
+                        LeaveCriticalSection(&s->mutex);
+                    }
+                    if (!allowed) {
+                        send_http_error(cfd, 403, "Forbidden");
+                        pr_close_defer(defer, ndefer, cfd);
+                        pr_free_slot(s, idx);
+                        return;
+                    }
+                    /* 请求头必须收齐（\r\n\r\n）：否则再 post 一次 WSARecv 等剩余头 */
+                    char* che = NULL;
+                    for (int i = (int)(line_end - hbuf) + 1; i + 3 < *hlen; i++) {
+                        if (hbuf[i] == '\r' && hbuf[i + 1] == '\n' &&
+                            hbuf[i + 2] == '\r' && hbuf[i + 3] == '\n') {
+                            che = hbuf + i;
+                            break;
+                        }
+                    }
+                    if (!che) {
+                        if (*hlen < 8192) {
+                            pr_iocp_ctx_t* cctx0 = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+                            memset(cctx0, 0, sizeof(*cctx0));
+                            cctx0->idx = idx;
+                            cctx0->conn_id = s->pr_conn_id[idx];
+                            cctx0->ev = IOCP_EV_CLIENT_READ;
+                            cctx0->sock = cfd;
+                            cctx0->buf = hbuf;
+                            cctx0->buflen = 8192;
+                            WSABUF wb0 = {8192, hbuf};
+                            DWORD fl0 = 0, dm0 = 0;
+                            WSARecv(cfd, &wb0, 1, &dm0, &fl0, (LPOVERLAPPED)cctx0, NULL);
+                            return;
+                        }
+                        send_http_error(cfd, 400, "Bad Request");
+                        pr_close_defer(defer, ndefer, cfd);
+                        pr_free_slot(s, idx);
+                        return;
+                    }
+                    /* b. 建连：阻塞 connect（5 秒超时），不走 route/up_pool */
+                    SOCKET ufd_new = pr_connect_direct(thost, tport);
+                    if (ufd_new == INVALID_SOCKET) {
+                        send_http_error(cfd, 502, "Bad Gateway");
+                        pr_close_defer(defer, ndefer, cfd);
+                        pr_free_slot(s, idx);
+                        return;
+                    }
+                    /* c. 回 200 Connection Established（临时切阻塞保证一次写完） */
+                    static const char ok_hdr[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+                    u_long nb_off200 = 0;
+                    ioctlsocket(cfd, FIONBIO, &nb_off200);
+                    int ok_sent = 0;
+                    while (ok_sent < (int)sizeof(ok_hdr) - 1) {
+                        int w = send(cfd, ok_hdr + ok_sent,
+                                     (int)sizeof(ok_hdr) - 1 - ok_sent, 0);
+                        if (w <= 0) break;
+                        ok_sent += w;
+                    }
+                    u_long nb_on200 = 1;
+                    ioctlsocket(cfd, FIONBIO, &nb_on200);   /* 隧道期客户端保持非阻塞 */
+                    if (ok_sent != (int)sizeof(ok_hdr) - 1) {
+                        closesocket(ufd_new);
+                        pr_close_defer(defer, ndefer, cfd);
+                        pr_free_slot(s, idx);
+                        return;
+                    }
+                    /* 头后与 CONNECT 同包到达的残留字节属于隧道负载，转给上游 */
+                    int hdr_total = (int)(che + 4 - hbuf);
+                    int leftn = *hlen - hdr_total;
+                    if (leftn > 0) {
+                        u_long nb_offl = 0;
+                        ioctlsocket(ufd_new, FIONBIO, &nb_offl);
+                        int offl = 0;
+                        while (offl < leftn) {
+                            int w = send(ufd_new, hbuf + hdr_total + offl, leftn - offl, 0);
+                            if (w <= 0) break;
+                            offl += w;
+                        }
+                    }
+                    u_long nb_onu = 1;
+                    ioctlsocket(ufd_new, FIONBIO, &nb_onu);
+                    /* d. 进入隧道泵：关联 IOCP + 双向 post WSARecv；
+                     *    up_parse=TUNNEL 让泵只做裸字节透传，不再做 HTTP 解析。
+                     *    任一侧 EOF/错误 → CLIENT_READ / UPSTREAM_READ 完成分支
+                     *    统一关双端回收槽位。 */
+                    CreateIoCompletionPort((HANDLE)ufd_new, s->iocp, (ULONG_PTR)idx, 0);
+                    s->pr_fd_upstream[idx] = ufd_new;
+                    s->pr_route_idx[idx]   = -1;
+                    s->pr_up_req_len[idx]  = 0;
+                    s->pr_up_pend_len[idx] = 0;
+                    s->pr_state[idx]       = PR_ST_DIR_W | PR_ST_ACTIVE;   /* KA/DRAIN 全清：不回 KA 复用 */
+                    s->pr_up[idx].up_parse = PR_UP_TUNNEL;
+                    *hlen = 0;   /* 请求头已消费，之后字节全是隧道负载 */
+                    if (!s->pr_up_pend[idx]) {
+                        s->pr_up_pend[idx] = (char*)malloc(PR_PROXY_BUF_SZ);
+                        if (!s->pr_up_pend[idx]) {
+                            closesocket(ufd_new);
+                            s->pr_fd_upstream[idx] = 0;
+                            pr_close_defer(defer, ndefer, cfd);
+                            pr_free_slot(s, idx);
+                            return;
+                        }
+                    }
+                    /* 上游→客户端方向：post 上游 WSARecv */
+                    pr_iocp_ctx_t* uctx = &((pr_iocp_ctx_t*)s->pr_iocp_up_ctx)[idx];
+                    memset(uctx, 0, sizeof(*uctx));
+                    uctx->idx = idx;
+                    uctx->conn_id = s->pr_conn_id[idx];
+                    uctx->ev  = IOCP_EV_UPSTREAM_READ;
+                    uctx->sock = ufd_new;
+                    uctx->buf  = s->pr_up_pend[idx];
+                    uctx->buflen = PR_PROXY_BUF_SZ;
+                    WSABUF wsb_up = {PR_PROXY_BUF_SZ, s->pr_up_pend[idx]};
+                    DWORD flg_up = 0, dummy_up = 0;
+                    WSARecv(ufd_new, &wsb_up, 1, &dummy_up, &flg_up, (LPOVERLAPPED)uctx, NULL);
+                    /* 客户端→上游方向：再 post 客户端 WSARecv（隧道裸字节） */
+                    pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
+                    memset(cctx, 0, sizeof(*cctx));
+                    cctx->idx = idx;
+                    cctx->conn_id = s->pr_conn_id[idx];
+                    cctx->ev  = IOCP_EV_CLIENT_READ;
+                    cctx->sock = cfd;
+                    cctx->buf  = hbuf;
+                    cctx->buflen = 8192;
+                    WSABUF wsabuf_c = {8192, hbuf};
+                    DWORD flg_c = 0, dummy_c = 0;
+                    WSARecv(cfd, &wsabuf_c, 1, &dummy_c, &flg_c, (LPOVERLAPPED)cctx, NULL);
+                    return;
+                }
                 s->pr_up[idx].req_is_head = (strcmp(method, "HEAD") == 0) ? 1 : 0;
 
-                int ridx = pr_lookup_route_idx(s, path);
+                // 第204轮缺陷4：一次临界区内拿到下标+指针（Windows 临界区同线程
+                // 可递归进入，外层只产生一次真实争用，替代原先两次 Enter/Leave）；
+                // 并缓存给 plan_build 内部 lookup，免再走两次 s->mutex。
                 nl_web_route_t* r = NULL;
+                int ridx;
                 EnterCriticalSection(&s->mutex);
-                int cur = 0;
-                for (nl_web_route_t* it = s->routes; it; it = it->next, cur++)
-                    if (cur == ridx) { r = it; break; }
+                ridx = pr_lookup_route_idx(s, path);
+                if (ridx >= 0) {
+                    int cur = 0;
+                    for (nl_web_route_t* it = s->routes; it; it = it->next, cur++)
+                        if (cur == ridx) { r = it; break; }
+                }
                 LeaveCriticalSection(&s->mutex);
                 if (!r) {
                     send_http_error(cfd, 404, "Not Found");
@@ -3102,6 +3423,8 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                     pr_free_slot(s, idx);
                     return;
                 }
+                g_pr_pre_route = r;   /* 同请求内 plan_build 一次性消费 */
+                snprintf(g_pr_pre_path, sizeof(g_pr_pre_path), "%s", path);
 
                 // ---------- 请求头完整性检查 ----------
                 // HTTP/HTTPS 上游必须等客户端头收齐（\r\n\r\n）才能改写构造转发；
@@ -3133,6 +3456,53 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                     }
                 }
 
+                /* 第204轮：keep-alive / Content-Length 判定（公共层统一规则：
+                 * HTTP/1.1 默认持久、1.0 默认关闭；chunked 或非法 CL 一律关闭）。
+                 * TCP 原始透传不适用 HTTP 语义，保持默认关闭。 */
+                int req_ka = 0;
+                long long req_cl = 0;
+                if (!is_tcp_proxy) {
+                    char*  hdrs = hbuf + (line_end - hbuf) + 1;
+                    size_t hdrs_len = (size_t)((hdr_end + 4) - hdrs);
+                    req_ka = nl_px_req_keepalive(proto, hdrs, hdrs_len);
+                    req_cl = nl_px_req_content_length(hdrs, hdrs_len);
+                    if (req_cl < 0) req_cl = 0;
+                    if (req_ka) s->pr_state[idx] |= PR_ST_KA;
+                    else        s->pr_state[idx] &= (uint8_t)~PR_ST_KA;
+                }
+
+                /* 第205轮：TRACE 回显（RFC 9110 §9.3.1）—— 200 + message/http，
+                 * body = 原始请求（行+头）。必须在下方 body 剥离前取字节
+                 * （剥离会 memmove 掉头块）；同步构造，分发处发送后走状态机收口。 */
+                char* trace_buf = NULL;
+                int   trace_len = 0;
+                if (!is_tcp_proxy && r->type != NL_ROUTE_TYPE_PROXY &&
+                    strcmp(method, "TRACE") == 0) {
+                    int raw_tlen = (int)(hdr_end + 4 - hbuf);
+                    if (raw_tlen < 0) raw_tlen = 0;
+                    char shead[256];
+                    int hn = snprintf(shead, sizeof(shead),
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: message/http\r\n"
+                                      "Content-Length: %d\r\n"
+                                      "Connection: %s\r\n\r\n",
+                                      raw_tlen, req_ka ? "keep-alive" : "close");
+                    if (hn > 0) {
+                        trace_buf = (char*)malloc((size_t)hn + (size_t)raw_tlen + 1);
+                        if (trace_buf) {
+                            memcpy(trace_buf, shead, (size_t)hn);
+                            memcpy(trace_buf + hn, hbuf, (size_t)raw_tlen);
+                            trace_len = hn + raw_tlen;
+                        }
+                    }
+                    if (!trace_buf) {
+                        send_http_error(cfd, 500, "Internal Server Error");
+                        pr_close_defer(defer, ndefer, cfd);
+                        pr_free_slot(s, idx);
+                        return;
+                    }
+                }
+
                 /* HTTP/1.1 Upgrade: h2c —— 请求头已收齐时移交公共层 H2 桥接，
                  * 这条 HTTP/1.1 请求本身作为 stream 1；平台此后不再处理该连接。 */
                 if (!is_tcp_proxy && hdr_end &&
@@ -3156,22 +3526,71 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                 }
                 size_t body_len = (size_t)*hlen - body_off;
 
+                /* 第204轮：本地路由 body 剥离 —— body 无人消费，复用前必须从缓冲
+                 * 剥离：已全到 → 压缩保留其后的管道化残留；未到全 → 记入 drain 等
+                 * 响应完成后异步收齐（DRAIN 阶段）。proxy 路由不剥离（raw/body_off
+                 * 指向的首包 body 还要转发给上游）。 */
+                if (!is_tcp_proxy && r->type != NL_ROUTE_TYPE_PROXY) {
+                    int boff = (int)(hdr_end + 4 - hbuf);
+                    int already = *hlen - boff;
+                    if (req_cl > 0) {
+                        if ((long long)already >= req_cl) {
+                            int tail = (int)((long long)already - req_cl);
+                            if (tail > 0) memmove(hbuf, hbuf + boff + (int)req_cl, (size_t)tail);
+                            *hlen = tail;
+                            if (s->pr_req_drain) s->pr_req_drain[idx] = 0;
+                        } else {
+                            *hlen = 0;
+                            if (s->pr_req_drain) s->pr_req_drain[idx] = req_cl - already;
+                        }
+                    } else {
+                        if (already > 0) memmove(hbuf, hbuf + boff, (size_t)already);
+                        *hlen = already;
+                        if (s->pr_req_drain) s->pr_req_drain[idx] = 0;
+                    }
+                    hbuf[*hlen] = '\0';
+                }
+
                 // ---------- 完整混合路由分发 ----------
                 if (r->type != NL_ROUTE_TYPE_PROXY) {
-                    // 非 proxy：临时切阻塞发响应，处理完立即 close
+                    // 第205轮：TRACE 回显已构造 —— 同步发送后按状态机收口
+                    if (trace_buf) {
+                        u_long nb_off_t = 0;
+                        ioctlsocket(cfd, FIONBIO, &nb_off_t);   /* 临时切阻塞发完 */
+                        send(cfd, trace_buf, trace_len, 0);
+                        free(trace_buf);
+                        int has_drain_t = (s->pr_req_drain && s->pr_req_drain[idx] > 0);
+                        if (has_drain_t) {
+                            s->pr_state[idx] |= PR_ST_DRAIN;
+                            pr_post_drain_recv(s, idx);
+                            return;
+                        }
+                        if ((s->pr_state[idx] & PR_ST_KA) && *hlen == 0) {
+                            pr_conn_keep_win(s, idx);
+                            return;
+                        }
+                        pr_close_defer(defer, ndefer, cfd);
+                        pr_free_slot(s, idx);
+                        return;
+                    }
+                    // 非 proxy：临时切阻塞发响应
                     u_long nb_off = 0;
                     ioctlsocket(cfd, FIONBIO, &nb_off);
 
                     // 查路由 + 状态 + 响应头统一由公共层生成（与 H2 进程内分发同源）；
                     // body 仍按平台最优方式发送：CONTENT 直接 send，FILE 走 TransmitFile 零拷贝。
+                    // 第204轮：keep-alive 由状态机判定（PR_ST_KA 位）传入，头与复用行为一致。
+                    int req_ka_bit = (s->pr_state[idx] & PR_ST_KA) != 0;
                     nl_px_local_plan plan;
                     int built = nl_px_local_plan_build(s, &g_pr_local_ops, path,
-                                                       s->pr_up[idx].req_is_head, &plan);
+                                                       s->pr_up[idx].req_is_head,
+                                                       req_ka_bit, &plan);
+                    int has_drain = (s->pr_req_drain && s->pr_req_drain[idx] > 0);
+                    /* 第191轮 CONTENT 快路径（锁外发完即关）：仅 ka=0 且无待消费
+                     * body 时可用 —— ka=1 必须走同步路径才能发完后复用连接，
+                     * body 未收齐必须走 DRAIN 异步收完再关（防带未读数据 RST）。 */
                     if (built == 1 && plan.type == NL_PX_LOCAL_CONTENT &&
-                        *ndefer < PR_DEFER_CLOSE_MAX) {
-                        /* 第191轮：CONTENT 快路径 —— plan 整体拷进延迟槽，
-                         * 头+body 发送与 closesocket 全部移到锁外执行（见 consume loop）。
-                         * 只留状态复用在锁内，多消费线程才能真正并行。 */
+                        !req_ka_bit && !has_drain && *ndefer < PR_DEFER_CLOSE_MAX) {
                         pr_defer_t* d = &defer[(*ndefer)++];
                         d->kind = PR_DEFER_CLOSE;
                         d->fd = cfd;
@@ -3198,6 +3617,23 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                         }
                     } else {
                         send_http_error(cfd, 404, "Not Found");
+                    }
+                    /* 第204轮：状态机收口 —— 响应已发完，不再无条件关闭：
+                     * ① body 未收齐 → 异步 DRAIN，收完再按 KA 位定去向；
+                     * ② ka=1 且无管道化残留 → 复用连接（修复缺陷5 的长连接用例）；
+                     * ③ 其余（ka=0 / 错误响应固定 close / 有残留）→ 延迟关闭。 */
+                    if (built == 1 && plan.status < 400) {
+                        if (has_drain) {
+                            s->pr_state[idx] |= PR_ST_DRAIN;
+                            pr_post_drain_recv(s, idx);
+                            return;
+                        }
+                        if (req_ka_bit && *hlen == 0) {
+                            pr_conn_keep_win(s, idx);
+                            return;
+                        }
+                        /* ka=1 但 hbuf 有管道化残留：暂不支持复用中续解析，
+                         * 按 RFC 允许拒绝 —— 关闭（顺序请求不受影响，残留=0）。 */
                     }
                     // 第191轮：closesocket 延迟到锁外执行（见 consume loop）
                     pr_close_defer(defer, ndefer, cfd);   // 取消所有 pending I/O
@@ -3367,7 +3803,8 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                 DWORD flags2 = 0, dummy2 = 0;
                 WSARecv(cfd, &wsabuf2, 1, &dummy2, &flags2, (LPOVERLAPPED)cctx, NULL);
 
-                s->pr_state[idx] = PR_ST_DIR_W | PR_ST_ACTIVE;
+                /* 第204轮：保留 PR_ST_KA（完成点复用判定依据），清 UP_EOF/DRAIN 等旧状态 */
+s->pr_state[idx] = (s->pr_state[idx] & PR_ST_KA) | PR_ST_DIR_W | PR_ST_ACTIVE;
                 return;
             }
 
@@ -3384,6 +3821,8 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                 }
                 u_long nb_on2 = 1;
                 ioctlsocket(s->pr_fd_upstream[idx], FIONBIO, &nb_on2);
+                *hlen = 0;   // 第204轮：body 已转发，缓冲归零（否则 hlen 跨段累加
+                             // 会越界，且 proxy 完成点复用判定要求 hlen==0）
                 // 继续 post 客户端 WSARecv
                 pr_iocp_ctx_t* cctx = &((pr_iocp_ctx_t*)s->pr_iocp_client_ctx)[idx];
                 memset(cctx, 0, sizeof(*cctx));
@@ -3458,7 +3897,7 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                 return;
             }
 
-            // 响应完整且已全部转发给客户端 → 归还上游连接复用，关闭客户端
+            // 响应完整且已全部转发给客户端 → 上游归还池；客户端按 keep-alive 复用/关闭
             if (s->pr_up[idx].up_parse == PR_UP_DONE) {
                 if (s->pr_up_key[idx] && s->pr_up_key[idx][0] != '\0') {
                     // 归还池（不关闭 socket；IOCP 无显式摘除 API，重关联时更新 key）
@@ -3467,6 +3906,19 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                     closesocket(ufd);   // 不参与池（如 tcp）直接关闭
                 }
                 s->pr_fd_upstream[idx] = 0;
+                /* 第204轮：上游响应 framing=keep-alive 时透传给客户端的头也是
+                 * keep-alive，连接必须真的复用（修复缺陷1 头与行为不一致）。
+                 * 客户端侧 WSARecv 仍在挂起（分发/body 转发时 post），无需再 post。 */
+                if (s->pr_state[idx] & PR_ST_KA) {
+                    s->pr_state[idx]    = PR_ST_ACTIVE;   // 清 DIR_W / KA / UP_EOF
+                    s->pr_route_idx[idx] = -1;
+                    s->pr_remain[idx]   = 0;
+                    s->pr_up_pend_len[idx] = 0;
+                    s->pr_up_req_len[idx]  = 0;
+                    nl_px_upstate_reset(&s->pr_up[idx]);
+                    if (s->pr_last_active_ms) s->pr_last_active_ms[idx] = pr_pool_now_ms();
+                    return;
+                }
                 closesocket(cfd);
                 s->pr_fd_client[idx] = INVALID_SOCKET;
                 pr_free_slot(s, idx);
@@ -3524,7 +3976,7 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
 
             // 余量全部补发完成
             s->pr_up_pend_len[idx] = 0;
-            // 响应完整 → 归还上游连接复用，关闭客户端（与上游读完成分支一致）
+            // 响应完整 → 上游归还池；客户端按 keep-alive 复用/关闭（与上游读完成分支一致）
             if (s->pr_up[idx].up_parse == PR_UP_DONE) {
                 if (s->pr_up_key[idx] && s->pr_up_key[idx][0] != '\0') {
                     nl_px_pool_put(s->up_pool, s->pr_up_key[idx], (intptr_t)ufd);
@@ -3532,6 +3984,17 @@ static void pr_iocp_handle_completion(nl_web_server_t* s, SOCKET listen_sock,
                     closesocket(ufd);
                 }
                 s->pr_fd_upstream[idx] = 0;
+                /* 第204轮：复用判定同上游读完成分支（见上） */
+                if (s->pr_state[idx] & PR_ST_KA) {
+                    s->pr_state[idx]    = PR_ST_ACTIVE;
+                    s->pr_route_idx[idx] = -1;
+                    s->pr_remain[idx]   = 0;
+                    s->pr_up_pend_len[idx] = 0;
+                    s->pr_up_req_len[idx]  = 0;
+                    nl_px_upstate_reset(&s->pr_up[idx]);
+                    if (s->pr_last_active_ms) s->pr_last_active_ms[idx] = pr_pool_now_ms();
+                    return;
+                }
                 closesocket(cfd);
                 s->pr_fd_client[idx] = INVALID_SOCKET;
                 pr_free_slot(s, idx);
@@ -4172,7 +4635,7 @@ static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
                 LeaveCriticalSection(&server->mutex);
                 char redirect_response[1024];
                 int rn = nl_px_build_redirect_head(redirect_response, sizeof(redirect_response),
-                                                   redirect_code, route->redirect_url);
+                                                   redirect_code, route->redirect_url, 0);
                 if (rn > 0) (void)send(client, redirect_response, rn, 0);
                 closesocket(client);
                 return;
@@ -4218,12 +4681,13 @@ static void nl_handle_client(nl_web_server_t* server, SOCKET client) {
             }
             else if (route->type == NL_ROUTE_TYPE_DIR) {
                 // 第203轮：目录/文件端点 —— 复用公共层 plan（端点即根、../ clamp、
-                // MIME 猜测、错误码映射均与引擎路径同一份实现）
+                // MIME 猜测、错误码映射均与引擎路径同一份实现）；
+                // keepalive 传 0：legacy 每请求一连接，响应完即关（头与行为一致）
                 LeaveCriticalSection(&server->mutex);
                 int is_head = (strcmp(method, "HEAD") == 0);
                 nl_px_local_plan plan;
                 if (nl_px_local_plan_build(server, &g_pr_local_ops, path,
-                                           is_head, &plan) != 1 || plan.head_len == 0) {
+                                           is_head, 0, &plan) != 1 || plan.head_len == 0) {
                     send_http_error(client, 404, "Not Found");
                     closesocket(client);
                     return;
@@ -5131,6 +5595,25 @@ static int nl_web_add_proxy_common(nl_web_server_t* server, const char* path,
 
 int nl_web_add_proxy(nl_web_server_t* server, const char* path, const char* upstream) {
     return nl_web_add_proxy_common(server, path, upstream, 0);
+}
+
+/* 第205轮 CONNECT：注册允许的隧道目标白名单（host 精确匹配不区分大小写，
+ * port=0 任意端口；空名单拒绝所有 CONNECT）。最多 16 条，超出返回 -1。 */
+int nl_web_connect_allow(nl_web_server_t* server, const char* host, int port) {
+    if (!server || !host || !host[0]) return -1;
+    int rc = 0;
+    EnterCriticalSection(&server->mutex);
+    if (server->connect_allow_cnt >= 16) {
+        rc = -1;   /* 固定上限：不扩容、不 malloc */
+    } else {
+        int i = server->connect_allow_cnt;
+        snprintf(server->connect_allow_host[i], sizeof(server->connect_allow_host[i]),
+                 "%s", host);
+        server->connect_allow_port[i] = port;
+        server->connect_allow_cnt = i + 1;
+    }
+    LeaveCriticalSection(&server->mutex);
+    return rc;
 }
 
 // 第195轮：目录（前缀）转发 —— nginx `location <prefix> { proxy_pass ... }` 语义。

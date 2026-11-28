@@ -7,6 +7,7 @@
 
 #include "netleaf_websocket.h"
 #include "nl_util.h"
+#include "common/nl_ws_tls.h"   /* 第205轮 WSS：TLS 运行时后端（三平台共用） */
 
 #define MAX_CLIENTS 256
 #define BUFFER_SIZE 16384
@@ -29,11 +30,17 @@ struct nl_websocket_server {
     HANDLE thread;
     ws_client_t* clients;
     CRITICAL_SECTION clients_mutex;
-    
+
     nl_ws_connect_handler on_connect;
     nl_ws_message_handler on_message;
     nl_ws_close_handler on_close;
     void* user_data;
+
+    /* 第205轮 WSS：TLS 配置（enable_tls 在 start 前设置；cert/key 为
+     * 调用方传入的 PEM 文件路径拷贝，不硬编码任何密钥） */
+    int tls_enabled;
+    char* tls_cert_file;
+    char* tls_key_file;
 };
 
 static void simple_sha1(const char* input, size_t len, unsigned char* output) {
@@ -44,9 +51,10 @@ static void base64_encode(const char* input, size_t len, char* output) {
     nl_base64_encode_into(input, len, output);
 }
 
-static int websocket_handshake(SOCKET client_fd) {
+/* 第205轮 WSS：tls 非空时读写全部走 TLS，NULL 时与明文完全一致 */
+static int websocket_handshake(SOCKET client_fd, nl_ws_tls_conn_t* tls) {
     char buffer[BUFFER_SIZE];
-    int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    int bytes = nl_ws_io_recv(tls, (uintptr_t)client_fd, buffer, BUFFER_SIZE - 1);
     if (bytes <= 0) return -1;
     buffer[bytes] = '\0';
     
@@ -85,7 +93,8 @@ static int websocket_handshake(SOCKET client_fd) {
         "\r\n",
         accept_key);
     
-    send(client_fd, response, (int)strlen(response), 0);
+    if (nl_ws_io_send(tls, (uintptr_t)client_fd, response, (int)strlen(response)) <= 0)
+        return -1;   /* 101 响应写失败（TLS 或对端异常）按握手失败处理 */
     return 0;
 }
 
@@ -158,41 +167,58 @@ static DWORD WINAPI client_thread(LPVOID arg) {
     nl_websocket_server_t* server = targ->server;
     SOCKET client_fd = targ->client_fd;
     free(targ);
-    
-    if (websocket_handshake(client_fd) != 0) {
+
+    /* 第205轮 WSS：enable TLS 时先完成服务端 TLS 握手（阻塞式），
+     * 之后 HTTP 升级握手与 frame 读写全部走 TLS；失败关连接。 */
+    nl_ws_tls_conn_t* tls = NULL;
+    if (server->tls_enabled) {
+        tls = nl_ws_tls_accept((uintptr_t)client_fd,
+                               server->tls_cert_file, server->tls_key_file);
+        if (!tls) {
+            closesocket(client_fd);
+            if (server->on_close) {
+                server->on_close(server->user_data);
+            }
+            return 0;
+        }
+    }
+
+    if (websocket_handshake(client_fd, tls) != 0) {
+        nl_ws_tls_release(tls);
         closesocket(client_fd);
         if (server->on_close) {
             server->on_close(server->user_data);
         }
         return 0;
     }
-    
+
     char buffer[BUFFER_SIZE];
-    
+
     while (1) {
-        int bytes = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+        int bytes = nl_ws_io_recv(tls, (uintptr_t)client_fd, buffer, BUFFER_SIZE - 1);
         if (bytes <= 0) break;
-        
+
         char data[BUFFER_SIZE];
         size_t data_len;
         nl_ws_opcode_t opcode;
-        
-        if (parse_ws_frame(buffer, bytes, data, &data_len, &opcode) == 0) {
+
+        if (parse_ws_frame(buffer, (size_t)bytes, data, &data_len, &opcode) == 0) {
             if (opcode == NL_WS_CLOSE) {
                 char close_frame[2] = {0x88, 0x00};
-                send(client_fd, (char*)close_frame, 2, 0);
+                nl_ws_io_send(tls, (uintptr_t)client_fd, close_frame, 2);
                 break;
             } else if (opcode == NL_WS_PING) {
                 char pong_frame[10];
                 size_t pong_len;
                 build_ws_frame("", 0, NL_WS_PONG, pong_frame, &pong_len);
-                send(client_fd, pong_frame, (int)pong_len, 0);
+                nl_ws_io_send(tls, (uintptr_t)client_fd, pong_frame, (int)pong_len);
             } else if (server->on_message && (opcode == NL_WS_TEXT || opcode == NL_WS_BINARY)) {
                 server->on_message(data, data_len, opcode, server->user_data);
             }
         }
     }
-    
+
+    nl_ws_tls_release(tls);   /* 第205轮 WSS：关闭前释放 TLS ctx（明文时为 no-op） */
     closesocket(client_fd);
     if (server->on_close) {
         server->on_close(server->user_data);
@@ -268,18 +294,44 @@ nl_websocket_server_t* nl_ws_server_create(int port) {
 
 void nl_ws_server_destroy(nl_websocket_server_t* server) {
     if (!server) return;
-    
+
     if (server->fd != INVALID_SOCKET) closesocket(server->fd);
+    /* 第205轮 WSS：释放 TLS 证书/私钥路径拷贝 */
+    free(server->tls_cert_file);
+    free(server->tls_key_file);
     DeleteCriticalSection(&server->clients_mutex);
     free(server);
 }
 
 int nl_ws_server_start(nl_websocket_server_t* server) {
     if (!server || server->running) return -1;
-    
+
     server->running = 1;
     server->thread = CreateThread(NULL, 0, server_thread, server, 0, NULL);
     return server->thread ? 0 : -1;
+}
+
+/* 第205轮 WSS：enable TLS（cert/key 为 PEM 文件路径，由调用方提供，不硬编码）。
+ * 需在 start 前调用；返回 0=成功，-1=失败（参数非法 / 已在运行 /
+ * TLS 后端库不可用）。未 enable 时行为与明文完全一致。 */
+int nl_ws_server_enable_tls(nl_websocket_server_t* server,
+                            const char* cert_file, const char* key_file) {
+    if (!server || !cert_file || !key_file || server->running) return -1;
+    if (nl_ws_tls_load() != 0) return -1;   /* 运行时后端（tls3/tls2）不可用 */
+
+    char* cert = strdup(cert_file);   /* _CRT_SECURE_NO_WARNINGS 已由构建定义 */
+    char* key = strdup(key_file);
+    if (!cert || !key) {
+        free(cert);
+        free(key);
+        return -1;
+    }
+    free(server->tls_cert_file);
+    free(server->tls_key_file);
+    server->tls_cert_file = cert;
+    server->tls_key_file = key;
+    server->tls_enabled = 1;
+    return 0;
 }
 
 void nl_ws_server_stop(nl_websocket_server_t* server) {
